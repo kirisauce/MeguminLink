@@ -1,0 +1,8 @@
+**/build
+
+/.vscode
+/.idea
+
+/.codex
+/.codewhale
+/.claude
