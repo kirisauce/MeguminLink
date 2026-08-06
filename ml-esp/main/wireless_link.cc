@@ -1,7 +1,7 @@
 #include "meguminlink/wireless_link.hpp"
 #include "esp_log.h"
 #include "esp_now.h"
-#include "meguminlink/binparser.hpp"
+#include "meguminlink/binfmt.hpp"
 #include "meguminlink/nvs_flash.hpp"
 
 using namespace mlink;
@@ -109,7 +109,7 @@ Packet::Packet()
 
 esp_err_t Packet::deserialize(const u8 *data, size_t len)
 {
-    BinParser p(data, data + len);
+    BinDeserializer p(data, data + len);
 
     __check_size(p, 1);
     packet_type = (PacketType)p.read_u8();
@@ -121,6 +121,9 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len)
     return ESP_OK;
 }
 
-esp_err_t Packet::serialize(u8 *buffer, size_t len) {}
+esp_err_t Packet::serialize(u8 *buffer, size_t len) {
+    // TODO: Implement serialize
+    return ESP_OK;
+}
 
 #undef __check_size
