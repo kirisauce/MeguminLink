@@ -1,11 +1,45 @@
 #include "meguminlink/wireless_link.hpp"
-#include "meguminlink/nvs_flash.hpp"
 #include "esp_log.h"
 #include "esp_now.h"
+#include "meguminlink/binparser.hpp"
+#include "meguminlink/nvs_flash.hpp"
+
+using namespace mlink;
 
 static constexpr char TAG[] = "mlink::wireless_link";
 
-esp_err_t mlink::wireless_link_init()
+#define __check(...)                                                                                                   \
+    if (ret != ESP_OK)                                                                                                 \
+    {                                                                                                                  \
+        ESP_LOGE(TAG, __VA_ARGS__);                                                                                    \
+        goto err;                                                                                                      \
+    }
+
+static void link_recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data, int data_len)
+{
+}
+
+static void link_send_cb(const wifi_tx_info_t *send_info, esp_now_send_status_t send_status)
+{
+}
+
+static inline esp_err_t wireless_link_register()
+{
+    esp_err_t ret;
+
+    ret = esp_now_register_recv_cb(link_recv_cb);
+    __check("Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
+
+    ret = esp_now_register_send_cb(link_send_cb);
+    __check("Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
+
+    return ESP_OK;
+
+err:
+    return ret;
+}
+
+esp_err_t wireless_link_init()
 {
     static bool initialized = false;
     if (initialized)
@@ -14,11 +48,6 @@ esp_err_t mlink::wireless_link_init()
     }
 
     esp_err_t ret;
-    #define __check(...) if (ret != ESP_OK) \
-    { \
-        ESP_LOGE(TAG, __VA_ARGS__); \
-        goto err; \
-    }
     ret = mlink::nvs_flash_init();
     __check("mlink::nvs_flash_init() failed");
 
@@ -55,9 +84,43 @@ esp_err_t mlink::wireless_link_init()
     ret = esp_now_init();
     __check("esp_now_init() failed");
 
+    ret = wireless_link_register();
+    if (ret != ESP_OK)
+        goto err;
+
     initialized = true;
     return ESP_OK;
 
 err:
     return ret;
 }
+
+#undef __check
+
+#define __check_size(parser, expected_size)                                                                            \
+    if (parser.remaining() < expected_size)                                                                            \
+    {                                                                                                                  \
+        return ESP_ERR_INVALID_SIZE;                                                                                   \
+    }
+
+Packet::Packet()
+{
+}
+
+esp_err_t Packet::deserialize(const u8 *data, size_t len)
+{
+    BinParser p(data, data + len);
+
+    __check_size(p, 1);
+    packet_type = (PacketType)p.read_u8();
+
+    switch(packet_type) {
+        case PacketType::Probe: {}
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t Packet::serialize(u8 *buffer, size_t len) {}
+
+#undef __check_size
