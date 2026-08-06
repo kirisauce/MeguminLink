@@ -1,3 +1,4 @@
+#include "meguminlink/app.hpp"
 #include "meguminlink/common.hpp"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -45,12 +46,10 @@ void app_main()
         // ESP_ERROR_CHECK(esp_now_set_peer_rate_config(RECEIVER_MAC, &peer_rate_config));
     }
 
-    constexpr static u8 TX_DATA[] = "Hello World!";
+    auto &app = mlink::Application::get_instance();
+
     while (true)
     {
-        ESP_ERROR_CHECK(esp_now_send(RECEIVER_MAC, TX_DATA, sizeof(TX_DATA)));
-        ESP_LOGI(TAG, "Transmitted 1 packet");
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        app.run();
     }
 }

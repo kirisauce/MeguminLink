@@ -1,4 +1,5 @@
 #include "meguminlink/wireless_link.hpp"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_now.h"
 #include "meguminlink/binfmt.hpp"
@@ -112,17 +113,37 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len)
     BinDeserializer p(data, data + len);
 
     __check_size(p, 1);
-    packet_type = (PacketType)p.read_u8();
+    packet_type = static_cast<PacketType>(p.read_u8());
 
-    switch(packet_type) {
-        case PacketType::Probe: {}
+    switch (packet_type)
+    {
+    case PacketType::Probe: {
+        break;
+    }
+    default: {
+        break;
+    }
     }
 
     return ESP_OK;
 }
 
-esp_err_t Packet::serialize(u8 *buffer, size_t len) {
-    // TODO: Implement serialize
+esp_err_t Packet::serialize(u8 *buffer, size_t len)
+{
+    BinSerializer s(buffer, len);
+    __check_size(s, 1);
+    s.write_u8(static_cast<u8>(packet_type));
+
+    switch (packet_type)
+    {
+    case PacketType::Probe: {
+        break;
+    }
+    default: {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    }
+
     return ESP_OK;
 }
 
