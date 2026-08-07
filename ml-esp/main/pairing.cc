@@ -12,6 +12,11 @@ void pairing_process(Application &app)
         {
         case PacketType::Probe: {
         }
+        case PacketType::PairingRequest: {
+            
+        }
+        case PacketType::PairingAccepted: {
+        }
         }
     }
 }

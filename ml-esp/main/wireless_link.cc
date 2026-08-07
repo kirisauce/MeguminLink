@@ -1,7 +1,5 @@
 #include "meguminlink/wireless_link.hpp"
-#include "esp_err.h"
 #include "esp_log.h"
-#include "esp_now.h"
 #include "meguminlink/binfmt.hpp"
 #include "meguminlink/nvs_flash.hpp"
 
@@ -120,6 +118,18 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len)
     case PacketType::Probe: {
         break;
     }
+    case PacketType::PairingRequest: {
+        auto &content = payload.pairing_request;
+        __check_size(p, 6);
+        p.read_bytes(content.target_mac, sizeof(content.target_mac));
+        break;
+    }
+    case PacketType::PairingAccepted: {
+        auto &content = payload.pairing_accepted;
+        __check_size(p, 6);
+        p.read_bytes(content.target_mac, sizeof(content.target_mac));
+        break;
+    }
     default: {
         break;
     }
@@ -137,6 +147,18 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len)
     switch (packet_type)
     {
     case PacketType::Probe: {
+        break;
+    }
+    case PacketType::PairingRequest: {
+        auto &content = payload.pairing_request;
+        __check_size(s, 6);
+        s.write_bytes(content.target_mac, sizeof(content.target_mac));
+        break;
+    }
+    case PacketType::PairingAccepted: {
+        auto &content = payload.pairing_accepted;
+        __check_size(s, 6);
+        s.write_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
     default: {
