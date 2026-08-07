@@ -1,9 +1,10 @@
 #ifndef __MEGUMINLINK_APP_HPP__
 #define __MEGUMINLINK_APP_HPP__
 
+#include "meguminlink/pairing.hpp"
 #include "meguminlink/wireless_link.hpp"
-#include <vector>
 #include <freertos/FreeRTOS.h>
+#include <vector>
 
 namespace mlink
 {
@@ -25,17 +26,23 @@ class Application
 
     SemaphoreHandle_t main_task_wake();
 
+    /** 由无线链路接收回调调用：入队一帧数据并唤醒主任务 */
+    void push_received_packet(const ReceivedPacket &pkt);
+
+    /** 由主任务调用：取走全部积压帧（返回后本队列为空） */
+    std::vector<ReceivedPacket> take_received_packets();
+
     void run();
 
     static Application &get_instance();
-
-    std::vector<Packet> received_packets;
 
   private:
     ApplicationState m_state;
     SemaphoreHandle_t m_main_task_wake;
 
-    SemaphoreHandle_t m_packet_received;
+    SemaphoreHandle_t m_rx_mutex;
+    std::vector<ReceivedPacket> m_received_packets;
+    PairingState m_pairing;
 };
 } // namespace mlink
 
