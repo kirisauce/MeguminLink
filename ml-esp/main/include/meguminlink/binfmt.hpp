@@ -47,6 +47,9 @@ class BinDeserializer
     /** 读取小端 int64，调用方必须保证 remaining() >= 8 */
     int64_t read_i64_le();
 
+    /** 读取 n 字节原始数据到 out，调用方必须保证 remaining() >= n */
+    void read_bytes(uint8_t *out, size_t n);
+
     /** 跳过 n 字节，调用方必须保证 remaining() >= n */
     void consume(size_t n);
 

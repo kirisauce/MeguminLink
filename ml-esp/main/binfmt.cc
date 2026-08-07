@@ -83,6 +83,13 @@ int64_t BinDeserializer::read_i64_le() {
     return static_cast<int64_t>(read_u64_le());
 }
 
+// ── Raw bytes ────────────────────────────────────────────────
+
+void BinDeserializer::read_bytes(uint8_t *out, size_t n) {
+    std::memcpy(out, m_head, n);
+    m_head += n;
+}
+
 // ── Advance ──────────────────────────────────────────────────
 
 void BinDeserializer::consume(size_t n) {
