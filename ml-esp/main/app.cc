@@ -56,6 +56,13 @@ std::vector<ReceivedPacket> Application::take_received_packets()
     return packets;
 }
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+CmsisDapUsb &Application::usb()
+{
+    return m_usb;
+}
+#endif
+
 void Application::run()
 {
     while (true)

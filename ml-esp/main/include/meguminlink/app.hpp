@@ -3,6 +3,12 @@
 
 #include "meguminlink/pairing.hpp"
 #include "meguminlink/wireless_link.hpp"
+#include "sdkconfig.h"
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+#include "meguminlink/usb.hpp"
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <vector>
 
@@ -32,6 +38,10 @@ class Application
     /** 由主任务调用：取走全部积压帧（返回后本队列为空） */
     std::vector<ReceivedPacket> take_received_packets();
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    CmsisDapUsb &usb();
+#endif
+
     void run();
 
     static Application &get_instance();
@@ -43,6 +53,10 @@ class Application
     SemaphoreHandle_t m_rx_mutex;
     std::vector<ReceivedPacket> m_received_packets;
     PairingState m_pairing;
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    CmsisDapUsb m_usb;
+#endif
 };
 } // namespace mlink
 

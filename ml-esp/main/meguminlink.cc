@@ -23,7 +23,7 @@ void app_main()
     auto &app = mlink::Application::get_instance();
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
-    mlink::cmsis_dap_usb_init();
+    app.usb().init();
 #endif
 
     // 已存在配对记录则直接进入 Idle，否则上电自动进入配对模式
