@@ -1,9 +1,11 @@
+#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/wireless_link.hpp"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "meguminlink/app.hpp"
 #include "meguminlink/binfmt.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/common.hpp"
 #include <cstring>
 
 using namespace mlink;
@@ -11,13 +13,6 @@ using namespace mlink;
 static constexpr char TAG[] = "mlink::wireless_link";
 
 static constexpr u8 CHANNEL = 10;
-
-#define __check(...)                                                                                                   \
-    if (ret != ESP_OK)                                                                                                 \
-    {                                                                                                                  \
-        ESP_LOGE(TAG, __VA_ARGS__);                                                                                    \
-        goto err;                                                                                                      \
-    }
 
 static void link_recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data, int data_len)
 {
@@ -114,13 +109,16 @@ esp_err_t mlink::wireless_link_init()
     // ESP_LOGI(TAG, "WiFi promiscuous mode was enabled");
 
     {
+        ret = esp_wifi_set_mode(WIFI_MODE_STA);
+        __check("esp_wifi_set_mode() failed");
+
         wifi_config_t wifi_cfg = {};
         ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
         __check("esp_wifi_set_config() failed");
-        ret = esp_wifi_set_mode(WIFI_MODE_STA);
-        __check("esp_wifi_set_mode() failed");
+
         ret = esp_wifi_start();
         __check("esp_wifi_start() failed");
+
         ret = esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
         __check("esp_wifi_set_channel() failed");
     }
@@ -190,8 +188,6 @@ esp_err_t mlink::wireless_link_send(const u8 *dest_mac, const Packet &packet)
 
     return esp_now_send(dest_mac, buffer, packet.serialized_size());
 }
-
-#undef __check
 
 #define __check_size(parser, expected_size)                                                                            \
     if (parser.remaining() < expected_size)                                                                            \

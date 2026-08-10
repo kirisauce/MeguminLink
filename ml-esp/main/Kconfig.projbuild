@@ -1,0 +1,9 @@
+config MEGUMINLINK_USB_SUPPORT
+    bool "Enable USB (TinyUSB) support"
+    default y
+    depends on IDF_TARGET_ESP32S3
+    help
+        Compile the USB/TinyUSB support code (main/usb.cc). The USB OTG
+        peripheral is only available on ESP32-S3, so this option is only
+        configurable when building for that target; on other targets the
+        file is always excluded from the build.

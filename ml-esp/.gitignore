@@ -6,3 +6,6 @@
 /.codex
 /.codewhale
 /.claude
+
+/CMSIS-DAP
+/managed_components
