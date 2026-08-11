@@ -4,6 +4,10 @@ file(GLOB __src ${CMAKE_CURRENT_LIST_DIR}/*.cc ${CMAKE_CURRENT_LIST_DIR}/*.c)
 # 该选项仅对 ESP32-S3 可用（见同目录 Kconfig.projbuild）
 if(CONFIG_MEGUMINLINK_USB_SUPPORT)
     file(GLOB __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/*.cc ${CMAKE_CURRENT_LIST_DIR}/usb/*.c)
+    # UART bridge 仅在 MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时编译
+    if(NOT CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE)
+        list(REMOVE_ITEM __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/uart_bridge.cc)
+    endif()
     list(APPEND __src ${__usb_src})
 endif()
 

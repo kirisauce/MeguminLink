@@ -15,7 +15,8 @@ namespace
 {
 // ---- CMSIS-DAP v2 descriptors ----
 // 接口结构：vendor specific 接口 (class 0xFF) + bulk 端点 承载 CMSIS-DAP v2
-// 命令/响应，IAD 组合的 CDC ACM 接口作 UART 透传。
+// 命令/响应；CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时追加 IAD 组合的
+// CDC ACM 接口作 UART 透传。
 // Product String 必须包含 "CMSIS-DAP"，调试器（pyOCD 等）靠它识别设备。
 
 // VID/PID：量产前需注册自有 VID/PID。当前沿用 Espressif TinyUSB 默认值：
@@ -49,29 +50,40 @@ constexpr tusb_desc_device_t DEVICE_DESCRIPTOR = {
 // 接口结构：
 //   接口 0：vendor specific (0xFF, 0x00, 0x00) —— CMSIS-DAP bulk transport
 //     EP2 Bulk OUT（命令）+ EP3 Bulk IN（响应）
+//   CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时追加：
 //   接口 1/2：IAD 组合的 CDC ACM 串口（UART 透传）
 //     EP4 Interrupt IN（通知）+ EP3 Bulk OUT / EP1 Bulk IN（数据）
 enum
 {
     ITF_NUM_DAP = 0,
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     ITF_NUM_CDC, // CDC ACM（通知接口）
     ITF_NUM_CDC_DATA,
+#endif
     ITF_NUM_TOTAL,
 
     EP_DAP_OUT = 0x02, // Bulk OUT：命令
     EP_DAP_IN = 0x83,  // Bulk IN ：响应
 
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     EP_CDC_NOTIF = 0x84, // Interrupt IN：CDC 通知
     EP_CDC_OUT = 0x03,   // Bulk OUT：CDC 数据
     EP_CDC_IN = 0x81,    // Bulk IN ：CDC 数据
+#endif
 };
 
 // bmAttributes = 0x80：bus powered
 constexpr u8 CONFIG_DESCRIPTOR[] = {
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_CDC_DESC_LEN, 0x80, 500),
+#else
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN, 0x80, 500),
+#endif
 
     TUD_VENDOR_DESCRIPTOR(ITF_NUM_DAP, 4, EP_DAP_OUT, EP_DAP_IN, 64),
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 0, EP_CDC_NOTIF, 64, EP_CDC_OUT, EP_CDC_IN, 64),
+#endif
 
     // 如需 SWO 流，在此追加 EP3 Bulk In (0x83, 64B) 描述符
 };
@@ -122,8 +134,10 @@ esp_err_t CmsisDapUsb::init()
         __check("Failed to initialize TinyUSB driver");
     }
 
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     ret = uart_bridge_init();
     __check("Failed to initialize USB CDC ACM interface");
+#endif
 
     m_initialized = true;
     return ESP_OK;

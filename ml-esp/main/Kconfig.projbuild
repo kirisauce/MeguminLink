@@ -10,6 +10,17 @@ config MEGUMINLINK_USB_SUPPORT
         configurable when building for that target; on other targets the
         file is always excluded from the build.
 
+config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    bool "Enable UART bridge (CDC ACM)"
+    default y
+    depends on MEGUMINLINK_USB_SUPPORT
+    help
+        Compile the UART bridge and expose a CDC ACM interface on USB.
+        When disabled, the USB device only exposes the CMSIS-DAP
+        interface and no serial port is visible to the host.
+
+if MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+
 config MEGUMINLINK_UART_RX_BUFFER_SIZE
     int "UART receive buffer size"
     default 256
@@ -38,5 +49,7 @@ config MEGUMINLINK_UART_BRIDGE_RX_IO
 config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
     int "UART bridge baud rate"
     default 115200
+
+endif
 
 endmenu
