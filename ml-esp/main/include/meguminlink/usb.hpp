@@ -3,6 +3,8 @@
 #define __MEGUMINLINK_USB_HPP__
 
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+#include <driver/uhci.h>
 
 #include "meguminlink/common.hpp"
 
@@ -22,9 +24,13 @@ class CmsisDapUsb
     esp_err_t init();
 
   private:
+    esp_err_t uart_bridge_init();
+
     bool m_initialized = false;
     char m_serial[18];  // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
     const char *m_string_descriptors[5];
+    QueueHandle_t m_uart_queue;
+    uhci_controller_handle_t m_uhci;
 
     static constexpr u16 USB_VID = 0x303A;
     static constexpr u16 USB_PID = 0x4020;

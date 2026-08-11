@@ -7,3 +7,20 @@ config MEGUMINLINK_USB_SUPPORT
         peripheral is only available on ESP32-S3, so this option is only
         configurable when building for that target; on other targets the
         file is always excluded from the build.
+
+config MEGUMINLINK_UART_RX_BUFFER_SIZE
+    int "UART receive buffer size"
+    default 256
+
+config MEGUMINLINK_UART_TX_BUFFER_SIZE
+    int "UART send buffer size"
+    default 256
+
+config MEGUMINLINK_UART_EVENT_QUEUE_SIZE
+    int "UART event queue size"
+    default 16
+
+config MEGUMINLINK_UART_BRIDGE_NUM
+    int "UART bridge peripheral num"
+    default 1
+    range 1 2
