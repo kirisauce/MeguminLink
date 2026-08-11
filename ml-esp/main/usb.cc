@@ -15,6 +15,12 @@ static constexpr char TAG[] = "mlink::usb";
 
 namespace
 {
+// ---- UART bridge 常量（CDC 回调与桥任务共用）----
+constexpr auto UART_NUM = static_cast<uart_port_t>(UART_NUM_0 + CONFIG_MEGUMINLINK_UART_BRIDGE_NUM);
+constexpr int RX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_RX_BUFFER_SIZE;
+constexpr int TX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_TX_BUFFER_SIZE;
+constexpr int QUEUE_SIZE = CONFIG_MEGUMINLINK_UART_EVENT_QUEUE_SIZE;
+
 // ---- CMSIS-DAP v2 descriptors ----
 // 接口结构：vendor specific 接口 (class 0xFF) + bulk 端点 承载 CMSIS-DAP v2
 // 命令/响应，IAD 组合的 CDC ACM 接口作 UART 透传。
@@ -82,14 +88,24 @@ void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
 }
 
-bool uart_uhci_handle_rx_event(uhci_controller_t *handle, const uhci_rx_event_data_t *data, void *user_data)
+// CDC RX 回调运行在 TinyUSB 任务上下文（tinyusb_task 派发）：只 read + 写 UART TX。
+// uart_write_bytes 是任务安全 API，TX 环形缓冲满时阻塞——受 USB 速率上界约束，可接受。
+void uart_cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
 {
-    return true;
-}
-
-bool uart_uhci_handle_tx_done(uhci_controller_t *handle, const uhci_tx_done_event_data_t *data, void *user_data)
-{
-    return true;
+    static u8 rx_buffer[256];
+    size_t rx_size = 0;
+    const esp_err_t ret =
+        tinyusb_cdcacm_read(static_cast<tinyusb_cdcacm_itf_t>(interface), rx_buffer, sizeof(rx_buffer), &rx_size);
+    if (ret != ESP_OK || rx_size == 0)
+    {
+        ESP_LOGW(TAG, "CDC read failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    const int written = uart_write_bytes(UART_NUM, rx_buffer, rx_size);
+    if (written < 0)
+    {
+        ESP_LOGW(TAG, "UART write failed: %s", esp_err_to_name(written));
+    }
 }
 } // namespace
 
@@ -121,9 +137,6 @@ esp_err_t CmsisDapUsb::init()
         snprintf(m_serial, sizeof(m_serial), MACSTR, MAC2STR(mac));
     }
 
-    ret = uart_bridge_init();
-    __check("Failed to initialize USB CDC ACM interface");
-
     {
         tinyusb_config_t tinyusb_config = TINYUSB_DEFAULT_CONFIG(tinyusb_event_callback);
         tinyusb_config.descriptor.device = &DEVICE_DESCRIPTOR;
@@ -136,6 +149,9 @@ esp_err_t CmsisDapUsb::init()
         __check("Failed to initialize TinyUSB driver");
     }
 
+    ret = uart_bridge_init();
+    __check("Failed to initialize USB CDC ACM interface");
+
     m_initialized = true;
     return ESP_OK;
 
@@ -143,24 +159,65 @@ err:
     return ret;
 }
 
+void CmsisDapUsb::uart_bridge_task(void *arg)
+{
+    auto *self = static_cast<CmsisDapUsb *>(arg);
+    static u8 buffer[256];
+    uart_event_t evt;
+
+    while (true)
+    {
+        if (xQueueReceive(self->m_uart_queue, &evt, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+
+        switch (evt.type)
+        {
+        case UART_DATA: {
+            const int len = uart_read_bytes(UART_NUM, buffer, sizeof(buffer), 0);
+            if (len > 0)
+            {
+                const size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, buffer, static_cast<size_t>(len));
+                if (queued < static_cast<size_t>(len))
+                {
+                    ESP_LOGW(TAG, "CDC TX queue full, dropped %d of %d bytes", len - static_cast<int>(queued), len);
+                }
+                const esp_err_t ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+                if (ret != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
+                }
+            }
+            break;
+        }
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL: {
+            ESP_LOGW(TAG, "UART RX overflow, flushing");
+            uart_flush_input(UART_NUM);
+            xQueueReset(self->m_uart_queue);
+            break;
+        }
+        default: {
+            break; // 其余事件（奇偶校验错误等）忽略
+        }
+        }
+    }
+}
+
 esp_err_t CmsisDapUsb::uart_bridge_init()
 {
     esp_err_t ret;
 
-    constexpr int RX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_RX_BUFFER_SIZE;
-    constexpr int TX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_TX_BUFFER_SIZE;
-    constexpr auto UART_NUM = static_cast<uart_port_t>(UART_NUM_0 + CONFIG_MEGUMINLINK_UART_BRIDGE_NUM);
-    constexpr bool QUEUE_SIZE = CONFIG_MEGUMINLINK_UART_EVENT_QUEUE_SIZE;
-
     static_assert(RX_BUF_SIZE > UART_HW_FIFO_LEN(UART_NUM));
     static_assert(TX_BUF_SIZE == 0 || TX_BUF_SIZE > UART_HW_FIFO_LEN(UART_NUM));
 
-    ret = uart_driver_install(UART_NUM, RX_BUF_SIZE, TX_BUF_SIZE, QUEUE_SIZE, &m_uart_queue, NULL);
+    ret = uart_driver_install(UART_NUM, RX_BUF_SIZE, TX_BUF_SIZE, QUEUE_SIZE, &m_uart_queue, 0);
     __check("uart_driver_install(UART_NUM_%d, ...) failed", CONFIG_MEGUMINLINK_UART_BRIDGE_NUM);
 
     {
         uart_config_t cfg = {};
-        cfg.baud_rate = 115200;
+        cfg.baud_rate = CONFIG_MEGUMINLINK_UART_BRIDGE_BAUD_RATE;
         cfg.data_bits = UART_DATA_8_BITS;
         cfg.stop_bits = UART_STOP_BITS_1;
         cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
@@ -171,26 +228,17 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
         __check("uart_param_config() failed with default configuration");
     }
 
-    {
-        uhci_controller_config_t cfg = {};
-        cfg.uart_port = UART_NUM;
-
-        ret = uhci_new_controller(&cfg, &m_uhci);
-        __check("uhci_new_controller() failed");
-    }
-
-    {
-        uhci_event_callbacks_t callbacks = {};
-        callbacks.on_rx_trans_event = uart_uhci_handle_rx_event;
-        callbacks.on_tx_trans_done = uart_uhci_handle_tx_done;
-        ret = uhci_register_event_callbacks(m_uhci, &callbacks, nullptr);
-        __check("Failed to register UART UHCI callbacks");
-    }
+    ret = uart_set_pin(UART_NUM, CONFIG_MEGUMINLINK_UART_BRIDGE_TX_IO, CONFIG_MEGUMINLINK_UART_BRIDGE_RX_IO, -1, -1);
+    __check("uart_set_pin() failed");
 
     {
         tinyusb_config_cdcacm_t cfg = {};
+        cfg.callback_rx = uart_cdcacm_rx_callback;
         tinyusb_cdcacm_init(&cfg);
     }
+
+    ret = xTaskCreate(uart_bridge_task, "uart_bridge", 4096, this, 5, nullptr) == pdPASS ? ESP_OK : ESP_FAIL;
+    __check("Failed to create UART bridge task");
 
     return ESP_OK;
 

@@ -24,3 +24,15 @@ config MEGUMINLINK_UART_BRIDGE_NUM
     int "UART bridge peripheral num"
     default 1
     range 1 2
+
+config MEGUMINLINK_UART_BRIDGE_TX_IO
+    int "UART bridge TX GPIO number"
+    default 17
+
+config MEGUMINLINK_UART_BRIDGE_RX_IO
+    int "UART bridge RX GPIO number"
+    default 18
+
+config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
+    int "UART bridge baud rate"
+    default 115200
