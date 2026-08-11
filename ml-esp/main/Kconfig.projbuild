@@ -10,6 +10,16 @@ config MEGUMINLINK_USB_SUPPORT
         configurable when building for that target; on other targets the
         file is always excluded from the build.
 
+config MEGUMINLINK_USB_MAX_PACKET_SIZE
+    int "USB max packet size"
+    default 512
+    depends on MEGUMINLINK_USB_SUPPORT
+
+config MEGUMINLINK_USB_PACKET_BUFFER_DEPTH
+    int "USB packet buffer depth"
+    default 8
+    depends on MEGUMINLINK_USB_SUPPORT
+
 config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     bool "Enable UART bridge (CDC ACM)"
     default y

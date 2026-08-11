@@ -4,6 +4,7 @@
 
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/ringbuf.h>
 
 #include "meguminlink/common.hpp"
 #include "sdkconfig.h"
@@ -19,9 +20,14 @@ class CmsisDapUsb
 {
   public:
     CmsisDapUsb();
+    ~CmsisDapUsb();
 
     /** 安装 TinyUSB 驱动并注册 CMSIS-DAP v2 描述符（幂等） */
     esp_err_t init();
+
+    TaskHandle_t m_dap_task;
+    RingbufHandle_t m_bulk_rx_buffer;
+    RingbufHandle_t m_bulk_tx_buffer;
 
   private:
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
@@ -32,6 +38,7 @@ class CmsisDapUsb
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
     const char *m_string_descriptors[5];
+
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     QueueHandle_t m_uart_queue;
 #endif

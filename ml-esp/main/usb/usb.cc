@@ -1,11 +1,13 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/usb/usb.hpp"
+#include "meguminlink/app.hpp"
 
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <sdkconfig.h>
 #include <tinyusb.h>
 #include <tinyusb_default_config.h>
+#include <tusb.h>
 
 #include <cstdio>
 
@@ -92,7 +94,46 @@ void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
 }
 
+void dap_task(void *arg)
+{
+    auto &usb = *reinterpret_cast<mlink::CmsisDapUsb *>(arg);
+    size_t item_size;
+
+    while (true)
+    {
+        auto item = reinterpret_cast<u8 *>(xRingbufferReceive(usb.m_bulk_rx_buffer, &item_size, portMAX_DELAY));
+        if (item != nullptr)
+        {
+            vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+        }
+    }
+}
+
 } // namespace
+
+void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
+{
+    (void)buffer;
+    (void)buffer_size;
+    if (idx != ITF_NUM_DAP)
+    {
+        return;
+    }
+
+    // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：回调不携带数据，
+    // 必须从内部 RX FIFO 读取。tud_vendor_n_read 仅在该模式下可用。
+    auto &usb = mlink::Application::get_instance().usb();
+    u8 tmp[CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE]; // 512B，≥ FIFO 64B
+    u32 n;
+    while ((n = tud_vendor_n_read(idx, tmp, sizeof(tmp))) > 0)
+    {
+        if (xRingbufferSend(usb.m_bulk_rx_buffer, tmp, n, pdMS_TO_TICKS(500)) != pdTRUE)
+        {
+            ESP_LOGW(TAG, "Ring buffer full, dropped %d bytes", (int)n);
+            break;
+        }
+    }
+}
 
 namespace mlink
 {
@@ -103,6 +144,23 @@ CmsisDapUsb::CmsisDapUsb()
     m_string_descriptors[2] = "CMSIS-DAP on " CONFIG_IDF_TARGET; // Product（必须含 "CMSIS-DAP"）
     m_string_descriptors[3] = m_serial;                          // Serial（init 时填充）
     m_string_descriptors[4] = "CMSIS-DAP v2";                    // Interface
+
+    constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_USB_PACKET_BUFFER_DEPTH;
+
+    m_bulk_rx_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
+    m_bulk_tx_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
+}
+
+CmsisDapUsb::~CmsisDapUsb()
+{
+    vRingbufferDelete(m_bulk_rx_buffer);
+    m_bulk_rx_buffer = nullptr;
+
+    vRingbufferDelete(m_bulk_tx_buffer);
+    m_bulk_tx_buffer = nullptr;
+
+    vTaskDelete(m_dap_task);
+    m_dap_task = nullptr;
 }
 
 esp_err_t CmsisDapUsb::init()
@@ -138,6 +196,9 @@ esp_err_t CmsisDapUsb::init()
     ret = uart_bridge_init();
     __check("Failed to initialize USB CDC ACM interface");
 #endif
+
+    // 创建DAP处理任务
+    xTaskCreate(dap_task, "CMSIS-DAP", 2048, this, 0, &m_dap_task);
 
     m_initialized = true;
     return ESP_OK;
