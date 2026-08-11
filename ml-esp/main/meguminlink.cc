@@ -7,7 +7,7 @@
 #include "sdkconfig.h"
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
-#include "meguminlink/usb.hpp"
+#include "meguminlink/usb/usb.hpp"
 #endif
 
 static constexpr char TAG[] = "mlink::main";

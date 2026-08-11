@@ -6,7 +6,7 @@
 #include "sdkconfig.h"
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
-#include "meguminlink/usb.hpp"
+#include "meguminlink/usb/usb.hpp"
 #endif
 
 #include <freertos/FreeRTOS.h>
