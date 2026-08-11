@@ -1,3 +1,5 @@
+menu "MeguminLink"
+
 config MEGUMINLINK_USB_SUPPORT
     bool "Enable USB (TinyUSB) support"
     default y
@@ -36,3 +38,5 @@ config MEGUMINLINK_UART_BRIDGE_RX_IO
 config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
     int "UART bridge baud rate"
     default 115200
+
+endmenu
