@@ -9,7 +9,11 @@ if(CONFIG_MEGUMINLINK_USB_SUPPORT)
         list(REMOVE_ITEM __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/uart_bridge.cc)
     endif()
     list(APPEND __src ${__usb_src})
+
+    # CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2；无 USB 则无传输通道，不编译）
+    file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
+    list(APPEND __src ${__dap_src})
 endif()
 
 idf_component_register(SRCS ${__src}
-                    INCLUDE_DIRS "./include")
+                    INCLUDE_DIRS "./include" "./cmsis_dap/Include" "./cmsis_dap/Config")

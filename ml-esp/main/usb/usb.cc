@@ -10,6 +10,10 @@
 #include <tusb.h>
 
 #include <cstdio>
+#include <cstring>
+
+#include "DAP_config.h"
+#include "DAP.h"
 
 static constexpr char TAG[] = "mlink::usb";
 
@@ -94,18 +98,79 @@ void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
 }
 
+// ---- CMSIS-DAP v2 协议处理 ----
+// 请求经 RX ring 进入 DAP_ExecuteCommand，响应直写 vendor TX FIFO。
+// 上游 main.c 中 USB 驱动调用 DAP_ExecuteCommand 的语义等同于此任务循环。
+
+// CMSIS-DAP v2 bulk：单次 USB 传输 = 一个请求包（EP 64B ⇒ 每项 ≤64B）
+u8 dap_request[DAP_PACKET_SIZE];
+u8 dap_response[DAP_PACKET_SIZE];
+
+// 响应写入 vendor TX FIFO：write 同步拷贝入 FIFO，满时返回 0；
+// tinyusb_task 后台排空。拷贝完成即缓冲区可复用，无需等发送完毕。
+void dap_send_response(u16 len)
+{
+    u16 sent = 0;
+    while (sent < len)
+    {
+        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+        {
+            tud_vendor_n_write_clear(ITF_NUM_DAP); // 断开：丢弃未发数据
+            return;
+        }
+        const u32 n = tud_vendor_n_write(ITF_NUM_DAP, dap_response + sent, len - sent);
+        if (n > 0)
+        {
+            sent += static_cast<u16>(n);
+        }
+        else
+        {
+            vTaskDelay(1); // FIFO 满，退避等排空
+        }
+    }
+    // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：写入字节数 < EP size 时
+    // 不会自动发起 IN 传输，短响应必须显式 flush 才能送达主机
+    tud_vendor_n_write_flush(ITF_NUM_DAP);
+}
+
 void dap_task(void *arg)
 {
     auto &usb = *reinterpret_cast<mlink::CmsisDapUsb *>(arg);
     size_t item_size;
 
+    DAP_Setup(); // 与上游 main.c 一致：初始化 DAP 状态与 SWJ 时钟
+
     while (true)
     {
         auto item = reinterpret_cast<u8 *>(xRingbufferReceive(usb.m_bulk_rx_buffer, &item_size, portMAX_DELAY));
-        if (item != nullptr)
+        if (item == nullptr || item_size == 0)
         {
-            vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+            continue;
         }
+        if (item_size > DAP_PACKET_SIZE)
+        {
+            // EP 64B 下不可能发生；防御性丢弃
+            ESP_LOGW(TAG, "Oversized DAP request (%u bytes), dropped", static_cast<unsigned>(item_size));
+            vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+            continue;
+        }
+        memcpy(dap_request, item, item_size);
+        vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+
+        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+        {
+            continue; // 主机未枚举完成前不处理
+        }
+
+        const u32 n = DAP_ExecuteCommand(dap_request, dap_response);
+        u16 resp_len = static_cast<u16>(n & 0xFFFFU);
+        if (resp_len > DAP_PACKET_SIZE)
+        {
+            // 仅 0x7F 批量命令可触发；与上游 [DAP_PACKET_COUNT][DAP_PACKET_SIZE] 缓冲同语义
+            ESP_LOGW(TAG, "DAP response truncated (%u -> %u)", resp_len, static_cast<unsigned>(DAP_PACKET_SIZE));
+            resp_len = DAP_PACKET_SIZE;
+        }
+        dap_send_response(resp_len);
     }
 }
 
@@ -148,16 +213,12 @@ CmsisDapUsb::CmsisDapUsb()
     constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_USB_PACKET_BUFFER_DEPTH;
 
     m_bulk_rx_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
-    m_bulk_tx_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 }
 
 CmsisDapUsb::~CmsisDapUsb()
 {
     vRingbufferDelete(m_bulk_rx_buffer);
     m_bulk_rx_buffer = nullptr;
-
-    vRingbufferDelete(m_bulk_tx_buffer);
-    m_bulk_tx_buffer = nullptr;
 
     vTaskDelete(m_dap_task);
     m_dap_task = nullptr;

@@ -62,4 +62,32 @@ config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
 
 endif
 
+if MEGUMINLINK_USB_SUPPORT
+
+config MEGUMINLINK_DAP_SWCLK_IO
+    int "CMSIS-DAP SWCLK/TCK GPIO number"
+    default 4
+
+config MEGUMINLINK_DAP_SWDIO_IO
+    int "CMSIS-DAP SWDIO/TMS GPIO number"
+    default 5
+
+config MEGUMINLINK_DAP_NRESET_IO
+    int "CMSIS-DAP nRESET GPIO number"
+    default 6
+
+config MEGUMINLINK_DAP_TDI_IO
+    int "CMSIS-DAP TDI GPIO number"
+    default 7
+
+config MEGUMINLINK_DAP_TDO_IO
+    int "CMSIS-DAP TDO GPIO number"
+    default 8
+
+config MEGUMINLINK_DAP_NTRST_IO
+    int "CMSIS-DAP nTRST GPIO number"
+    default 9
+
+endif
+
 endmenu

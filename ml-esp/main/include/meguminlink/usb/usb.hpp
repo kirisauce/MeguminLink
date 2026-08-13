@@ -14,7 +14,7 @@ namespace mlink
 /**
  * CMSIS-DAP v2 USB 设备。
  *
- * 仅负责描述符与 TinyUSB 驱动初始化；DAP 命令处理等逻辑后续在此类中实现。
+ * 仅负责描述符与 TinyUSB 驱动初始化；DAP 命令处理在 usb.cc 的 dap_task 中。
  */
 class CmsisDapUsb
 {
@@ -27,7 +27,6 @@ class CmsisDapUsb
 
     TaskHandle_t m_dap_task;
     RingbufHandle_t m_bulk_rx_buffer;
-    RingbufHandle_t m_bulk_tx_buffer;
 
   private:
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
