@@ -90,4 +90,32 @@ config MEGUMINLINK_DAP_NTRST_IO
 
 endif
 
+config MEGUMINLINK_MODE_SWITCH_ENABLE
+    bool "Enable debug mode switch button (double click)"
+    default y
+    help
+        Detect a double click on a button and toggle between local (USB
+        CMSIS-DAP) and wireless debug modes. Disable to strip the button
+        driver (e.g. when the GPIO is needed for something else).
+
+if MEGUMINLINK_MODE_SWITCH_ENABLE
+
+config MEGUMINLINK_MODE_SWITCH_GPIO
+    int "Mode switch button GPIO number"
+    default 0
+    range 0 48
+    help
+        Button GPIO, active low (internal pull-up, falling edge on press).
+        Default GPIO0 (BOOT button). Note: GPIO0 is a strapping pin - holding
+        it low during power-up enters ROM download mode.
+
+config MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS
+    int "Mode switch double-click window (ms)"
+    default 400
+    help
+        Maximum interval between two presses (falling edges) to count as a
+        double click.
+
+endif
+
 endmenu

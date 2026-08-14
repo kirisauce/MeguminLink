@@ -1023,6 +1023,12 @@ CONFIG_MEGUMINLINK_DAP_TDI_IO=7
 CONFIG_MEGUMINLINK_DAP_TDO_IO=8
 # default:
 CONFIG_MEGUMINLINK_DAP_NTRST_IO=9
+# default:
+CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE=y
+# default:
+CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO=0
+# default:
+CONFIG_MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS=400
 # end of MeguminLink
 
 #
@@ -1115,16 +1121,27 @@ CONFIG_COMPILER_CXX_GLIBCXX_CONSTEXPR_NO_CHANGE=y
 #
 
 #
-# BLE Log
+# BT Logs
 #
-# default:
-# CONFIG_BLE_LOG_ENABLED is not set
-# end of BLE Log
+
+#
+# Log Sources
+#
+# end of Log Sources
 
 # default:
-# CONFIG_BT_BLE_LOG_SPI_OUT_ENABLED is not set
+# CONFIG_BT_LOG_CRITICAL_ONLY is not set
 # default:
-# CONFIG_BT_BLE_LOG_UHCI_OUT_ENABLED is not set
+# CONFIG_BLE_LOG_ENABLED is not set
+
+#
+# Legacy SPI Log Output (Deprecated - use BT Log Async Output instead)
+#
+# default:
+# CONFIG_BT_BLE_LOG_SPI_OUT_ENABLED is not set
+# end of Legacy SPI Log Output (Deprecated - use BT Log Async Output instead)
+# end of BT Logs
+
 # default:
 # CONFIG_BT_LE_USED_MEM_STATISTICS_ENABLED is not set
 # end of Common Options
@@ -3069,8 +3086,6 @@ CONFIG_MBEDTLS_TLS_SERVER_AND_CLIENT=y
 # default:
 # CONFIG_MBEDTLS_TLS_CLIENT_ONLY is not set
 # default:
-# CONFIG_MBEDTLS_TLS_DISABLED is not set
-# default:
 # CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set
 # default:
 # CONFIG_MBEDTLS_SSL_CONTEXT_SERIALIZATION is not set
@@ -3092,6 +3107,8 @@ CONFIG_MBEDTLS_KEY_EXCHANGE_ELLIPTIC_CURVE=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_RSA=y
 # default:
 CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA=y
+# default:
+# CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE is not set
 # end of TLS Key Exchange Configuration
 
 # default:
@@ -3156,8 +3173,6 @@ CONFIG_MBEDTLS_CMAC_C=y
 # Asymmetric Ciphers
 #
 # default:
-CONFIG_MBEDTLS_BIGNUM_C=y
-# default:
 CONFIG_MBEDTLS_RSA_C=y
 # default:
 CONFIG_MBEDTLS_ECP_C=y
@@ -3194,8 +3209,6 @@ CONFIG_MBEDTLS_ECP_NIST_OPTIM=y
 # CONFIG_MBEDTLS_DHM_C is not set
 # default:
 CONFIG_MBEDTLS_ECDH_C=y
-# default:
-# CONFIG_MBEDTLS_ECJPAKE_C is not set
 # default:
 CONFIG_MBEDTLS_ECDSA_C=y
 # default:

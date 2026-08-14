@@ -211,7 +211,8 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
         tinyusb_cdcacm_init(&cfg);
     }
 
-    ret = xTaskCreate(uart_bridge_task, "uart_bridge", 4096, this, 5, nullptr) == pdPASS ? ESP_OK : ESP_FAIL;
+    ret =
+        xTaskCreate(uart_bridge_task, "uart_bridge", 4096, this, 5, &m_uart_bridge_task) == pdPASS ? ESP_OK : ESP_FAIL;
     __check("Failed to create UART bridge task");
 
     return ESP_OK;

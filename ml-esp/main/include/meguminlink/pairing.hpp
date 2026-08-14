@@ -10,7 +10,7 @@ namespace mlink
 class Application;
 
 /**
- * 配对子状态机（运行在 ApplicationState::Pairing 下）
+ * 配对子状态机（Wireless 模式未配对时的建链流程，见 Application::run）
  *
  * Discovering      广播 Probe 发现对端；收到 Probe 后按 MAC 仲裁：
  *                  - 对端 MAC 更小 → 对端发起，本机进入 WaitingForRequest
@@ -22,10 +22,10 @@ class Application;
 class PairingState
 {
   public:
-    /** 重置内部状态（重新进入 Pairing 状态时调用） */
+    /** 重置内部状态（重新进入配对流程时调用） */
     void reset();
 
-    /** 驱动状态机推进（由 Application 在 Pairing 状态下周期调用） */
+    /** 驱动状态机推进（由 Application 在 Wireless 模式未配对时周期调用） */
     void process(Application &app);
 
   private:
@@ -52,7 +52,7 @@ class PairingState
     esp_err_t send_request(const u8 *target);
     esp_err_t send_accepted(const u8 *target);
     void drop_peer();
-    void complete_pairing(Application &app, const u8 *peer);
+    void complete_pairing(const u8 *peer);
 };
 } // namespace mlink
 

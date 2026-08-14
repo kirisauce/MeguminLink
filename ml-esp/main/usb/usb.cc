@@ -13,8 +13,11 @@
 #include <cstdio>
 #include <cstring>
 
-#include "DAP.h"
+// 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 cmsis_dap/Source/*.c 一致）。
+// DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
+// DAP.h 仅在未定义时提供默认值（#ifndef 保护）；顺序反了会触发宏重定义。
 #include "DAP_config.h"
+#include "DAP.h"
 
 static constexpr char TAG[] = "mlink::usb";
 
@@ -305,5 +308,44 @@ esp_err_t CmsisDapUsb::init()
 
 err:
     return ret;
+}
+
+void CmsisDapUsb::set_enabled(bool enabled)
+{
+    // tud_disconnect()/tud_connect() 线程安全（内部持有 usbd 互斥锁），
+    // 可从任务上下文调用；tud_task 由 tinyusb_driver_install 创建后持续运行，
+    // 断开/重连不会破坏驱动状态，重新连接时主机会重新枚举设备。
+    if (enabled)
+    {
+        tud_connect();
+        if (m_dap_task != nullptr)
+        {
+            vTaskResume(m_dap_task);
+        }
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+        if (m_uart_bridge_task != nullptr)
+        {
+            vTaskResume(m_uart_bridge_task);
+        }
+#endif
+        ESP_LOGI(TAG, "USB enabled (local debug mode)");
+    }
+    else
+    {
+        // 先挂起数据处理任务，再断总线：suspend 时任务可能正阻塞在
+        // ringbuffer/队列接收或忙等排空 TX，下个调度点即挂起，无并发风险。
+        tud_disconnect();
+        if (m_dap_task != nullptr)
+        {
+            vTaskSuspend(m_dap_task);
+        }
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+        if (m_uart_bridge_task != nullptr)
+        {
+            vTaskSuspend(m_uart_bridge_task);
+        }
+#endif
+        ESP_LOGI(TAG, "USB disabled (wireless debug mode)");
+    }
 }
 } // namespace mlink
