@@ -82,12 +82,14 @@ void PairingState::drop_peer()
     }
 }
 
-void PairingState::complete_pairing(const u8 *peer)
+void PairingState::complete_pairing(Application &app, const u8 *peer)
 {
     const esp_err_t ret = peer_mac_store(peer);
     ESP_LOGI(TAG, "Pairing complete with " MACSTR " (nvs: %s)", MAC2STR(peer),
              ret == ESP_OK ? "ok" : esp_err_to_name(ret));
     drop_peer();
+    // 长按进入的配对模式在此结束；未配对自动配对（非配对模式）不受影响。
+    app.pairing_completed();
     // 配对是 Wireless 的子流程：完成后停留在 Wireless 模式，Application 检测到
     // NVS 中的 peer 记录即进入无线调试就绪状态，无需切换模式。
 }
@@ -179,7 +181,7 @@ void PairingState::process(Application &app)
     case State::AcceptedGrace: {
         if (now >= m_deadline)
         {
-            complete_pairing(m_peer_mac);
+            complete_pairing(app, m_peer_mac);
             return;
         }
         break;
@@ -239,7 +241,7 @@ void PairingState::process(Application &app)
             if (r.packet.packet_type == PacketType::PairingAccepted &&
                 std::memcmp(r.src_mac, m_peer_mac, ESP_NOW_ETH_ALEN) == 0)
             {
-                complete_pairing(m_peer_mac);
+                complete_pairing(app, m_peer_mac);
                 return;
             }
             break;

@@ -2,9 +2,8 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
 
-#include <driver/gpio.h>
+#include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
-#include <esp_timer.h>
 #include <sdkconfig.h>
 
 #include <freertos/FreeRTOS.h>
@@ -26,83 +25,6 @@ const char *mode_to_string(Mode mode)
     }
     return "?";
 }
-
-#if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
-// 防抖窗口：忽略间隔小于该值的边沿抖动（机械抖动通常 <5ms，20ms 足够）。
-// 必须远小于双击窗口（默认 400ms），否则真实双击会被防抖吞掉。
-constexpr u64 DEBOUNCE_US = 20 * 1000ULL;
-
-// 以下变量仅 ISR 写（s_double_click_pending 由主任务消费并清除）。
-// bool 是单字节对齐访问，在 32 位目标上读写原子，volatile 防止编译器缓存。
-volatile u64 s_last_edge_us = 0;   // 最近一次有效（防抖后）边沿时间
-volatile u64 s_first_press_us = 0; // 双击窗口内的第一次按下时间；0 = 窗口空闲
-volatile bool s_double_click_pending = false;
-
-void IRAM_ATTR mode_switch_isr(void *)
-{
-    const u64 now = esp_timer_get_time();
-
-    // 防抖：抖动产生的密集边沿直接忽略
-    if (now - s_last_edge_us < DEBOUNCE_US)
-    {
-        return;
-    }
-    s_last_edge_us = now;
-
-    const u64 first = s_first_press_us;
-    if (first != 0 && now - first <= CONFIG_MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS * 1000ULL)
-    {
-        // 窗口内的第二次按下 → 双击；复位 first_press，避免三击连切
-        s_double_click_pending = true;
-        s_first_press_us = 0;
-    }
-    else
-    {
-        // 第一次按下，或上一次窗口已过期（自然成为新的第一次按下）
-        s_first_press_us = now;
-    }
-}
-
-bool consume_double_click()
-{
-    if (s_double_click_pending)
-    {
-        s_double_click_pending = false;
-        return true;
-    }
-    return false;
-}
-
-esp_err_t mode_switch_button_init()
-{
-    const gpio_num_t gpio = static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO);
-
-    gpio_config_t cfg = {};
-    cfg.pin_bit_mask = 1ULL << CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO;
-    cfg.mode = GPIO_MODE_INPUT;
-    cfg.pull_up_en = GPIO_PULLUP_ENABLE; // 默认 GPIO0（BOOT 键）：内部上拉，按下拉低
-    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    cfg.intr_type = GPIO_INTR_NEGEDGE; // 按下 → 下降沿
-
-    esp_err_t ret = gpio_config(&cfg);
-    __check("gpio_config(GPIO%d) failed", CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO);
-
-    // gpio_install_isr_service 全局唯一，重复调用返回 ESP_ERR_INVALID_STATE；
-    // 本模块是项目中第一个使用 GPIO ISR 服务的组件（调用前已确认）。
-    ret = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-    __check("gpio_install_isr_service failed");
-
-    ret = gpio_isr_handler_add(gpio, mode_switch_isr, nullptr);
-    __check("gpio_isr_handler_add(GPIO%d) failed", CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO);
-
-    ESP_LOGI(TAG, "Mode switch on GPIO%d (double click, %d ms window)", CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO,
-             CONFIG_MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS);
-    return ESP_OK;
-
-err:
-    return ret;
-}
-#endif
 } // namespace
 
 Application::Application()
@@ -119,7 +41,7 @@ Application::Application()
     ESP_ERROR_CHECK(m_usb.init());
 #endif
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
-    ESP_ERROR_CHECK(mode_switch_button_init());
+    ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
     apply_mode();
 }
@@ -132,6 +54,12 @@ Mode Application::mode() const
 void Application::set_mode(Mode new_mode)
 {
     m_mode = new_mode; // 先更新状态：apply_mode 按新模式应用系统行为
+
+    // 配对是 Wireless 子流程：离开 Wireless 即终止配对（切回时未配对会重新自动进入）
+    if (new_mode != Mode::Wireless && m_pairing_active)
+    {
+        leave_pairing("mode switch");
+    }
 
     // 持久化到 NVS（带缓存：相同值自动跳过落盘）
     const esp_err_t ret = m_mode_key.set(static_cast<u8>(new_mode));
@@ -183,6 +111,49 @@ CmsisDapUsb &Application::usb()
 }
 #endif
 
+void Application::enter_pairing(bool manual)
+{
+    if (m_pairing_active)
+    {
+        return; // 已在配对流程（含自动配对中）：长按/重复进入幂等忽略
+    }
+    m_pairing_active = true;
+    m_pairing_manual = manual;
+    m_pairing.reset();
+    // 配对期间长按识别一律抑制：任意按下即退出的语义只由手动配对消费，
+    // 自动配对中的长按因此不会叠加手动配对
+    m_button.set_long_press_suppressed(true);
+    if (manual)
+    {
+        m_pairing_manual_start = xTaskGetTickCount();
+        ESP_LOGI(TAG, "Entering pairing (manual; NVS pairing kept, timeout %d ms)",
+                 CONFIG_MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Entering pairing (auto: no peer in NVS)");
+    }
+}
+
+void Application::leave_pairing(const char *reason)
+{
+    if (!m_pairing_active)
+    {
+        return;
+    }
+    m_pairing_active = false;
+    m_pairing_manual = false;
+    m_button.set_long_press_suppressed(false);
+    m_pairing.reset();
+    ESP_LOGI(TAG, "Left pairing (%s)", reason);
+}
+
+void Application::pairing_completed()
+{
+    // 配对成功落盘后由 PairingState 回调：统一退出配对流程
+    leave_pairing("completed");
+}
+
 void Application::run()
 {
     while (true)
@@ -190,11 +161,31 @@ void Application::run()
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
-        // 双击按键切换模式（本地 <-> 无线）。ISR 置位、此处消费；
-        // 200ms 轮询粒度对双击切换的响应无感。
-        if (consume_double_click())
+        // 按键事件由 m_button（状态机）识别，这里只消费并执行动作：
+        // 1. 双击 → 切换模式（本地 <-> 无线）
+        if (m_button.consume_double_click())
         {
             set_mode(mode() == Mode::Wireless ? Mode::Local : Mode::Wireless);
+        }
+
+        // 2. 任意一次按下 → 手动进入的配对流程立即退出（自动配对不响应按键）
+        if (m_button.consume_button_press() && m_pairing_active && m_pairing_manual)
+        {
+            leave_pairing("button press");
+        }
+
+        // 3. 长按 → 手动进入配对流程（仅 Wireless 有效，Local 忽略并提示）；
+        //    自动配对中长按被 enter_pairing 幂等忽略
+        if (m_button.consume_long_press())
+        {
+            if (mode() == Mode::Wireless)
+            {
+                enter_pairing(true);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Long press ignored in local mode; switch to wireless first");
+            }
         }
 #endif
 
@@ -206,17 +197,35 @@ void Application::run()
             break;
         }
         case Mode::Wireless: {
-            // 无线调试：已配对（NVS 有 peer 记录）→ 占位逻辑（TODO 转发调试协议）；
-            // 未配对 → 自动进入配对子流程
-            u8 peer_mac[ESP_NOW_ETH_ALEN];
-            if (peer_mac_load(peer_mac))
+            // 统一配对入口：未配对 → 自动进入配对流程；已配对 → 无线调试
+            if (!m_pairing_active)
             {
-                // TODO(无线调试)：在此将调试数据转发到 peer（复用 ESP-NOW 链路）
-                take_received_packets();
+                u8 peer_mac[ESP_NOW_ETH_ALEN];
+                if (!peer_mac_load(peer_mac))
+                {
+                    enter_pairing(false);
+                }
+            }
+
+            if (m_pairing_active)
+            {
+                // 统一驱动配对状态机。手动进入的配对有超时退出（防误按恢复旧配对）；
+                // 自动进入的配对以配对成功为唯一出口（超时退出无旧配对可用，无意义）
+                if (m_pairing_manual &&
+                    xTaskGetTickCount() - m_pairing_manual_start >=
+                        pdMS_TO_TICKS(CONFIG_MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS))
+                {
+                    leave_pairing("timeout");
+                }
+                else
+                {
+                    m_pairing.process(*this);
+                }
             }
             else
             {
-                m_pairing.process(*this);
+                // 已配对：无线调试就绪（TODO 转发调试协议到 peer）
+                take_received_packets();
             }
             break;
         }

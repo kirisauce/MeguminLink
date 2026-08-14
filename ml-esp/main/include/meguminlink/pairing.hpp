@@ -2,7 +2,7 @@
 #define __MEGUMINLINK_PAIRING_HPP__
 
 #include "esp_now.h"
-#include "freertos/FreeRTOS.h"
+#include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "meguminlink/common.hpp"
 
 namespace mlink
@@ -52,7 +52,7 @@ class PairingState
     esp_err_t send_request(const u8 *target);
     esp_err_t send_accepted(const u8 *target);
     void drop_peer();
-    void complete_pairing(const u8 *peer);
+    void complete_pairing(Application &app, const u8 *peer);
 };
 } // namespace mlink
 

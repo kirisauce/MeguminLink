@@ -91,12 +91,13 @@ config MEGUMINLINK_DAP_NTRST_IO
 endif
 
 config MEGUMINLINK_MODE_SWITCH_ENABLE
-    bool "Enable debug mode switch button (double click)"
+    bool "Enable debug mode switch button (double click + long press)"
     default y
     help
-        Detect a double click on a button and toggle between local (USB
-        CMSIS-DAP) and wireless debug modes. Disable to strip the button
-        driver (e.g. when the GPIO is needed for something else).
+        Double click toggles between local (USB CMSIS-DAP) and wireless
+        debug modes; a long press (in wireless mode) enters pairing mode.
+        Disable to strip the button driver (e.g. when the GPIO is needed
+        for something else).
 
 if MEGUMINLINK_MODE_SWITCH_ENABLE
 
@@ -115,6 +116,27 @@ config MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS
     help
         Maximum interval between two presses (falling edges) to count as a
         double click.
+
+config MEGUMINLINK_MODE_SWITCH_LONG_PRESS_MS
+    int "Mode switch button long-press threshold (ms)"
+    default 1000
+    range 300 5000
+    help
+        Hold the button this long (in wireless mode, when already paired) to
+        manually re-enter the pairing flow. Auto pairing (no peer in NVS) is
+        already running in that case, so the press is ignored. Must be longer
+        than the double-click window. In local mode a long press is ignored.
+
+config MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS
+    int "Manual pairing timeout (ms)"
+    default 60000
+    range 1000 300000
+    help
+        How long a manually entered pairing flow stays active before
+        automatically leaving it (restoring the previous pairing). Any
+        button press also leaves it immediately. Auto pairing (no peer in
+        NVS) is not affected and only ends on success. The NVS pairing
+        record is never erased by entering/leaving the pairing flow.
 
 endif
 
