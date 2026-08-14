@@ -4,6 +4,7 @@
 
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_rom_sys.h> // esp_rom_delay_us
 #include <sdkconfig.h>
 #include <tinyusb.h>
 #include <tinyusb_default_config.h>
@@ -12,8 +13,8 @@
 #include <cstdio>
 #include <cstring>
 
-#include "DAP_config.h"
 #include "DAP.h"
+#include "DAP_config.h"
 
 static constexpr char TAG[] = "mlink::usb";
 
@@ -108,6 +109,10 @@ u8 dap_response[DAP_PACKET_SIZE];
 
 // 响应写入 vendor TX FIFO：write 同步拷贝入 FIFO，满时返回 0；
 // tinyusb_task 后台排空。拷贝完成即缓冲区可复用，无需等发送完毕。
+// FIFO 满的根因：上一次 IN 传输的完成回调（TinyUSB 任务处理）相对本任务
+// 滞后，endpoint 仍 busy，数据留在 FIFO。此时 vTaskDelay(1) 的粒度是
+// 1 个 tick（此前 100Hz = 10ms！），每次响应都白等一个 tick，读吞吐被压到
+// ~5KB/s。改用 us 级忙等重试，只有长时间排不空才兜底让出。
 void dap_send_response(u16 len)
 {
     u16 sent = 0;
@@ -122,10 +127,24 @@ void dap_send_response(u16 len)
         if (n > 0)
         {
             sent += static_cast<u16>(n);
+            continue;
         }
-        else
+        // FIFO 满（上一次 IN 未完成）：us 级忙等重试，最多 ~1ms；
+        // 避免 vTaskDelay 的 tick 粒度（10ms@100Hz / 1ms@1000Hz）
+        bool progressed = false;
+        for (int w = 0; w < 10 && !progressed; w++)
         {
-            vTaskDelay(1); // FIFO 满，退避等排空
+            esp_rom_delay_us(100);
+            const u32 n2 = tud_vendor_n_write(ITF_NUM_DAP, dap_response + sent, len - sent);
+            if (n2 > 0)
+            {
+                sent += static_cast<u16>(n2);
+                progressed = true;
+            }
+        }
+        if (!progressed)
+        {
+            vTaskDelay(1); // 兜底：长时间排不空，让出 CPU
         }
     }
     // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：写入字节数 < EP size 时
@@ -232,6 +251,7 @@ esp_err_t CmsisDapUsb::init()
     }
 
     esp_err_t ret;
+    [[maybe_unused]] BaseType_t dap_core = 0; // 多核下 = TinyUSB 任务的反核；单核无意义
 
     {
         // 串号 = 芯片 MAC，保证多个 probe 可同时枚举
@@ -249,6 +269,15 @@ esp_err_t CmsisDapUsb::init()
             static_cast<int>(sizeof(m_string_descriptors) / sizeof(m_string_descriptors[0]));
         tinyusb_config.descriptor.full_speed_config = CONFIG_DESCRIPTOR;
 
+#if !CONFIG_FREERTOS_UNICORE
+        // 多核：显式固定 TinyUSB 任务到 core 1、优先级 5，不依赖库默认值
+        // （TINYUSB_DEFAULT_TASK_AFFINITY/PRIO 可能随组件版本变化），确保
+        // 后续创建的 DAP 任务可以确定性地与它分核。
+        tinyusb_config.task.xCoreID = 1;
+        tinyusb_config.task.priority = 5;
+        dap_core = (tinyusb_config.task.xCoreID == 0) ? 1 : 0; // TinyUSB 反核
+#endif
+
         ret = tinyusb_driver_install(&tinyusb_config);
         __check("Failed to initialize TinyUSB driver");
     }
@@ -258,8 +287,18 @@ esp_err_t CmsisDapUsb::init()
     __check("Failed to initialize USB CDC ACM interface");
 #endif
 
-    // 创建DAP处理任务
-    xTaskCreate(dap_task, "CMSIS-DAP", 2048, this, 0, &m_dap_task);
+    // 创建DAP处理任务。
+    // 多核构建（如 ESP32-S3）：DAP 任务固定在 TinyUSB 的反核（上方显式配置
+    // TinyUSB 在 core 1，故 DAP 任务在 core 0）且高优先级，保证 SWD 位时钟
+    // 生成期间不被任务抢占（抢占会破坏时序、把实际 SWCLK 压到 ~130kHz）。
+    // 单核构建（如 ESP32-C3/C2，CONFIG_FREERTOS_UNICORE）：无第二个核可
+    // 用，若本任务高优先级会饿死同核的 TinyUSB 任务导致 USB 死锁，因此
+    // 回退到与 TinyUSB 相同优先级（同优先级时间片轮转，互不饿死）。
+#if CONFIG_FREERTOS_UNICORE
+    xTaskCreate(dap_task, "CMSIS-DAP", 2048, this, 5, &m_dap_task);
+#else
+    xTaskCreatePinnedToCore(dap_task, "CMSIS-DAP", 2048, this, 20, &m_dap_task, dap_core);
+#endif
 
     m_initialized = true;
     return ESP_OK;

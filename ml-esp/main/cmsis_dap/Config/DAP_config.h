@@ -84,15 +84,22 @@ This information includes:
 // `#elif !defined(PIN_DELAY_SLOW)` guard in DAP.h skips that branch whenever
 // this file (always included before DAP.h) provides its own portable version.
 // DELAY_SLOW_CYCLES is the number of processor cycles consumed by one loop
-// iteration; a volatile counter loop compiles to roughly 3-4 cycles per
-// iteration on Xtensa. Defined as a function-like macro so the guard in DAP.h
+// iteration. 注意：不能用 volatile 计数器循环——编译器会对每次 volatile
+// 内存访问插入 memw 内存屏障（Xtensa memw 需等待 store buffer 排空，
+// 每个 ~15-20 周期），实测每次迭代高达 ~50 周期，把 SWCLK 压到 ~114kHz。
+// 改用"寄存器变量 + 空汇编内存屏障"循环：空 asm（""）是 GCC/Clang 全平台
+// 通用语法，不产生任何指令，仅用 memory clobber 阻止编译器优化掉循环；
+// 循环本体退化为 sub/test/branch，每迭代 ~3-4 周期，无内存访问、无 memw，
+// 且不依赖任何平台特定指令（可移植回其他架构）。
+// Defined as a function-like macro so the guard in DAP.h
 // (`defined(PIN_DELAY_SLOW)`) can see it.
-#define DELAY_SLOW_CYCLES       3U              // Number of cycles for one iteration
+#define DELAY_SLOW_CYCLES       4U              // Number of cycles for one iteration
 #define PIN_DELAY_SLOW(delay)                                                  \
   do {                                                                         \
-    volatile uint32_t __dap_delay_count = (uint32_t)(delay);                   \
+    uint32_t __dap_delay_count = (uint32_t)(delay);                            \
     while (__dap_delay_count != 0U) {                                          \
-      __dap_delay_count = __dap_delay_count - 1U;                              \
+      __asm__ __volatile__("" ::: "memory");                                   \
+      __dap_delay_count--;                                                     \
     }                                                                          \
   } while (0)
 
@@ -127,7 +134,10 @@ This information includes:
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. For devices with limited RAM or USB buffer the
 /// setting can be reduced (valid range is 1 .. 255).
-#define DAP_PACKET_COUNT        1U              ///< Specifies number of packets buffered.
+/// 复用 USB RX ringbuffer 深度配置项（默认 8）：此前写死 1，OpenOCD 报
+/// "Packet Count = 1" 导致零流水线（发一个包等一个响应）；与 ringbuffer
+/// 深度保持一致即可让 OpenOCD 的 pending FIFO 流水线化。
+#define DAP_PACKET_COUNT        CONFIG_MEGUMINLINK_USB_PACKET_BUFFER_DEPTH  ///< Specifies number of packets buffered.
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
