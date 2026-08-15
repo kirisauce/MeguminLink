@@ -124,6 +124,18 @@ class Application
      */
     void on_uart_data(const u8 *data, size_t len);
 
+    /**
+     * 本地串口线编码变化 → 打包 UartLineCoding 帧发给配对 peer（尽力而为）。
+     * 调用方：S3 侧 CDC SET_LINE_CODING 回调（Wireless 模式）。未配对丢弃。
+     */
+    void send_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
+
+    /**
+     * 收到无线 UartLineCoding 帧 → 应用到本地 UART（recv_cb 直通调用）。
+     * 仅无 USB 侧（C3）处理；USB 侧（S3）不会收到（目标侧不发），防御忽略。
+     */
+    void on_uart_line_coding(const payload::UartLineCoding &lc);
+
     void run();
 
     /** 是否处于配对流程（供 LedController 自行读取） */

@@ -64,6 +64,15 @@ void uart_cdcacm_line_coding_callback(int interface, cdcacm_event_t *event)
         return;
     }
 
+    auto &app = mlink::Application::get_instance();
+    if (app.mode() == mlink::Mode::Wireless)
+    {
+        // Wireless：线编码无线同步给目标侧 UART（PC 改参数 → C3 实时跟随）。
+        // S3 本地 UART1 桥任务已挂起（见 apply_mode），不再配置本地参数。
+        app.send_uart_line_coding(lc->bit_rate, lc->data_bits, lc->stop_bits, lc->parity);
+        return;
+    }
+
     // 波特率：0 表示"无偏好"（部分主机对虚拟串口发 0），跳过；
     // 驱动对 0 及不可达波特率返回 ESP_FAIL（已核实 LL 层 baud==0 保护），告警后保留旧值
     if (lc->bit_rate != 0)

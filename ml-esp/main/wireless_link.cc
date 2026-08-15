@@ -90,6 +90,12 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         app.on_uart_data(uart.data, uart.len);
         return;
     }
+    case PacketType::UartLineCoding: {
+        // 线编码同步直通投递：PC 端改串口参数 → 目标侧 UART 实时跟随
+        const auto &lc = rp.packet.payload.uart_line_coding;
+        app.on_uart_line_coding(lc);
+        return;
+    }
     default:
         // 配对控制帧（Probe/PairingRequest/PairingAccepted）：维持经主循环
         // 统一驱动配对状态机的原路径
@@ -299,6 +305,18 @@ esp_err_t WirelessLink::send_uart_data(const u8 *dest_mac, const u8 *data, size_
     return send(dest_mac, packet);
 }
 
+esp_err_t WirelessLink::send_uart_line_coding(const u8 *dest_mac, u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    Packet packet;
+    packet.packet_type = PacketType::UartLineCoding;
+    auto &content = packet.payload.uart_line_coding;
+    content.baud = baud;
+    content.data_bits = data_bits;
+    content.stop_bits = stop_bits;
+    content.parity = parity;
+    return send(dest_mac, packet);
+}
+
 esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len)
 {
     u8 peer_mac[ESP_NOW_ETH_ALEN];
@@ -452,6 +470,10 @@ size_t Packet::serialized_size() const
     case PacketType::UartData: {
         return UART_FRAME_HEADER_SIZE + payload.uart_data.len;
     }
+    case PacketType::UartLineCoding: {
+        // 帧头 3B + 数据段 7B（baud 4B + 3 个 1B）
+        return UART_FRAME_HEADER_SIZE + 7;
+    }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
@@ -526,6 +548,18 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.data = storage;
         break;
     }
+    case PacketType::UartLineCoding: {
+        // 数据段固定 7B：baud 4B + data_bits/stop_bits/parity 各 1B
+        auto &content = payload.uart_line_coding;
+        MLINK_CHECK_SIZE(p, 2);
+        (void)p.read_u16(); // len（防御性读取并忽略，固定 7B）
+        MLINK_CHECK_SIZE(p, 7);
+        content.baud = p.read_u32();
+        content.data_bits = p.read_u8();
+        content.stop_bits = p.read_u8();
+        content.parity = p.read_u8();
+        break;
+    }
     default: {
         break;
     }
@@ -591,6 +625,16 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_u16(content.len);
         MLINK_CHECK_SIZE(s, content.len);
         s.write_bytes(content.data, content.len);
+        break;
+    }
+    case PacketType::UartLineCoding: {
+        auto &content = payload.uart_line_coding;
+        MLINK_CHECK_SIZE(s, 2 + 7);
+        s.write_u16(7);
+        s.write_u32(content.baud);
+        s.write_u8(content.data_bits);
+        s.write_u8(content.stop_bits);
+        s.write_u8(content.parity);
         break;
     }
     default: {

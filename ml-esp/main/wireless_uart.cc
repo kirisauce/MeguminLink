@@ -84,6 +84,81 @@ void WirelessUartBridge::write_uart(const u8 *data, size_t len)
     }
 }
 
+void WirelessUartBridge::configure(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    // 与 usb/uart_bridge.cc 的 CDC line coding 翻译逻辑对齐。参数为 CDC
+    // 枚举原值（目标侧无 tinyusb 头，按数值判断），各参数独立校验：
+    // 驱动不支持的值（数据位 16、Mark/Space 校验等）告警并跳过该项。
+    if (baud != 0)
+    {
+        const esp_err_t ret = uart_set_baudrate(UART_NUM, baud);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "uart_set_baudrate(%lu) failed: %s", static_cast<unsigned long>(baud), esp_err_to_name(ret));
+        }
+    }
+
+    // 数据位：5/6/7/8；16 及以上不支持
+    switch (data_bits)
+    {
+    case 5:
+        uart_set_word_length(UART_NUM, UART_DATA_5_BITS);
+        break;
+    case 6:
+        uart_set_word_length(UART_NUM, UART_DATA_6_BITS);
+        break;
+    case 7:
+        uart_set_word_length(UART_NUM, UART_DATA_7_BITS);
+        break;
+    case 8:
+        uart_set_word_length(UART_NUM, UART_DATA_8_BITS);
+        break;
+    default:
+        ESP_LOGW(TAG, "Unsupported data bits: %u", data_bits);
+        break;
+    }
+
+    // 停止位（CDC 枚举）：0=1, 1=1.5, 2=2
+    switch (stop_bits)
+    {
+    case 0:
+        uart_set_stop_bits(UART_NUM, UART_STOP_BITS_1);
+        break;
+    case 1:
+        uart_set_stop_bits(UART_NUM, UART_STOP_BITS_1_5);
+        break;
+    case 2:
+        uart_set_stop_bits(UART_NUM, UART_STOP_BITS_2);
+        break;
+    default:
+        ESP_LOGW(TAG, "Unsupported stop bits: %u", stop_bits);
+        break;
+    }
+
+    // 校验位（CDC 枚举）：驱动不支持 Mark(3)/Space(4)
+    switch (parity)
+    {
+    case 0:
+        uart_set_parity(UART_NUM, UART_PARITY_DISABLE);
+        break;
+    case 1:
+        uart_set_parity(UART_NUM, UART_PARITY_ODD);
+        break;
+    case 2:
+        uart_set_parity(UART_NUM, UART_PARITY_EVEN);
+        break;
+    default:
+        ESP_LOGW(TAG, "Unsupported parity: %u", parity);
+        break;
+    }
+
+    // 丢弃按旧参数采样的残余 RX 字节（FIFO + 环形缓冲）
+    uart_flush_input(UART_NUM);
+
+    ESP_LOGI(TAG, "UART line coding applied: %lu baud, %u data bits, stop %u, parity %u",
+             static_cast<unsigned long>(baud), data_bits, stop_bits, parity);
+}
+
 void WirelessUartBridge::bridge_task_fn(void *arg)
 {
     auto *self = static_cast<WirelessUartBridge *>(arg);

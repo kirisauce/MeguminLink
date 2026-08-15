@@ -36,6 +36,19 @@ class WirelessUartBridge
      */
     void write_uart(const u8 *data, size_t len);
 
+    /**
+     * 应用无线同步的线编码参数（PC 端 CDC SET_LINE_CODING → 本机 UART，
+     * recv_cb 直通调用）。参数为 CDC 枚举原值，翻译逻辑与
+     * usb/uart_bridge.cc 的 line coding 回调对齐（目标侧无 tinyusb 头）。
+     * 各参数独立校验：驱动不支持的值告警并跳过该项，其余照常应用。
+     *
+     * @param baud      波特率（0 = 无偏好，跳过）
+     * @param data_bits CDC 枚举 5/6/7/8
+     * @param stop_bits CDC 枚举 0=1, 1=1.5, 2=2
+     * @param parity    CDC 枚举 0=None, 1=Odd, 2=Even, 3=Mark, 4=Space
+     */
+    void configure(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
+
   private:
     /** 桥任务入口：UART 事件队列 → UART_DATA 读出 → 无线帧发送 */
     static void bridge_task_fn(void *arg);

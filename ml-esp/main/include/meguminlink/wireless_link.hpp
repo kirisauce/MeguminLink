@@ -85,6 +85,19 @@ struct UartData
     u16 len;        /**< 有效数据长度（data[0..len-1]） */
     const u8 *data; /**< 串口字节流（指向调用方存储） */
 };
+
+/**
+ * 无线同步的 UART 线编码参数（PC 端 CDC SET_LINE_CODING → 目标侧 UART）。
+ * 帧数据段 7B：baud 4B 大端 + data_bits/stop_bits/parity 各 1B。参数传 CDC
+ * 枚举原值，目标侧翻译为 UART 驱动参数（目标侧无 tinyusb 头，按数值判断）。
+ */
+struct UartLineCoding
+{
+    u32 baud;     /**< 波特率（0 = 无偏好，跳过） */
+    u8 data_bits; /**< CDC 枚举：5/6/7/8 */
+    u8 stop_bits; /**< CDC 枚举：0=1, 1=1.5, 2=2 */
+    u8 parity;    /**< CDC 枚举：0=None, 1=Odd, 2=Even, 3=Mark, 4=Space */
+};
 } // namespace payload
 
 enum class PacketType
@@ -95,6 +108,7 @@ enum class PacketType
     DapCommand,      /** 无线转发的 DAP 命令载荷（USB 收到的 CMSIS-DAP 请求原样打包） */
     DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
     UartData,        /** 无线转发的串口数据载荷（PC↔目标 UART 双向，尽力而为） */
+    UartLineCoding,  /** 无线同步的 UART 线编码载荷（PC 端 SET_LINE_CODING → 目标侧） */
 };
 
 union PacketPayload {
@@ -104,6 +118,7 @@ union PacketPayload {
     payload::DapCommand dap_command;
     payload::DapResponse dap_response;
     payload::UartData uart_data;
+    payload::UartLineCoding uart_line_coding;
 };
 
 class Packet
@@ -210,6 +225,12 @@ class WirelessLink
      * @param len 数据长度（> MAX_UART_PAYLOAD_SIZE 时拒绝）
      */
     esp_err_t send_uart_data(const u8 *dest_mac, const u8 *data, size_t len);
+
+    /**
+     * 打包线编码参数为 UartLineCoding 帧并发送给对端（尽力而为，不重传）。
+     * 参数为 CDC 枚举原值（见 payload::UartLineCoding），目标侧翻译应用。
+     */
+    esp_err_t send_uart_line_coding(const u8 *dest_mac, u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。

@@ -226,6 +226,35 @@ void Application::on_uart_data(const u8 *data, size_t len)
 #endif
 }
 
+void Application::send_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    // 尽力而为：未配对丢弃（与 send_uart_data 同语义）。PC 端改串口参数
+    // 是低频事件，失败仅告警，不重试。
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (!mlink::peer_mac_load(peer_mac))
+    {
+        ESP_LOGD(TAG, "Wireless UART: no paired peer, line coding dropped");
+        return;
+    }
+    const esp_err_t ret = m_wireless_link.send_uart_line_coding(peer_mac, baud, data_bits, stop_bits, parity);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Wireless UART: failed to send line coding: %s", esp_err_to_name(ret));
+    }
+}
+
+void Application::on_uart_line_coding(const payload::UartLineCoding &lc)
+{
+    // 接收端动作由本机角色决定（recv_cb 直通调用）：
+    // 无 USB 侧（C3）把线编码应用到本机 UART；USB 侧（S3）正常不会收到
+    // （目标侧不发），防御性忽略。
+#if !CONFIG_MEGUMINLINK_USB_SUPPORT
+    m_wireless_uart.configure(lc.baud, lc.data_bits, lc.stop_bits, lc.parity);
+#else
+    (void)lc;
+#endif
+}
+
 void Application::enter_pairing(bool manual)
 {
     if (m_pairing_active)
