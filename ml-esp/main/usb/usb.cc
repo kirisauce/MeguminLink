@@ -1,7 +1,8 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
-#include "meguminlink/nvs_flash.hpp" // peer_mac_load（Wireless 转发目标）
+#include "meguminlink/dap_executor.hpp" // dap_executor_run（Local 执行核心）
+#include "meguminlink/wireless_link.hpp" // wireless_link_forward_dap_command（Wireless 转发）
 
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -104,12 +105,18 @@ void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
 }
 
 // ---- CMSIS-DAP v2 协议处理 ----
-// 请求经 RX ring 进入 DAP_ExecuteCommand，响应直写 vendor TX FIFO。
-// 上游 main.c 中 USB 驱动调用 DAP_ExecuteCommand 的语义等同于此任务循环。
+// 统一由公共执行器 dap_executor_run（见 dap_executor.cc）驱动：
+// 命令源 = USB bulk RX ringbuffer（Wireless 模式在源内完成转发分流），
+// 响应宿 = USB vendor TX FIFO。本任务无独立执行循环。
 
-// CMSIS-DAP v2 bulk：单次 USB 传输 = 一个请求包（EP 64B ⇒ 每项 ≤64B）
+// 请求/响应缓冲为 USB 传输层资源（不占任务栈——ESP-IDF 任务栈以字节计，
+// DAP 执行调用链栈需求大，缓冲放栈上会溢出）。
 u8 dap_request[DAP_PACKET_SIZE];
-u8 dap_response[DAP_PACKET_SIZE];
+// 响应缓冲按 CMSIS-DAP 批量响应上限预留（kDapMaxResponseSize，见
+// dap_executor.hpp）：Local 模式单命令响应 ≤ DAP_PACKET_SIZE，0x7F 批量
+// 响应可到 ~2KB（DAP_ExecuteCommand 批量写入不检查边界）；Wireless 模式
+// 等待到的无线响应（≤ kMaxDapPayloadSize）同样拷入此缓冲再写回 USB。
+u8 dap_response[mlink::kDapMaxResponseSize];
 
 // 响应写入 vendor TX FIFO：write 同步拷贝入 FIFO，满时返回 0；
 // tinyusb_task 后台排空。拷贝完成即缓冲区可复用，无需等发送完毕。
@@ -117,7 +124,7 @@ u8 dap_response[DAP_PACKET_SIZE];
 // 滞后，endpoint 仍 busy，数据留在 FIFO。此时 vTaskDelay(1) 的粒度是
 // 1 个 tick（此前 100Hz = 10ms！），每次响应都白等一个 tick，读吞吐被压到
 // ~5KB/s。改用 us 级忙等重试，只有长时间排不空才兜底让出。
-void dap_send_response(u16 len)
+void dap_send_response(const u8 *data, u16 len)
 {
     u16 sent = 0;
     while (sent < len)
@@ -127,7 +134,7 @@ void dap_send_response(u16 len)
             tud_vendor_n_write_clear(ITF_NUM_DAP); // 断开：丢弃未发数据
             return;
         }
-        const u32 n = tud_vendor_n_write(ITF_NUM_DAP, dap_response + sent, len - sent);
+        const u32 n = tud_vendor_n_write(ITF_NUM_DAP, data + sent, len - sent);
         if (n > 0)
         {
             sent += static_cast<u16>(n);
@@ -139,7 +146,7 @@ void dap_send_response(u16 len)
         for (int w = 0; w < 10 && !progressed; w++)
         {
             esp_rom_delay_us(100);
-            const u32 n2 = tud_vendor_n_write(ITF_NUM_DAP, dap_response + sent, len - sent);
+            const u32 n2 = tud_vendor_n_write(ITF_NUM_DAP, data + sent, len - sent);
             if (n2 > 0)
             {
                 sent += static_cast<u16>(n2);
@@ -156,69 +163,77 @@ void dap_send_response(u16 len)
     tud_vendor_n_write_flush(ITF_NUM_DAP);
 }
 
-void dap_task(void *arg)
+// 执行器命令源（USB 输入，dap_executor_run 的 cmd_src）：
+// 从 bulk RX ringbuffer 取一条命令；Wireless 模式下不执行而是转发给
+// 配对 peer 并等待响应写回 USB（返回 false = 无需执行）；
+// Local 模式返回 true，由执行器执行并回传响应。
+bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
 {
     auto &usb = *reinterpret_cast<mlink::CmsisDapUsb *>(arg);
+
     size_t item_size;
-
-    DAP_Setup(); // 与上游 main.c 一致：初始化 DAP 状态与 SWJ 时钟
-
-    while (true)
+    auto item = reinterpret_cast<u8 *>(xRingbufferReceive(usb.m_bulk_rx_buffer, &item_size, portMAX_DELAY));
+    if (item == nullptr || item_size == 0)
     {
-        auto item = reinterpret_cast<u8 *>(xRingbufferReceive(usb.m_bulk_rx_buffer, &item_size, portMAX_DELAY));
-        if (item == nullptr || item_size == 0)
-        {
-            continue;
-        }
-        if (item_size > DAP_PACKET_SIZE)
-        {
-            // EP 64B 下不可能发生；防御性丢弃
-            ESP_LOGW(TAG, "Oversized DAP request (%u bytes), dropped", static_cast<unsigned>(item_size));
-            vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
-            continue;
-        }
-        memcpy(dap_request, item, item_size);
-        vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
-
-        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
-        {
-            continue; // 主机未枚举完成前不处理
-        }
-
-        // Wireless 模式：USB 收到的 DAP 命令不本地执行，打包无线转发给
-        // 已配对 peer（接收端当前仅打日志、不回响应，PC 端会超时）。
-        // 未配对（peer 未落盘）时丢弃并记录，配对完成后自动恢复转发。
-        auto &app = mlink::Application::get_instance();
-        if (app.mode() == mlink::Mode::Wireless)
-        {
-            u8 peer_mac[ESP_NOW_ETH_ALEN];
-            if (!mlink::peer_mac_load(peer_mac))
-            {
-                ESP_LOGW(TAG, "Wireless: no paired peer, %u-byte DAP request dropped",
-                         static_cast<unsigned>(item_size));
-            }
-            else
-            {
-                const esp_err_t ret = mlink::wireless_link_send_dap_command(peer_mac, dap_request, item_size);
-                if (ret != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "Wireless: failed to forward %u-byte DAP request: %s",
-                             static_cast<unsigned>(item_size), esp_err_to_name(ret));
-                }
-            }
-            continue; // 不回响应：第一版接收端只做日志，无 DAP 执行结果
-        }
-
-        const u32 n = DAP_ExecuteCommand(dap_request, dap_response);
-        u16 resp_len = static_cast<u16>(n & 0xFFFFU);
-        if (resp_len > DAP_PACKET_SIZE)
-        {
-            // 仅 0x7F 批量命令可触发；与上游 [DAP_PACKET_COUNT][DAP_PACKET_SIZE] 缓冲同语义
-            ESP_LOGW(TAG, "DAP response truncated (%u -> %u)", resp_len, static_cast<unsigned>(DAP_PACKET_SIZE));
-            resp_len = DAP_PACKET_SIZE;
-        }
-        dap_send_response(resp_len);
+        return false;
     }
+    if (item_size > buf_cap)
+    {
+        // EP 64B 下不可能发生；防御性丢弃
+        ESP_LOGW(TAG, "Oversized DAP request (%u bytes), dropped", static_cast<unsigned>(item_size));
+        vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+        return false;
+    }
+    memcpy(buf, item, item_size);
+    vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
+    *len = static_cast<u16>(item_size);
+
+    if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+    {
+        return false; // 主机未枚举完成前不处理
+    }
+
+    // 数据流向判断：Wireless 模式 → USB 收到的 DAP 命令转发给配对 peer
+    // （完整无线调试数据通路）；Local 模式 → 交给执行器本地执行。
+    // 具体发送/等待逻辑在 wireless_link 的转发接口里，这里只负责
+    // 判断流向并把手里的 USB 响应写回。
+    auto &app = mlink::Application::get_instance();
+    if (app.mode() == mlink::Mode::Wireless)
+    {
+        u16 resp_len = 0;
+        const esp_err_t ret = mlink::wireless_link_forward_dap_command(buf, *len, dap_response,
+                                                                       sizeof(dap_response), &resp_len);
+        if (ret == ESP_OK)
+        {
+            dap_send_response(dap_response, resp_len);
+        }
+        return false; // 无线路径已处理（或丢弃），无需执行
+    }
+
+    return true; // Local 模式：交给执行器执行
+}
+
+// 执行器响应宿（USB 输出，dap_executor_run 的 resp_sink）。
+// 保持既有语义：超过 DAP_PACKET_SIZE 的响应（仅 0x7F 批量命令可触发）
+// 截断发送，与上游 [DAP_PACKET_COUNT][DAP_PACKET_SIZE] 缓冲同语义。
+void usb_resp_sink(const u8 *data, u16 len, void *arg)
+{
+    u16 out_len = len;
+    if (out_len > DAP_PACKET_SIZE)
+    {
+        ESP_LOGW(TAG, "DAP response truncated (%u -> %u)", out_len, static_cast<unsigned>(DAP_PACKET_SIZE));
+        out_len = DAP_PACKET_SIZE;
+    }
+    dap_send_response(data, out_len);
+}
+
+void dap_task(void *arg)
+{
+    // 复用公共执行器：命令源 = USB ringbuffer（Wireless 模式在源内转发），
+    // 响应宿 = USB 写回；请求/响应缓冲用本文件传输层缓冲（不占任务栈）。
+    // 执行循环、DAP_Setup 与命令日志均在 dap_executor.cc。
+    mlink::dap_executor_run(usb_cmd_src, usb_resp_sink, arg, dap_request, sizeof(dap_request), dap_response,
+                            sizeof(dap_response));
 }
 
 } // namespace
@@ -257,7 +272,7 @@ CmsisDapUsb::CmsisDapUsb()
     m_string_descriptors[3] = m_serial;                          // Serial（init 时填充）
     m_string_descriptors[4] = "CMSIS-DAP v2";                    // Interface
 
-    constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_USB_PACKET_BUFFER_DEPTH;
+    constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
 
     m_bulk_rx_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 }
@@ -323,9 +338,9 @@ esp_err_t CmsisDapUsb::init()
     // 用，若本任务高优先级会饿死同核的 TinyUSB 任务导致 USB 死锁，因此
     // 回退到与 TinyUSB 相同优先级（同优先级时间片轮转，互不饿死）。
 #if CONFIG_FREERTOS_UNICORE
-    xTaskCreate(dap_task, "CMSIS-DAP", 2048, this, 5, &m_dap_task);
+    xTaskCreate(dap_task, "CMSIS-DAP", 4096, this, 5, &m_dap_task);
 #else
-    xTaskCreatePinnedToCore(dap_task, "CMSIS-DAP", 2048, this, 20, &m_dap_task, dap_core);
+    xTaskCreatePinnedToCore(dap_task, "CMSIS-DAP", 4096, this, 20, &m_dap_task, dap_core);
 #endif
 
     m_initialized = true;

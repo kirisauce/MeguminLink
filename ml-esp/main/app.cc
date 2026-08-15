@@ -1,6 +1,7 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/wireless_link.hpp" // WirelessDapExecutor（DapCommand 投递）
 
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
@@ -8,6 +9,8 @@
 #include <sdkconfig.h>
 
 #include <freertos/FreeRTOS.h>
+
+#include <cstring> // memcpy（push_wireless_response）
 
 using namespace mlink;
 
@@ -26,56 +29,12 @@ const char *mode_to_string(Mode mode)
     }
     return "?";
 }
-
-/**
- * DAP 命令号 → 可读名称（CMSIS-DAP v2 命令 ID，见 DAP.h 的 ID_DAP_*）。
- * 接收端日志用；与 cmsis_dap 实现解耦，不 include DAP.h。
- */
-const char *dap_command_name(u8 id)
-{
-    switch (id)
-    {
-    case 0x00: return "DAP_Info";
-    case 0x01: return "DAP_HostStatus";
-    case 0x02: return "DAP_Connect";
-    case 0x03: return "DAP_Disconnect";
-    case 0x04: return "DAP_TransferConfigure";
-    case 0x05: return "DAP_Transfer";
-    case 0x06: return "DAP_TransferBlock";
-    case 0x07: return "DAP_TransferAbort";
-    case 0x08: return "DAP_WriteABORT";
-    case 0x09: return "DAP_Delay";
-    case 0x0A: return "DAP_ResetTarget";
-    case 0x10: return "DAP_SWJ_Pins";
-    case 0x11: return "DAP_SWJ_Clock";
-    case 0x12: return "DAP_SWJ_Sequence";
-    case 0x13: return "DAP_SWD_Configure";
-    case 0x14: return "DAP_JTAG_Sequence";
-    case 0x15: return "DAP_JTAG_Configure";
-    case 0x16: return "DAP_JTAG_IDCODE";
-    case 0x17: return "DAP_SWO_Transport";
-    case 0x18: return "DAP_SWO_Mode";
-    case 0x19: return "DAP_SWO_Baudrate";
-    case 0x1A: return "DAP_SWO_Control";
-    case 0x1B: return "DAP_SWO_Status";
-    case 0x1C: return "DAP_SWO_Data";
-    case 0x1D: return "DAP_SWD_Sequence";
-    case 0x1E: return "DAP_SWO_ExtendedStatus";
-    case 0x1F: return "DAP_UART_Transport";
-    case 0x20: return "DAP_UART_Configure";
-    case 0x21: return "DAP_UART_Transfer";
-    case 0x22: return "DAP_UART_Control";
-    case 0x23: return "DAP_UART_Status";
-    case 0x7E: return "DAP_QueueCommands";
-    case 0x7F: return "DAP_ExecuteCommands";
-    default: return "unknown";
-    }
-}
 } // namespace
 
 Application::Application()
     : m_mode_key(NVS_KEY_MODE, static_cast<u8>(Mode::Local)), m_mode(Mode::Local),
-      m_main_task_wake(xSemaphoreCreateBinary()), m_rx_mutex(xSemaphoreCreateMutex())
+      m_main_task_wake(xSemaphoreCreateBinary()), m_rx_mutex(xSemaphoreCreateMutex()),
+      m_wireless_response_sem(xSemaphoreCreateBinary()), m_wireless_response_mutex(xSemaphoreCreateMutex())
 {
     // 延迟构造（get_instance 首次调用，此时 NVS 已初始化）：
     // 从 NVS 恢复模式（Local/Wireless，无记录默认 Local）。
@@ -104,6 +63,9 @@ Application::Application()
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     ESP_ERROR_CHECK(m_usb.init());
 #endif
+    // 无线侧 DAP 执行器：任何构建都创建（无线接收端执行 DAP 命令），
+    // 仅主循环投递命令时工作（Local 模式下空闲阻塞）
+    ESP_ERROR_CHECK(m_wireless_dap.init());
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -176,6 +138,39 @@ std::vector<ReceivedPacket> Application::take_received_packets()
     packets.swap(m_received_packets);
     xSemaphoreGive(m_rx_mutex);
     return packets;
+}
+
+void Application::push_wireless_response(const u8 *data, u16 len)
+{
+    xSemaphoreTake(m_wireless_response_mutex, portMAX_DELAY);
+    if (len > sizeof(m_wireless_response))
+    {
+        // 无线帧承载上限的防御性截断（正常不会触发）
+        len = static_cast<u16>(sizeof(m_wireless_response));
+    }
+    m_wireless_response_len = len;
+    std::memcpy(m_wireless_response, data, len);
+    xSemaphoreGive(m_wireless_response_mutex);
+
+    // 先写完缓冲再 give：等待方 take 成功后读到的必然是本次完整响应
+    xSemaphoreGive(m_wireless_response_sem);
+}
+
+bool Application::wait_wireless_response(u8 *buf, u16 *len, u32 timeout_ms)
+{
+    if (xSemaphoreTake(m_wireless_response_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+    {
+        return false; // 超时：调用方丢弃（PC 端 debugger 自行重试）
+    }
+
+    xSemaphoreTake(m_wireless_response_mutex, portMAX_DELAY);
+    const u16 n = m_wireless_response_len;
+    std::memcpy(buf, m_wireless_response, n);
+    m_wireless_response_len = 0;
+    xSemaphoreGive(m_wireless_response_mutex);
+
+    *len = n;
+    return true;
 }
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
@@ -318,23 +313,36 @@ void Application::run()
                     wireless_link_peer_add(peer_mac);
                 }
                 // USB 收到的 DAP 命令已由 dap_task 转发给 peer（见 usb.cc）。
-                // 这里消费无线链路收到的帧：第一版 DapCommand 仅打日志
-                // （不执行、不回响应），配对控制帧在已配对状态下不应出现，
-                // 防御性忽略。
+                // 这里消费无线链路收到的帧：
+                // - DapCommand：本机是接收端（target 侧），投递给 wireless_dap
+                //   执行器（DAP_ExecuteCommand + 响应回传，见 wireless_dap.cc）；
+                // - DapResponse：本机是发送端，存入响应通道唤醒 dap_task
+                //   （dap_task 转发命令后正等待该响应并写回 USB）；
+                // 配对控制帧在已配对状态下不应出现，防御性忽略。
                 auto packets = take_received_packets();
                 for (const auto &rp : packets)
                 {
-                    if (rp.packet.packet_type == PacketType::DapCommand)
+                    switch (rp.packet.packet_type)
                     {
+                    case PacketType::DapCommand: {
                         const auto &cmd = rp.packet.payload.dap_command;
-                        ESP_LOGI(TAG, "DAP cmd from " MACSTR ": id=0x%02X (%s) len=%u", MAC2STR(rp.src_mac),
-                                 cmd.data[0], dap_command_name(cmd.data[0]), static_cast<unsigned>(cmd.len));
-                        ESP_LOG_BUFFER_HEX_LEVEL(TAG, cmd.data, cmd.len, ESP_LOG_INFO);
+                        const esp_err_t ret = m_wireless_dap.execute(rp.src_mac, cmd.data, cmd.len);
+                        if (ret != ESP_OK)
+                        {
+                            ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),
+                                     esp_err_to_name(ret));
+                        }
+                        break;
                     }
-                    else
-                    {
+                    case PacketType::DapResponse: {
+                        const auto &resp = rp.packet.payload.dap_response;
+                        push_wireless_response(resp.data, resp.len);
+                        break;
+                    }
+                    default:
                         ESP_LOGW(TAG, "Unexpected packet type %d in paired state, ignored",
                                  static_cast<int>(rp.packet.packet_type));
+                        break;
                     }
                 }
             }

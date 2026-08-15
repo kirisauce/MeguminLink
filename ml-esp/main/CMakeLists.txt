@@ -9,11 +9,13 @@ if(CONFIG_MEGUMINLINK_USB_SUPPORT)
         list(REMOVE_ITEM __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/uart_bridge.cc)
     endif()
     list(APPEND __src ${__usb_src})
-
-    # CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2；无 USB 则无传输通道，不编译）
-    file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
-    list(APPEND __src ${__dap_src})
 endif()
+
+# CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2）：无条件编译。
+# Local 模式（USB 本地执行）与无线接收端（target 侧执行 DAP 命令）
+# 都依赖 DAP 核心；无线接收端通常是无 USB 的目标（如 ESP32-C3）。
+file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
+list(APPEND __src ${__dap_src})
 
 # LED 指示灯模块：仅在 GPIO 驱动被选中时编译（Disabled 时整个模块不参与构建）
 if(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO)

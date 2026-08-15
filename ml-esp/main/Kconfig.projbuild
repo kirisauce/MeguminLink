@@ -19,10 +19,13 @@ config MEGUMINLINK_USB_MAX_PACKET_SIZE
     default 512
     depends on MEGUMINLINK_USB_SUPPORT
 
-config MEGUMINLINK_USB_PACKET_BUFFER_DEPTH
-    int "USB packet buffer depth"
+config MEGUMINLINK_PACKET_BUFFER_DEPTH
+    int "Packet buffer depth"
     default 8
-    depends on MEGUMINLINK_USB_SUPPORT
+    help
+        Depth of the USB bulk RX ringbuffer (USB targets) and, at the same
+        time, the CMSIS-DAP DAP_PACKET_COUNT (see DAP_config.h). Kept
+        available on non-USB targets (e.g. wireless receiver ESP32-C3).
 
 config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     bool "Enable UART bridge (CDC ACM)"
@@ -66,11 +69,14 @@ config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
 
 endif
 
-if MEGUMINLINK_USB_SUPPORT
-
 config MEGUMINLINK_DAP_SWCLK_IO
     int "CMSIS-DAP SWCLK/TCK GPIO number"
     default 4
+    help
+        SWD/JTAG I/O pins of the CMSIS-DAP core. Used both by the local
+        (USB) CMSIS-DAP implementation and by the wireless target-side
+        executor, so these are available on every target (including
+        non-USB ones like ESP32-C3 used as the wireless receiver).
 
 config MEGUMINLINK_DAP_SWDIO_IO
     int "CMSIS-DAP SWDIO/TMS GPIO number"
@@ -92,7 +98,16 @@ config MEGUMINLINK_DAP_NTRST_IO
     int "CMSIS-DAP nTRST GPIO number"
     default 9
 
-endif
+config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
+    int "Wireless DAP response timeout (ms)"
+    default 300
+    range 10 5000
+    help
+        How long the USB-side (sender) waits for a wireless DAP response
+        after forwarding a command to the paired peer before giving up.
+        On timeout the response is dropped without retransmission: the
+        PC-side debugger (pyOCD/OpenOCD) will see a command timeout and
+        retry on its own.
 
 config MEGUMINLINK_MODE_SWITCH_ENABLE
     bool "Enable debug mode switch button (double click + long press)"

@@ -83,6 +83,21 @@ class Application
     /** 由主任务调用：取走全部积压帧（返回后本队列为空） */
     std::vector<ReceivedPacket> take_received_packets();
 
+    /**
+     * 主循环调用：存入收到的无线 DAP 响应并唤醒等待者。
+     * 发送端 dap_task 转发命令后阻塞等待的正是这个响应（一次一个在途请求）。
+     */
+    void push_wireless_response(const u8 *data, u16 len);
+
+    /**
+     * 由 dap_task 调用：阻塞等待无线 DAP 响应（带超时）。
+     * @param buf        响应缓冲区（容量需 ≥ kMaxDapPayloadSize）
+     * @param len        输出：实际响应字节数
+     * @param timeout_ms 超时（MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS）
+     * @return true=成功；false=超时（调用方丢弃，PC 端 debugger 自行重试）
+     */
+    bool wait_wireless_response(u8 *buf, u16 *len, u32 timeout_ms);
+
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb &usb();
 #endif
@@ -126,6 +141,17 @@ class Application
     std::vector<ReceivedPacket> m_received_packets;
     PairingState m_pairing;
 
+    /**
+     * 无线 DAP 响应通道（发送端用）：
+     * 主循环收到 DapResponse 帧 → push_wireless_response 写入并 give 信号量；
+     * dap_task 转发命令后 → wait_wireless_response 等待信号量并读出。
+     * 缓冲大小对齐无线帧承载上限（kMaxDapPayloadSize）。
+     */
+    u8 m_wireless_response[kMaxDapPayloadSize];
+    u16 m_wireless_response_len = 0;
+    SemaphoreHandle_t m_wireless_response_sem;   /**< 响应到达信号（二进制） */
+    SemaphoreHandle_t m_wireless_response_mutex; /**< 响应缓冲互斥 */
+
     /** 配对流程活动标志（进入置位，成功/超时/按键/切模式后复位） */
     bool m_pairing_active = false;
     /** 是否手动进入（长按）：决定是否启用超时/任意按键退出 */
@@ -144,6 +170,9 @@ class Application
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb m_usb;
 #endif
+
+    /** 无线侧 DAP 执行接线（命令队列 + 执行任务，见 wireless_link.hpp） */
+    WirelessDapExecutor m_wireless_dap;
 };
 } // namespace mlink
 

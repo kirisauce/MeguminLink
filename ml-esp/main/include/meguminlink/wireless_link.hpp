@@ -6,6 +6,13 @@
 #include "esp_now.h"              // IWYU pragma: export
 #include "esp_wifi.h"             // IWYU pragma: export
 #include "meguminlink/common.hpp" // IWYU pragma: keep
+#include "meguminlink/dap_executor.hpp" // kDapMaxResponseSize（响应缓冲容量）
+
+#include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
+#include <cstring> // memcpy（ReceivedPacket 拷贝）
 
 namespace mlink
 {
@@ -15,14 +22,14 @@ esp_err_t wireless_link_init();
 inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 /**
- * DapCommand 帧格式：[type:1B][len:2B 大端][data:len B]。
- * 数据段上限对齐 ESP-NOW v2.0 能力（ESP_NOW_MAX_DATA_LEN_V2 - 帧头，1467B）。
- * 第一版实际仅承载单条 DAP 命令（USB 单次请求 ≤ DAP_PACKET_SIZE = 64B），
- * 上限按无线链路能力预留，为后续批量命令（0x7F）与响应回传留出空间，
- * 避免将来为了大帧改写帧格式。
+ * DapCommand/DapResponse 帧格式：[type:1B][len:2B 大端][data:len B]。
+ * 数据段上限 = CMSIS-DAP 单包大小（DAP_PACKET_SIZE=64B，USB EP 64B 单次
+ * 传输即一个请求/响应包）。0x7F 批量命令的超大响应由执行器丢弃
+ * （见 dap_executor.cc），不走无线帧——因此 Packet 结构保持小巧，
+ * 调用方可放心放在任务栈上。
  */
 inline constexpr size_t kDapFrameHeaderSize = 3;
-inline constexpr size_t kMaxDapPayloadSize = ESP_NOW_MAX_DATA_LEN_V2 - kDapFrameHeaderSize; // 1467
+inline constexpr size_t kMaxDapPayloadSize = kDapMaxRequestSize; // 64B，见 dap_executor.hpp
 
 namespace payload
 {
@@ -40,10 +47,24 @@ struct PairingAccepted
     u8 target_mac[ESP_NOW_ETH_ALEN];
 };
 
+/**
+ * DAP 命令/响应为"指针视图"：Packet 只是序列化包装层，不内嵌数据。
+ * 发送时 data 指向调用方命令/响应缓冲；接收（反序列化）时由调用方提供
+ * 存储（见 ReceivedPacket::storage），data 指向该存储。数据段上限
+ * kMaxDapPayloadSize = DAP_PACKET_SIZE（64B，USB 单包），Packet 因此
+ * 保持小巧，可放心放任务栈上。
+ */
 struct DapCommand
 {
-    u16 len; /**< 有效数据长度（data[0..len-1]） */
-    u8 data[kMaxDapPayloadSize];
+    u16 len;        /**< 有效数据长度（data[0..len-1]） */
+    const u8 *data; /**< 命令字节流（指向调用方存储） */
+};
+
+/** 与 DapCommand 同构：接收端执行 DAP 命令后的响应视图 */
+struct DapResponse
+{
+    u16 len;        /**< 有效数据长度（data[0..len-1]） */
+    const u8 *data; /**< 响应字节流（指向调用方存储） */
 };
 } // namespace payload
 
@@ -53,6 +74,7 @@ enum class PacketType
     PairingRequest,  /** 配对请求，对方必须回应一个`PairingAccepted`才能完成配对 */
     PairingAccepted, /** 接受配对请求，作为对`PairingRequest`的回应 */
     DapCommand,      /** 无线转发的 DAP 命令载荷（USB 收到的 CMSIS-DAP 请求原样打包） */
+    DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
 };
 
 union PacketPayload {
@@ -60,6 +82,7 @@ union PacketPayload {
     payload::PairingRequest pairing_request;
     payload::PairingAccepted pairing_accepted;
     payload::DapCommand dap_command;
+    payload::DapResponse dap_response;
 };
 
 class Packet
@@ -67,7 +90,13 @@ class Packet
   public:
     Packet();
 
-    esp_err_t deserialize(const u8 *data, size_t len);
+    /**
+     * 从无线帧反序列化。
+     * @param storage      payload 数据存储（DapCommand/DapResponse 的数据
+     *                     拷贝到这里，其 data 指针指向本存储）
+     * @param storage_cap  存储容量（≥ kMaxDapPayloadSize）
+     */
+    esp_err_t deserialize(const u8 *data, size_t len, u8 *storage, size_t storage_cap);
     esp_err_t serialize(u8 *buffer, size_t len) const;
 
     /** 序列化后的帧长度，用于发送时告知 ESP-NOW */
@@ -77,11 +106,57 @@ class Packet
     PacketPayload payload;
 };
 
-/** 一帧已接收的协议包，附带 ESP-NOW 源 MAC */
+/**
+ * 一帧已接收的协议包，附带 ESP-NOW 源 MAC。
+ * storage 为反序列化的 payload 数据存储（命令/响应字节流），
+ * 生命周期与本对象一致（主循环消费完才销毁）。
+ * 注意：本对象会被值拷贝入接收队列（vector），拷贝时必须把
+ * payload 的 data 指针重绑到拷贝后的 storage（见 rebind_data_ptr）。
+ */
 struct ReceivedPacket
 {
     Packet packet;
     u8 src_mac[ESP_NOW_ETH_ALEN];
+    u8 storage[kMaxDapPayloadSize];
+
+    ReceivedPacket() = default;
+
+    ReceivedPacket(const ReceivedPacket &other)
+    {
+        packet = other.packet;
+        std::memcpy(src_mac, other.src_mac, ESP_NOW_ETH_ALEN);
+        std::memcpy(storage, other.storage, sizeof(storage));
+        rebind_data_ptr();
+    }
+
+    ReceivedPacket &operator=(const ReceivedPacket &other)
+    {
+        if (this != &other)
+        {
+            packet = other.packet;
+            std::memcpy(src_mac, other.src_mac, ESP_NOW_ETH_ALEN);
+            std::memcpy(storage, other.storage, sizeof(storage));
+            rebind_data_ptr();
+        }
+        return *this;
+    }
+
+  private:
+    /** 反序列化后 payload 数据总在 storage[0..len)，拷贝后重绑指针 */
+    void rebind_data_ptr()
+    {
+        switch (packet.packet_type)
+        {
+        case PacketType::DapCommand:
+            packet.payload.dap_command.data = storage;
+            break;
+        case PacketType::DapResponse:
+            packet.payload.dap_response.data = storage;
+            break;
+        default:
+            break;
+        }
+    }
 };
 
 /** 向指定对端（可为广播地址）发送一帧协议包 */
@@ -89,6 +164,22 @@ esp_err_t wireless_link_send(const u8 *dest_mac, const Packet &packet);
 
 /** 打包一条 DAP 命令（原样字节流）为 DapCommand 帧并发送给对端 */
 esp_err_t wireless_link_send_dap_command(const u8 *dest_mac, const u8 *data, size_t len);
+
+/** 打包一条 DAP 响应（原样字节流）为 DapResponse 帧并发送给对端 */
+esp_err_t wireless_link_send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
+
+/**
+ * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
+ * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
+ * resp 缓冲（容量 resp_cap，需 ≥ kMaxDapPayloadSize）。
+ * @param cmd/len  DAP 命令原样字节流
+ * @param resp     响应缓冲
+ * @param resp_cap 响应缓冲容量
+ * @param resp_len 输出：响应字节数（仅返回 ESP_OK 时有效）
+ * @return ESP_OK=已收到响应；否则失败（未配对 / 发送失败 / 响应超时，
+ *         命令已丢弃，PC 端 debugger 会自行超时重试）
+ */
+esp_err_t wireless_link_forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len);
 
 /**
  * 登记一个对端 peer（encrypt=false）。
@@ -99,6 +190,41 @@ esp_err_t wireless_link_peer_add(const u8 *peer_mac);
 
 /** 从 peer list 删除一个对端 peer（配对放弃/完成时归还槽位） */
 esp_err_t wireless_link_peer_remove(const u8 *peer_mac);
+
+/**
+ * 无线侧 DAP 执行接线（与 usb.cc 的 dap_task 对称）：
+ * 命令队列 + 高优先级执行任务，把收到的 DapCommand 交给公共执行器
+ * （dap_executor_run）执行，结果以 DapResponse 帧回发给命令来源。
+ * 状态全在对象内（无全局变量），实例由 Application 持有（m_wireless_dap）。
+ */
+class WirelessDapExecutor
+{
+  public:
+    /** 创建命令队列与执行任务（幂等；任务平时阻塞在队列上，不占 CPU） */
+    esp_err_t init();
+
+    /**
+     * 投递一条无线接收到的 DAP 命令（异步入队，立即返回）。
+     * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
+     * @param data    DAP 命令原样字节流
+     * @param len     命令长度（> DAP_PACKET_SIZE 时拒绝，与 USB 路径一致）
+     */
+    esp_err_t execute(const u8 *src_mac, const u8 *data, size_t len);
+
+  private:
+    /** 执行器回调（dap_executor_run 的 cmd_src/resp_sink）与任务入口 */
+    static bool cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg);
+    static void resp_sink(const u8 *data, u16 len, void *arg);
+    static void task(void *arg);
+
+    QueueHandle_t m_queue = nullptr;
+    TaskHandle_t m_task = nullptr;
+    /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
+    u8 m_src_mac[ESP_NOW_ETH_ALEN];
+    /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */
+    u8 m_request[kDapMaxRequestSize];
+    u8 m_response[kDapMaxResponseSize];
+};
 } // namespace mlink
 
 #endif

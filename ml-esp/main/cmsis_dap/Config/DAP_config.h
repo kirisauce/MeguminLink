@@ -134,10 +134,11 @@ This information includes:
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. For devices with limited RAM or USB buffer the
 /// setting can be reduced (valid range is 1 .. 255).
-/// 复用 USB RX ringbuffer 深度配置项（默认 8）：此前写死 1，OpenOCD 报
+/// 复用 MEGUMINLINK_PACKET_BUFFER_DEPTH（默认 8）：此前写死 1，OpenOCD 报
 /// "Packet Count = 1" 导致零流水线（发一个包等一个响应）；与 ringbuffer
-/// 深度保持一致即可让 OpenOCD 的 pending FIFO 流水线化。
-#define DAP_PACKET_COUNT        CONFIG_MEGUMINLINK_USB_PACKET_BUFFER_DEPTH  ///< Specifies number of packets buffered.
+/// 深度保持一致即可让 OpenOCD 的 pending FIFO 流水线化。该配置项已从
+/// USB 支持中解耦（无 USB 目标同样存在），无线接收端同样按此取值。
+#define DAP_PACKET_COUNT        CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH  ///< Specifies number of packets buffered.
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
