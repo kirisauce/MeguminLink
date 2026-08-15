@@ -6,7 +6,7 @@
 #include "esp_now.h"              // IWYU pragma: export
 #include "esp_wifi.h"             // IWYU pragma: export
 #include "meguminlink/common.hpp" // IWYU pragma: keep
-#include "meguminlink/dap_executor.hpp" // kDapMaxResponseSize（响应缓冲容量）
+#include "meguminlink/dap_executor.hpp" // kDapMaxRequestSize / kDapMaxResponseSize（执行器缓冲）
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
@@ -16,8 +16,6 @@
 
 namespace mlink
 {
-esp_err_t wireless_link_init();
-
 /** ESP-NOW 广播地址，用于发现阶段的 Probe 广播 */
 inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
@@ -159,71 +157,73 @@ struct ReceivedPacket
     }
 };
 
-/** 向指定对端（可为广播地址）发送一帧协议包 */
-esp_err_t wireless_link_send(const u8 *dest_mac, const Packet &packet);
-
-/** 打包一条 DAP 命令（原样字节流）为 DapCommand 帧并发送给对端 */
-esp_err_t wireless_link_send_dap_command(const u8 *dest_mac, const u8 *data, size_t len);
-
-/** 打包一条 DAP 响应（原样字节流）为 DapResponse 帧并发送给对端 */
-esp_err_t wireless_link_send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
-
 /**
- * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
- * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
- * resp 缓冲（容量 resp_cap，需 ≥ kMaxDapPayloadSize）。
- * @param cmd/len  DAP 命令原样字节流
- * @param resp     响应缓冲
- * @param resp_cap 响应缓冲容量
- * @param resp_len 输出：响应字节数（仅返回 ESP_OK 时有效）
- * @return ESP_OK=已收到响应；否则失败（未配对 / 发送失败 / 响应超时，
- *         命令已丢弃，PC 端 debugger 会自行超时重试）
+ * 无线链路：ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，状态全在对象内。
+ * 与 usb.cc 的 dap_task（USB 侧执行接线）对称：无线传输层负责把收到的
+ * DapCommand 交给公共执行器（dap_executor_run）执行，结果以 DapResponse
+ * 帧回发给来源；发送端（USB 侧）经 forward_dap_command 转发并等待响应。
+ * 实例由 Application 持有（m_wireless_link），与 m_usb/m_pairing 同模式。
  */
-esp_err_t wireless_link_forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len);
-
-/**
- * 登记一个对端 peer（encrypt=false）。
- * 仅登记尚未存在于 peer list 的地址，重复调用是安全的。
- * 广播地址已由 wireless_link_init() 常驻登记，无需也不应重复登记。
- */
-esp_err_t wireless_link_peer_add(const u8 *peer_mac);
-
-/** 从 peer list 删除一个对端 peer（配对放弃/完成时归还槽位） */
-esp_err_t wireless_link_peer_remove(const u8 *peer_mac);
-
-/**
- * 无线侧 DAP 执行接线（与 usb.cc 的 dap_task 对称）：
- * 命令队列 + 高优先级执行任务，把收到的 DapCommand 交给公共执行器
- * （dap_executor_run）执行，结果以 DapResponse 帧回发给命令来源。
- * 状态全在对象内（无全局变量），实例由 Application 持有（m_wireless_dap）。
- */
-class WirelessDapExecutor
+class WirelessLink
 {
   public:
-    /** 创建命令队列与执行任务（幂等；任务平时阻塞在队列上，不占 CPU） */
+    /** 初始化 WiFi/ESP-NOW、登记广播 peer，并创建无线侧 DAP 执行器（幂等） */
     esp_err_t init();
 
+    /** 向指定对端（可为广播地址）发送一帧协议包 */
+    esp_err_t send(const u8 *dest_mac, const Packet &packet);
+
+    /** 打包一条 DAP 命令/响应（原样字节流）为对应帧并发送给对端 */
+    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len);
+    esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
+
     /**
-     * 投递一条无线接收到的 DAP 命令（异步入队，立即返回）。
+     * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
+     * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
+     * resp 缓冲（容量 resp_cap，需 ≥ kMaxDapPayloadSize）。
+     * @return ESP_OK=已收到响应；否则失败（未配对 / 发送失败 / 响应超时，
+     *         命令已丢弃，PC 端 debugger 会自行超时重试）
+     */
+    esp_err_t forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len);
+
+    /**
+     * 登记一个对端 peer（encrypt=false）。仅登记尚未存在于 peer list 的地址，
+     * 重复调用是安全的。广播地址已由 init() 常驻登记，无需也不应重复登记。
+     */
+    esp_err_t peer_add(const u8 *peer_mac);
+
+    /** 从 peer list 删除一个对端 peer（配对放弃/完成时归还槽位） */
+    esp_err_t peer_remove(const u8 *peer_mac);
+
+    /**
+     * 投递一条无线接收到的 DAP 命令给执行器（异步入队，立即返回）。
      * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
      * @param data    DAP 命令原样字节流
      * @param len     命令长度（> DAP_PACKET_SIZE 时拒绝，与 USB 路径一致）
      */
-    esp_err_t execute(const u8 *src_mac, const u8 *data, size_t len);
+    esp_err_t dap_execute(const u8 *src_mac, const u8 *data, size_t len);
 
   private:
-    /** 执行器回调（dap_executor_run 的 cmd_src/resp_sink）与任务入口 */
-    static bool cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg);
-    static void resp_sink(const u8 *data, u16 len, void *arg);
-    static void task(void *arg);
+    /** ESP-NOW 接收/发送回调（esp_now 要求 C 函数指针，无 arg；经 Application 访问） */
+    static void recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data, int data_len);
+    static void send_cb(const wifi_tx_info_t *send_info, esp_now_send_status_t send_status);
 
-    QueueHandle_t m_queue = nullptr;
-    TaskHandle_t m_task = nullptr;
+    /** 无线侧 DAP 执行器回调（arg = 本对象 this）与任务入口 */
+    static bool dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg);
+    static void dap_resp_sink(const u8 *data, u16 len, void *arg);
+    static void dap_task_fn(void *arg);
+
+    static constexpr u8 kChannel = 10; // ESP-NOW 固定信道
+
+    bool m_initialized = false;
+    /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
+    QueueHandle_t m_dap_queue = nullptr;
+    TaskHandle_t m_dap_task = nullptr;
     /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
-    u8 m_src_mac[ESP_NOW_ETH_ALEN];
+    u8 m_dap_src_mac[ESP_NOW_ETH_ALEN];
     /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */
-    u8 m_request[kDapMaxRequestSize];
-    u8 m_response[kDapMaxResponseSize];
+    u8 m_dap_request[kDapMaxRequestSize];
+    u8 m_dap_response[kDapMaxResponseSize];
 };
 } // namespace mlink
 

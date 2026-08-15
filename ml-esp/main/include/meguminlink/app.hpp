@@ -102,6 +102,9 @@ class Application
     CmsisDapUsb &usb();
 #endif
 
+    /** 无线链路访问器（配对/转发/执行接线使用） */
+    WirelessLink &wireless_link();
+
     void run();
 
     /**
@@ -171,8 +174,8 @@ class Application
     CmsisDapUsb m_usb;
 #endif
 
-    /** 无线侧 DAP 执行接线（命令队列 + 执行任务，见 wireless_link.hpp） */
-    WirelessDapExecutor m_wireless_dap;
+    /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless_link.hpp） */
+    WirelessLink m_wireless_link;
 };
 } // namespace mlink
 

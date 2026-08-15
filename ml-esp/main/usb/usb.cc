@@ -2,7 +2,7 @@
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（Local 执行核心）
-#include "meguminlink/wireless_link.hpp" // wireless_link_forward_dap_command（Wireless 转发）
+#include "meguminlink/wireless_link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
 
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -201,8 +201,8 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     if (app.mode() == mlink::Mode::Wireless)
     {
         u16 resp_len = 0;
-        const esp_err_t ret = mlink::wireless_link_forward_dap_command(buf, *len, dap_response,
-                                                                       sizeof(dap_response), &resp_len);
+        const esp_err_t ret = app.wireless_link().forward_dap_command(buf, *len, dap_response,
+                                                                      sizeof(dap_response), &resp_len);
         if (ret == ESP_OK)
         {
             dap_send_response(dap_response, resp_len);

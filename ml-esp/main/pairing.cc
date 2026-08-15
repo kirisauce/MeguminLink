@@ -38,7 +38,7 @@ esp_err_t PairingState::send_probe()
 {
     Packet p;
     p.packet_type = PacketType::Probe;
-    const esp_err_t ret = wireless_link_send(ESP_NOW_BROADCAST, p);
+    const esp_err_t ret = mlink::Application::get_instance().wireless_link().send(ESP_NOW_BROADCAST, p);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to send probe: %s", esp_err_to_name(ret));
@@ -51,7 +51,7 @@ esp_err_t PairingState::send_request(const u8 *target)
     Packet p;
     p.packet_type = PacketType::PairingRequest;
     std::memcpy(p.payload.pairing_request.target_mac, target, ESP_NOW_ETH_ALEN);
-    const esp_err_t ret = wireless_link_send(target, p);
+    const esp_err_t ret = mlink::Application::get_instance().wireless_link().send(target, p);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to send pairing request: %s", esp_err_to_name(ret));
@@ -64,7 +64,7 @@ esp_err_t PairingState::send_accepted(const u8 *target)
     Packet p;
     p.packet_type = PacketType::PairingAccepted;
     std::memcpy(p.payload.pairing_accepted.target_mac, target, ESP_NOW_ETH_ALEN);
-    const esp_err_t ret = wireless_link_send(target, p);
+    const esp_err_t ret = mlink::Application::get_instance().wireless_link().send(target, p);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to send pairing accepted: %s", esp_err_to_name(ret));
@@ -77,7 +77,7 @@ void PairingState::drop_peer()
     if (m_peer_mac[0] != 0 || m_peer_mac[1] != 0 || m_peer_mac[2] != 0 || m_peer_mac[3] != 0 || m_peer_mac[4] != 0 ||
         m_peer_mac[5] != 0)
     {
-        wireless_link_peer_remove(m_peer_mac);
+        mlink::Application::get_instance().wireless_link().peer_remove(m_peer_mac);
         std::memset(m_peer_mac, 0, ESP_NOW_ETH_ALEN);
     }
 }
@@ -200,7 +200,7 @@ void PairingState::process(Application &app)
                 std::memcmp(r.src_mac, m_own_mac, ESP_NOW_ETH_ALEN) < 0)
             {
                 std::memcpy(m_peer_mac, r.src_mac, ESP_NOW_ETH_ALEN);
-                wireless_link_peer_add(m_peer_mac);
+                mlink::Application::get_instance().wireless_link().peer_add(m_peer_mac);
                 send_accepted(m_peer_mac);
                 m_state = State::AcceptedGrace;
                 m_deadline = now + pdMS_TO_TICKS(ACCEPTED_GRACE_MS);
@@ -217,7 +217,7 @@ void PairingState::process(Application &app)
                 {
                     // 对端是发起方，本机转为接收方
                     std::memcpy(m_peer_mac, r.src_mac, ESP_NOW_ETH_ALEN);
-                    wireless_link_peer_add(m_peer_mac);
+                    mlink::Application::get_instance().wireless_link().peer_add(m_peer_mac);
                     m_state = State::WaitingForRequest;
                     m_deadline = now + pdMS_TO_TICKS(WAITING_FOR_REQUEST_TIMEOUT_MS);
                     ESP_LOGI(TAG, "Peer " MACSTR " has smaller MAC, waiting for request", MAC2STR(r.src_mac));
@@ -226,7 +226,7 @@ void PairingState::process(Application &app)
                 {
                     // 本机是发起方，立即发出请求
                     std::memcpy(m_peer_mac, r.src_mac, ESP_NOW_ETH_ALEN);
-                    wireless_link_peer_add(m_peer_mac);
+                    mlink::Application::get_instance().wireless_link().peer_add(m_peer_mac);
                     m_state = State::WaitingForAccepted;
                     m_retries = 0;
                     m_deadline = now + pdMS_TO_TICKS(REQUEST_RETRY_MS);

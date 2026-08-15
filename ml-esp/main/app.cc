@@ -60,12 +60,12 @@ Application::Application()
 
     // 在此初始化 USB 与模式切换按键，并应用当前模式（USB 常驻，模式差异
     // 在 dap_task 的本地执行/无线转发分流）。
+    // 无线链路初始化（WiFi/ESP-NOW/广播 peer + 无线侧 DAP 执行器）：
+    // 任何构建都创建，仅主循环投递命令时工作（Local 模式下空闲阻塞）
+    ESP_ERROR_CHECK(m_wireless_link.init());
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     ESP_ERROR_CHECK(m_usb.init());
 #endif
-    // 无线侧 DAP 执行器：任何构建都创建（无线接收端执行 DAP 命令），
-    // 仅主循环投递命令时工作（Local 模式下空闲阻塞）
-    ESP_ERROR_CHECK(m_wireless_dap.init());
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -179,6 +179,11 @@ CmsisDapUsb &Application::usb()
     return m_usb;
 }
 #endif
+
+WirelessLink &Application::wireless_link()
+{
+    return m_wireless_link;
+}
 
 void Application::enter_pairing(bool manual)
 {
@@ -310,7 +315,7 @@ void Application::run()
                 u8 peer_mac[ESP_NOW_ETH_ALEN];
                 if (peer_mac_load(peer_mac))
                 {
-                    wireless_link_peer_add(peer_mac);
+                    m_wireless_link.peer_add(peer_mac);
                 }
                 // USB 收到的 DAP 命令已由 dap_task 转发给 peer（见 usb.cc）。
                 // 这里消费无线链路收到的帧：
@@ -326,7 +331,7 @@ void Application::run()
                     {
                     case PacketType::DapCommand: {
                         const auto &cmd = rp.packet.payload.dap_command;
-                        const esp_err_t ret = m_wireless_dap.execute(rp.src_mac, cmd.data, cmd.len);
+                        const esp_err_t ret = m_wireless_link.dap_execute(rp.src_mac, cmd.data, cmd.len);
                         if (ret != ESP_OK)
                         {
                             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),
