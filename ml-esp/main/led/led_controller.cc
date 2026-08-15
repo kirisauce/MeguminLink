@@ -2,7 +2,6 @@
 
 #include "esp_log.h"
 #include "meguminlink/app.hpp" // Application 完整定义（读取 mode/pairing_active）
-#include "sdkconfig.h"
 
 using namespace mlink;
 
@@ -32,7 +31,7 @@ void LedController::update()
     const bool wireless = m_app->mode() == Mode::Wireless;
     const bool pairing = m_app->pairing_active();
 
-    m_driver.apply(LedEffects{wireless ? LedEffect::Off : LedEffect::On,
-                              pairing ? LedEffect::Blink
-                                      : wireless ? LedEffect::On : LedEffect::Off});
+    m_driver.apply(LedEffects{wireless ? LedEffect::Off : LedEffect::On, pairing    ? LedEffect::Blink
+                                                                         : wireless ? LedEffect::On
+                                                                                    : LedEffect::Off});
 }

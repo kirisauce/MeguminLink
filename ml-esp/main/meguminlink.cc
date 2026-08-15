@@ -1,7 +1,5 @@
-#include "esp_log.h"
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
-#include "sdkconfig.h"
 
 extern "C" void app_main();
 

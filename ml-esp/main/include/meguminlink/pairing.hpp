@@ -1,3 +1,4 @@
+#pragma once
 #ifndef __MEGUMINLINK_PAIRING_HPP__
 #define __MEGUMINLINK_PAIRING_HPP__
 

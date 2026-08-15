@@ -12,14 +12,14 @@ namespace mlink
  * DAP 命令缓冲建议容量：CMSIS-DAP v2 单次请求上限（DAP_PACKET_SIZE=64B，
  * USB EP 64B / 无线帧命令长度检查均以此为限）。
  */
-inline constexpr size_t kDapMaxRequestSize = 64;
+inline constexpr size_t DAP_MAX_REQUEST_SIZE = 64;
 
 /**
  * DAP 响应缓冲建议容量：请求 ≤ DAP_PACKET_SIZE（64B）时，0x7F 批量命令
  * 的响应理论上限约 31 子命令 × 64B + 2 ≈ 2KB（CMSIS-DAP 的 DAP_ExecuteCommand
  * 批量响应写入不检查边界），此值覆盖该上限防止溢出。
  */
-inline constexpr size_t kDapMaxResponseSize = 2048;
+inline constexpr size_t DAP_MAX_RESPONSE_SIZE = 2048;
 
 /**
  * 阻塞获取一条 DAP 命令的源。
@@ -57,7 +57,7 @@ u16 dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t respon
  *
  * 调用方负责以高优先级创建承载任务（SWD 位碰撞执行期间不可被抢占），
  * 并提供命令缓冲（容量 request_cap ≥ DAP_PACKET_SIZE）与响应缓冲
- * （容量 response_cap ≥ kDapMaxResponseSize）——缓冲放在调用方存储中
+ * （容量 response_cap ≥ DAP_MAX_RESPONSE_SIZE）——缓冲放在调用方存储中
  * 而非本函数栈上（ESP-IDF 任务栈以字节计且有限）。
  *
  * @param cmd_src      命令源（阻塞取命令；返回 true=执行，false=不执行）
@@ -68,8 +68,8 @@ u16 dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t respon
  * @param response     响应缓冲（容量 response_cap）
  * @param response_cap 响应缓冲容量
  */
-void dap_executor_run(DapCommandSource cmd_src, DapResponseSink resp_sink, void *arg, u8 *request,
-                      size_t request_cap, u8 *response, size_t response_cap);
+void dap_executor_run(DapCommandSource cmd_src, DapResponseSink resp_sink, void *arg, u8 *request, size_t request_cap,
+                      u8 *response, size_t response_cap);
 } // namespace mlink
 
 #endif

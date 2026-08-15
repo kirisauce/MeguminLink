@@ -1,7 +1,7 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
-#include "meguminlink/dap_executor.hpp" // dap_executor_run（Local 执行核心）
+#include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
 #include "meguminlink/wireless_link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
 
 #include <esp_log.h>
@@ -18,8 +18,11 @@
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 cmsis_dap/Source/*.c 一致）。
 // DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
 // DAP.h 仅在未定义时提供默认值（#ifndef 保护）；顺序反了会触发宏重定义。
+// clang-format 的字典序排序会把它们排反，此处保持顺序：
+// clang-format off
 #include "DAP_config.h"
 #include "DAP.h"
+// clang-format on
 
 static constexpr char TAG[] = "mlink::usb";
 
@@ -100,7 +103,7 @@ constexpr u8 CONFIG_DESCRIPTOR[] = {
     // 如需 SWO 流，在此追加 EP3 Bulk In (0x83, 64B) 描述符
 };
 
-void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
+void tinyusb_event_callback([[maybe_unused]] tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
 }
 
@@ -112,11 +115,11 @@ void tinyusb_event_callback(tinyusb_event_t *event, [[maybe_unused]] void *arg)
 // 请求/响应缓冲为 USB 传输层资源（不占任务栈——ESP-IDF 任务栈以字节计，
 // DAP 执行调用链栈需求大，缓冲放栈上会溢出）。
 u8 dap_request[DAP_PACKET_SIZE];
-// 响应缓冲按 CMSIS-DAP 批量响应上限预留（kDapMaxResponseSize，见
+// 响应缓冲按 CMSIS-DAP 批量响应上限预留（DAP_MAX_RESPONSE_SIZE，见
 // dap_executor.hpp）：Local 模式单命令响应 ≤ DAP_PACKET_SIZE，0x7F 批量
 // 响应可到 ~2KB（DAP_ExecuteCommand 批量写入不检查边界）；Wireless 模式
-// 等待到的无线响应（≤ kMaxDapPayloadSize）同样拷入此缓冲再写回 USB。
-u8 dap_response[mlink::kDapMaxResponseSize];
+// 等待到的无线响应（≤ MAX_DAP_PAYLOAD_SIZE）同样拷入此缓冲再写回 USB。
+u8 dap_response[mlink::DAP_MAX_RESPONSE_SIZE];
 
 // 响应写入 vendor TX FIFO：write 同步拷贝入 FIFO，满时返回 0；
 // tinyusb_task 后台排空。拷贝完成即缓冲区可复用，无需等发送完毕。
@@ -184,7 +187,7 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
         vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
         return false;
     }
-    memcpy(buf, item, item_size);
+    std::memcpy(buf, item, item_size);
     vRingbufferReturnItem(usb.m_bulk_rx_buffer, item);
     *len = static_cast<u16>(item_size);
 
@@ -201,8 +204,8 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     if (app.mode() == mlink::Mode::Wireless)
     {
         u16 resp_len = 0;
-        const esp_err_t ret = app.wireless_link().forward_dap_command(buf, *len, dap_response,
-                                                                      sizeof(dap_response), &resp_len);
+        const esp_err_t ret =
+            app.wireless_link().forward_dap_command(buf, *len, dap_response, sizeof(dap_response), &resp_len);
         if (ret == ESP_OK)
         {
             dap_send_response(dap_response, resp_len);
@@ -216,7 +219,7 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
 // 执行器响应宿（USB 输出，dap_executor_run 的 resp_sink）。
 // 保持既有语义：超过 DAP_PACKET_SIZE 的响应（仅 0x7F 批量命令可触发）
 // 截断发送，与上游 [DAP_PACKET_COUNT][DAP_PACKET_SIZE] 缓冲同语义。
-void usb_resp_sink(const u8 *data, u16 len, void *arg)
+void usb_resp_sink(const u8 *data, u16 len, [[maybe_unused]] void *arg)
 {
     u16 out_len = len;
     if (out_len > DAP_PACKET_SIZE)
@@ -300,7 +303,7 @@ esp_err_t CmsisDapUsb::init()
         // 串号 = 芯片 MAC，保证多个 probe 可同时枚举
         u8 mac[6];
         ret = esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
-        __check("Failed to read MAC address");
+        MLINK_CHECK("Failed to read MAC address");
         snprintf(m_serial, sizeof(m_serial), MACSTR, MAC2STR(mac));
     }
 
@@ -322,12 +325,12 @@ esp_err_t CmsisDapUsb::init()
 #endif
 
         ret = tinyusb_driver_install(&tinyusb_config);
-        __check("Failed to initialize TinyUSB driver");
+        MLINK_CHECK("Failed to initialize TinyUSB driver");
     }
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     ret = uart_bridge_init();
-    __check("Failed to initialize USB CDC ACM interface");
+    MLINK_CHECK("Failed to initialize USB CDC ACM interface");
 #endif
 
     // 创建DAP处理任务。

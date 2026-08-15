@@ -15,7 +15,7 @@ esp_err_t ButtonState::init(gpio_num_t gpio)
 {
     m_gpio = gpio;
 
-    // 声明置于所有 __check(goto err) 之前，避免跨初始化跳转
+    // 声明置于所有 MLINK_CHECK(goto err) 之前，避免跨初始化跳转
     esp_timer_create_args_t timer_args = {};
 
     gpio_config_t cfg = {};
@@ -26,12 +26,12 @@ esp_err_t ButtonState::init(gpio_num_t gpio)
     cfg.intr_type = GPIO_INTR_ANYEDGE; // 按下/松开都触发：松开需取消长按定时器
 
     esp_err_t ret = gpio_config(&cfg);
-    __check("gpio_config(GPIO%d) failed: %s", gpio, esp_err_to_name(ret));
+    MLINK_CHECK("gpio_config(GPIO%d) failed: %s", gpio, esp_err_to_name(ret));
 
     // gpio_install_isr_service 全局唯一，重复调用返回 ESP_ERR_INVALID_STATE；
     // 本模块是项目中第一个使用 GPIO ISR 服务的组件（调用前已确认）。
     ret = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-    __check("gpio_install_isr_service failed: %s", esp_err_to_name(ret));
+    MLINK_CHECK("gpio_install_isr_service failed: %s", esp_err_to_name(ret));
 
     // 长按一次性定时器：按下边沿启动，到期仍按住则判长按。
     // 必须先于 ISR 注册创建，保证 ISR 触发时 handle 有效。
@@ -39,10 +39,10 @@ esp_err_t ButtonState::init(gpio_num_t gpio)
     timer_args.arg = this;
     timer_args.name = "mlink_long_press";
     ret = esp_timer_create(&timer_args, &m_long_press_timer);
-    __check("esp_timer_create(long_press) failed: %s", esp_err_to_name(ret));
+    MLINK_CHECK("esp_timer_create(long_press) failed: %s", esp_err_to_name(ret));
 
     ret = gpio_isr_handler_add(gpio, isr_handler, this);
-    __check("gpio_isr_handler_add(GPIO%d) failed: %s", gpio, esp_err_to_name(ret));
+    MLINK_CHECK("gpio_isr_handler_add(GPIO%d) failed: %s", gpio, esp_err_to_name(ret));
 
     ESP_LOGI(TAG, "Mode switch on GPIO%d (double click %d ms, long press %d ms)", gpio,
              CONFIG_MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS, CONFIG_MEGUMINLINK_MODE_SWITCH_LONG_PRESS_MS);

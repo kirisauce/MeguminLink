@@ -41,16 +41,15 @@ Application::Application()
     const u8 v = m_mode_key.get();
     m_mode = (v == static_cast<u8>(Mode::Wireless)) ? Mode::Wireless : Mode::Local;
 
-    // USB 支持未编译（kLocalModeSupported=false）时 Local 不可达：
+    // USB 支持未编译（LOCAL_MODE_SUPPORTED=false）时 Local 不可达：
     // 强制 Wireless，并改写 NVS 自愈（仅发生一次，下次启动直接是 Wireless）。
-    if (!kLocalModeSupported && m_mode == Mode::Local)
+    if (!LOCAL_MODE_SUPPORTED && m_mode == Mode::Local)
     {
         m_mode = Mode::Wireless;
         const esp_err_t ret = m_mode_key.set(static_cast<u8>(Mode::Wireless));
         if (ret != ESP_OK)
         {
-            ESP_LOGE(TAG, "Failed to persist wireless mode (Local unsupported): %s",
-                     esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to persist wireless mode (Local unsupported): %s", esp_err_to_name(ret));
         }
         else
         {
@@ -82,9 +81,9 @@ Mode Application::mode() const
 
 void Application::set_mode(Mode new_mode)
 {
-    // USB 支持未编译（kLocalModeSupported=false）时 Local 不可达：
+    // USB 支持未编译（LOCAL_MODE_SUPPORTED=false）时 Local 不可达：
     // 静默忽略（不持久化、不应用、无日志），双击切 Local 等价于锁死 Wireless。
-    if (new_mode == Mode::Local && !kLocalModeSupported)
+    if (new_mode == Mode::Local && !LOCAL_MODE_SUPPORTED)
     {
         return;
     }
@@ -295,9 +294,8 @@ void Application::run()
             {
                 // 统一驱动配对状态机。手动进入的配对有超时退出（防误按恢复旧配对）；
                 // 自动进入的配对以配对成功为唯一出口（超时退出无旧配对可用，无意义）
-                if (m_pairing_manual &&
-                    xTaskGetTickCount() - m_pairing_manual_start >=
-                        pdMS_TO_TICKS(CONFIG_MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS))
+                if (m_pairing_manual && xTaskGetTickCount() - m_pairing_manual_start >=
+                                            pdMS_TO_TICKS(CONFIG_MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS))
                 {
                     leave_pairing("timeout");
                 }

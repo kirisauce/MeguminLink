@@ -62,7 +62,7 @@ esp_err_t mlink::NvsKey::raw_store_u8(u8 value) const
 {
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    __check("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
+    MLINK_CHECK("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
 
     ret = nvs_set_u8(handle, m_key, value);
     if (ret == ESP_OK)
@@ -93,7 +93,7 @@ esp_err_t mlink::NvsKey::raw_store_blob(const void *value, size_t len) const
 {
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    __check("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
+    MLINK_CHECK("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
 
     ret = nvs_set_blob(handle, m_key, value, len);
     if (ret == ESP_OK)

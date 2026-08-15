@@ -54,9 +54,6 @@ class CmsisDapUsb
     QueueHandle_t m_uart_queue;
     TaskHandle_t m_uart_bridge_task = nullptr;
 #endif
-
-    static constexpr u16 USB_VID = 0x303A;
-    static constexpr u16 USB_PID = 0x4020;
 };
 } // namespace mlink
 

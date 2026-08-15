@@ -1,3 +1,4 @@
+#pragma once
 #ifndef __MEGUMINLINK_APP_HPP__
 #define __MEGUMINLINK_APP_HPP__
 
@@ -25,16 +26,16 @@ namespace mlink
 {
 /** Local 模式是否可达：USB 支持未编译时（含非 S3 目标）Local 不可达，强制 Wireless */
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
-inline constexpr bool kLocalModeSupported = true;
+inline constexpr bool LOCAL_MODE_SUPPORTED = true;
 #else
-inline constexpr bool kLocalModeSupported = false;
+inline constexpr bool LOCAL_MODE_SUPPORTED = false;
 #endif
 
 /**
  * Application 运行模式（唯一状态机，见 Application）。
  *
  * Local：本地调试，USB CMSIS-DAP（+ UART 桥）正常工作；仅
- * kLocalModeSupported（USB 支持启用）时可达，否则强制 Wireless；
+ * LOCAL_MODE_SUPPORTED（USB 支持启用）时可达，否则强制 Wireless；
  * Wireless：无线调试，USB 设备保持启用（主机可枚举），USB 收到的
  * DAP 命令由 dap_task 打包为 DapCommand 帧无线转发到配对 peer；
  * 接收端当前仅打日志、不回响应（第一版，无 DAP 执行逻辑）。
@@ -52,7 +53,7 @@ inline constexpr bool kLocalModeSupported = false;
  */
 enum class Mode
 {
-    Local,    // 本地调试（USB）；仅 kLocalModeSupported 时可达，否则不可用
+    Local,    // 本地调试（USB）；仅 LOCAL_MODE_SUPPORTED 时可达，否则不可用
     Wireless, // 无线调试（USB 常驻，DAP 命令无线转发；未配对时自动配对）
 };
 
@@ -91,7 +92,7 @@ class Application
 
     /**
      * 由 dap_task 调用：阻塞等待无线 DAP 响应（带超时）。
-     * @param buf        响应缓冲区（容量需 ≥ kMaxDapPayloadSize）
+     * @param buf        响应缓冲区（容量需 ≥ MAX_DAP_PAYLOAD_SIZE）
      * @param len        输出：实际响应字节数
      * @param timeout_ms 超时（MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS）
      * @return true=成功；false=超时（调用方丢弃，PC 端 debugger 自行重试）
@@ -107,12 +108,10 @@ class Application
 
     void run();
 
-    /**
-     * 配对成功落盘后由 PairingState 回调：统一退出配对流程。
-     */
     /** 是否处于配对流程（供 LedController 自行读取） */
     bool pairing_active() const;
 
+    /** 配对成功落盘后由 PairingState 回调：统一退出配对流程 */
     void pairing_completed();
 
     static Application &get_instance();
@@ -148,9 +147,9 @@ class Application
      * 无线 DAP 响应通道（发送端用）：
      * 主循环收到 DapResponse 帧 → push_wireless_response 写入并 give 信号量；
      * dap_task 转发命令后 → wait_wireless_response 等待信号量并读出。
-     * 缓冲大小对齐无线帧承载上限（kMaxDapPayloadSize）。
+     * 缓冲大小对齐无线帧承载上限（MAX_DAP_PAYLOAD_SIZE）。
      */
-    u8 m_wireless_response[kMaxDapPayloadSize];
+    u8 m_wireless_response[MAX_DAP_PAYLOAD_SIZE];
     u16 m_wireless_response_len = 0;
     SemaphoreHandle_t m_wireless_response_sem;   /**< 响应到达信号（二进制） */
     SemaphoreHandle_t m_wireless_response_mutex; /**< 响应缓冲互斥 */

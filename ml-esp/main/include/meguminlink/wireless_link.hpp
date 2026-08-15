@@ -3,10 +3,10 @@
 #define __MEGUMINLINK_WIRELESS_LINK_HPP__
 
 #include "esp_err.h"
-#include "esp_now.h"              // IWYU pragma: export
-#include "esp_wifi.h"             // IWYU pragma: export
-#include "meguminlink/common.hpp" // IWYU pragma: keep
-#include "meguminlink/dap_executor.hpp" // kDapMaxRequestSize / kDapMaxResponseSize（执行器缓冲）
+#include "esp_now.h"                    // IWYU pragma: export
+#include "esp_wifi.h"                   // IWYU pragma: export
+#include "meguminlink/common.hpp"       // IWYU pragma: keep
+#include "meguminlink/dap_executor.hpp" // DAP_MAX_REQUEST_SIZE / DAP_MAX_RESPONSE_SIZE（执行器缓冲）
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
@@ -26,8 +26,8 @@ inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xf
  * （见 dap_executor.cc），不走无线帧——因此 Packet 结构保持小巧，
  * 调用方可放心放在任务栈上。
  */
-inline constexpr size_t kDapFrameHeaderSize = 3;
-inline constexpr size_t kMaxDapPayloadSize = kDapMaxRequestSize; // 64B，见 dap_executor.hpp
+inline constexpr size_t DAP_FRAME_HEADER_SIZE = 3;
+inline constexpr size_t MAX_DAP_PAYLOAD_SIZE = DAP_MAX_REQUEST_SIZE; // 64B，见 dap_executor.hpp
 
 namespace payload
 {
@@ -49,7 +49,7 @@ struct PairingAccepted
  * DAP 命令/响应为"指针视图"：Packet 只是序列化包装层，不内嵌数据。
  * 发送时 data 指向调用方命令/响应缓冲；接收（反序列化）时由调用方提供
  * 存储（见 ReceivedPacket::storage），data 指向该存储。数据段上限
- * kMaxDapPayloadSize = DAP_PACKET_SIZE（64B，USB 单包），Packet 因此
+ * MAX_DAP_PAYLOAD_SIZE = DAP_PACKET_SIZE（64B，USB 单包），Packet 因此
  * 保持小巧，可放心放任务栈上。
  */
 struct DapCommand
@@ -92,7 +92,7 @@ class Packet
      * 从无线帧反序列化。
      * @param storage      payload 数据存储（DapCommand/DapResponse 的数据
      *                     拷贝到这里，其 data 指针指向本存储）
-     * @param storage_cap  存储容量（≥ kMaxDapPayloadSize）
+     * @param storage_cap  存储容量（≥ MAX_DAP_PAYLOAD_SIZE）
      */
     esp_err_t deserialize(const u8 *data, size_t len, u8 *storage, size_t storage_cap);
     esp_err_t serialize(u8 *buffer, size_t len) const;
@@ -115,7 +115,7 @@ struct ReceivedPacket
 {
     Packet packet;
     u8 src_mac[ESP_NOW_ETH_ALEN];
-    u8 storage[kMaxDapPayloadSize];
+    u8 storage[MAX_DAP_PAYLOAD_SIZE];
 
     ReceivedPacket() = default;
 
@@ -180,7 +180,7 @@ class WirelessLink
     /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
      * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
-     * resp 缓冲（容量 resp_cap，需 ≥ kMaxDapPayloadSize）。
+     * resp 缓冲（容量 resp_cap，需 ≥ MAX_DAP_PAYLOAD_SIZE）。
      * @return ESP_OK=已收到响应；否则失败（未配对 / 发送失败 / 响应超时，
      *         命令已丢弃，PC 端 debugger 会自行超时重试）
      */
@@ -213,7 +213,7 @@ class WirelessLink
     static void dap_resp_sink(const u8 *data, u16 len, void *arg);
     static void dap_task_fn(void *arg);
 
-    static constexpr u8 kChannel = 10; // ESP-NOW 固定信道
+    static constexpr u8 CHANNEL = 10; // ESP-NOW 固定信道
 
     bool m_initialized = false;
     /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
@@ -222,8 +222,8 @@ class WirelessLink
     /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
     u8 m_dap_src_mac[ESP_NOW_ETH_ALEN];
     /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */
-    u8 m_dap_request[kDapMaxRequestSize];
-    u8 m_dap_response[kDapMaxResponseSize];
+    u8 m_dap_request[DAP_MAX_REQUEST_SIZE];
+    u8 m_dap_response[DAP_MAX_RESPONSE_SIZE];
 };
 } // namespace mlink
 

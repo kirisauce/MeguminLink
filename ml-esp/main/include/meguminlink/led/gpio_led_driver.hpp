@@ -2,7 +2,7 @@
 #ifndef __MEGUMINLINK_GPIO_LED_DRIVER_HPP__
 #define __MEGUMINLINK_GPIO_LED_DRIVER_HPP__
 
-#include "driver/gpio.h"        // gpio_num_t
+#include "driver/gpio.h" // gpio_num_t
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h" // portMUX_TYPE
@@ -45,10 +45,10 @@ class GpioLedDriver
 
     gpio_num_t m_io[2] = {static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO_LED1_IO),
                           static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO_LED2_IO)};
-    bool m_active_low;          /**< 低电平点亮 */
+    bool m_active_low; /**< 低电平点亮 */
     esp_timer_handle_t m_timer = nullptr;
-    LedEffects m_effects{};     /**< 当前目标效果（apply 写入，定时器读取） */
-    bool m_level[2] = {};       /**< 当前实际 GPIO 电平（Blink 相位） */
+    LedEffects m_effects{}; /**< 当前目标效果（apply 写入，定时器读取） */
+    bool m_level[2] = {};   /**< 当前实际 GPIO 电平（Blink 相位） */
     portMUX_TYPE m_lock = portMUX_INITIALIZER_UNLOCKED;
 };
 

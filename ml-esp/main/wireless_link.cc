@@ -4,14 +4,19 @@
 #include "esp_mac.h"
 #include "meguminlink/app.hpp"
 #include "meguminlink/binfmt.hpp"
+#include "meguminlink/common.hpp"
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（无线侧执行接线）
 #include "meguminlink/nvs_flash.hpp"
-#include "meguminlink/common.hpp"
 #include <cstring>
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc 一致）。
+// DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
+// DAP.h 仅在未定义时提供默认值（#ifndef 保护）；顺序反了会触发宏重定义。
+// clang-format 的字典序排序会把它们排反，此处保持顺序：
+// clang-format off
 #include "DAP_config.h" // DAP_PACKET_SIZE（命令长度上限/请求缓冲）
 #include "DAP.h"
+// clang-format on
 
 using namespace mlink;
 
@@ -19,11 +24,11 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/** 无线发送帧缓冲大小（栈上）：帧 ≤ kDapFrameHeaderSize + kMaxDapPayloadSize = 67B */
-constexpr size_t kMaxFrameSize = kDapFrameHeaderSize + kMaxDapPayloadSize;
+/** 无线发送帧缓冲大小（栈上）：帧 ≤ DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE = 67B */
+constexpr size_t MAX_FRAME_SIZE = DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE;
 
 /** 无线侧 DAP 执行器：命令队列深度 */
-constexpr size_t kDapQueueDepth = 8;
+constexpr size_t DAP_QUEUE_DEPTH = 8;
 
 /** 一条待执行的 DAP 命令：命令来源（响应回发）+ 原样命令字节流 */
 struct DapExecuteRequest
@@ -55,7 +60,7 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     Application::get_instance().push_received_packet(rp);
 }
 
-void WirelessLink::send_cb(const wifi_tx_info_t *send_info, esp_now_send_status_t send_status)
+void WirelessLink::send_cb([[maybe_unused]] const wifi_tx_info_t *send_info, esp_now_send_status_t send_status)
 {
     if (send_status != ESP_NOW_SEND_SUCCESS)
     {
@@ -72,52 +77,52 @@ esp_err_t WirelessLink::init()
 
     esp_err_t ret;
     ret = mlink::nvs_flash_init();
-    __check("mlink::nvs_flash_init() failed");
+    MLINK_CHECK("mlink::nvs_flash_init() failed");
 
     ret = esp_netif_init();
-    __check("esp_netif_init() failed");
+    MLINK_CHECK("esp_netif_init() failed");
     ret = esp_event_loop_create_default();
-    __check("esp_event_loop_create_default() failed");
+    MLINK_CHECK("esp_event_loop_create_default() failed");
 
     {
         wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
         ret = esp_wifi_init(&wifi_init_cfg);
-        __check("esp_wifi_init() failed");
+        MLINK_CHECK("esp_wifi_init() failed");
         ESP_LOGI(TAG, "WiFi initialized");
 
         ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-        __check("esp_wifi_set_storage() failed");
+        MLINK_CHECK("esp_wifi_set_storage() failed");
     }
 
     {
         ret = esp_wifi_set_mode(WIFI_MODE_STA);
-        __check("esp_wifi_set_mode() failed");
+        MLINK_CHECK("esp_wifi_set_mode() failed");
 
         wifi_config_t wifi_cfg = {};
         ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-        __check("esp_wifi_set_config() failed");
+        MLINK_CHECK("esp_wifi_set_config() failed");
 
         ret = esp_wifi_start();
-        __check("esp_wifi_start() failed");
+        MLINK_CHECK("esp_wifi_start() failed");
 
-        ret = esp_wifi_set_channel(kChannel, WIFI_SECOND_CHAN_NONE);
-        __check("esp_wifi_set_channel() failed");
+        ret = esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+        MLINK_CHECK("esp_wifi_set_channel() failed");
     }
 
     ret = esp_now_init();
-    __check("esp_now_init() failed");
+    MLINK_CHECK("esp_now_init() failed");
 
     ret = peer_add(ESP_NOW_BROADCAST);
-    __check("ensure_broadcast_peer() failed: %s", esp_err_to_name(ret));
+    MLINK_CHECK("peer_add(ESP_NOW_BROADCAST) failed: %s", esp_err_to_name(ret));
 
     ret = esp_now_register_recv_cb(recv_cb);
-    __check("Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
+    MLINK_CHECK("Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
 
     ret = esp_now_register_send_cb(send_cb);
-    __check("Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
+    MLINK_CHECK("Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
 
     // 无线侧 DAP 执行器：命令队列 + 高优先级任务（收到 DapCommand → 执行 → 回发）
-    m_dap_queue = xQueueCreate(kDapQueueDepth, sizeof(DapExecuteRequest));
+    m_dap_queue = xQueueCreate(DAP_QUEUE_DEPTH, sizeof(DapExecuteRequest));
     if (m_dap_queue == nullptr)
     {
         ESP_LOGE(TAG, "Failed to create DAP command queue");
@@ -184,7 +189,7 @@ esp_err_t WirelessLink::peer_remove(const u8 *peer_mac)
 esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 {
     // 栈上缓冲（Packet 小巧：数据段 ≤64B，帧 ≤67B）
-    u8 buffer[kMaxFrameSize];
+    u8 buffer[MAX_FRAME_SIZE];
     const esp_err_t ret = packet.serialize(buffer, sizeof(buffer));
     if (ret != ESP_OK)
     {
@@ -197,10 +202,10 @@ esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 
 esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len)
 {
-    if (len > kMaxDapPayloadSize)
+    if (len > MAX_DAP_PAYLOAD_SIZE)
     {
         ESP_LOGE(TAG, "DAP command too large (%u bytes, max %u)", static_cast<unsigned>(len),
-                 static_cast<unsigned>(kMaxDapPayloadSize));
+                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -215,10 +220,10 @@ esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, siz
 
 esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, size_t len)
 {
-    if (len > kMaxDapPayloadSize)
+    if (len > MAX_DAP_PAYLOAD_SIZE)
     {
         ESP_LOGE(TAG, "DAP response too large (%u bytes, max %u)", static_cast<unsigned>(len),
-                 static_cast<unsigned>(kMaxDapPayloadSize));
+                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -251,7 +256,8 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
     // 阻塞等待接收端响应（一次一个在途请求，与 CMSIS-DAP v2 同步请求/响应
     // 语义一致；等待期间不处理下一个请求）。
     u16 rlen = 0;
-    if (!Application::get_instance().wait_wireless_response(resp, &rlen, CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS))
+    if (!Application::get_instance().wait_wireless_response(resp, &rlen,
+                                                            CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS))
     {
         ESP_LOGW(TAG, "Wireless: no response within %u ms, %u-byte request dropped",
                  CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS, static_cast<unsigned>(len));
@@ -260,7 +266,7 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
 
     if (rlen > resp_cap)
     {
-        // 防御性截断（正常不会触发：接收端只发送 ≤ kMaxDapPayloadSize 的响应）
+        // 防御性截断（正常不会触发：接收端只发送 ≤ MAX_DAP_PAYLOAD_SIZE 的响应）
         ESP_LOGW(TAG, "Wireless response truncated (%u -> %u)", rlen, static_cast<unsigned>(resp_cap));
         rlen = static_cast<u16>(resp_cap);
     }
@@ -344,7 +350,7 @@ esp_err_t WirelessLink::dap_execute(const u8 *src_mac, const u8 *data, size_t le
 
 // ---- Packet 序列化 ----
 
-#define __check_size(parser, expected_size)                                                                            \
+#define MLINK_CHECK_SIZE(parser, expected_size)                                                                        \
     if (parser.remaining() < expected_size)                                                                            \
     {                                                                                                                  \
         return ESP_ERR_INVALID_SIZE;                                                                                   \
@@ -370,7 +376,7 @@ size_t Packet::serialized_size() const
     case PacketType::DapCommand:
     case PacketType::DapResponse: {
         const u16 len = (packet_type == PacketType::DapCommand) ? payload.dap_command.len : payload.dap_response.len;
-        return kDapFrameHeaderSize + len;
+        return DAP_FRAME_HEADER_SIZE + len;
     }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
@@ -383,7 +389,7 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
 {
     BinDeserializer p(data, data + len);
 
-    __check_size(p, 1);
+    MLINK_CHECK_SIZE(p, 1);
     packet_type = static_cast<PacketType>(p.read_u8());
 
     switch (packet_type)
@@ -393,26 +399,26 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
     }
     case PacketType::PairingRequest: {
         auto &content = payload.pairing_request;
-        __check_size(p, 6);
+        MLINK_CHECK_SIZE(p, 6);
         p.read_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
     case PacketType::PairingAccepted: {
         auto &content = payload.pairing_accepted;
-        __check_size(p, 6);
+        MLINK_CHECK_SIZE(p, 6);
         p.read_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
     case PacketType::DapCommand: {
         // 数据段拷入调用方存储，data 指向该存储（见 ReceivedPacket::storage）
         auto &content = payload.dap_command;
-        __check_size(p, 2);
+        MLINK_CHECK_SIZE(p, 2);
         const u16 n = p.read_u16();
         if (n > storage_cap)
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        __check_size(p, n);
+        MLINK_CHECK_SIZE(p, n);
         p.read_bytes(storage, n);
         content.len = n;
         content.data = storage;
@@ -420,13 +426,13 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
     }
     case PacketType::DapResponse: {
         auto &content = payload.dap_response;
-        __check_size(p, 2);
+        MLINK_CHECK_SIZE(p, 2);
         const u16 n = p.read_u16();
         if (n > storage_cap)
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        __check_size(p, n);
+        MLINK_CHECK_SIZE(p, n);
         p.read_bytes(storage, n);
         content.len = n;
         content.data = storage;
@@ -443,7 +449,7 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
 esp_err_t Packet::serialize(u8 *buffer, size_t len) const
 {
     BinSerializer s(buffer, len);
-    __check_size(s, 1);
+    MLINK_CHECK_SIZE(s, 1);
     s.write_u8(static_cast<u8>(packet_type));
 
     switch (packet_type)
@@ -453,37 +459,37 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
     }
     case PacketType::PairingRequest: {
         auto &content = payload.pairing_request;
-        __check_size(s, 6);
+        MLINK_CHECK_SIZE(s, 6);
         s.write_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
     case PacketType::PairingAccepted: {
         auto &content = payload.pairing_accepted;
-        __check_size(s, 6);
+        MLINK_CHECK_SIZE(s, 6);
         s.write_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
     case PacketType::DapCommand: {
         auto &content = payload.dap_command;
-        if (content.data == nullptr || content.len > kMaxDapPayloadSize)
+        if (content.data == nullptr || content.len > MAX_DAP_PAYLOAD_SIZE)
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        __check_size(s, 2);
+        MLINK_CHECK_SIZE(s, 2);
         s.write_u16(content.len);
-        __check_size(s, content.len);
+        MLINK_CHECK_SIZE(s, content.len);
         s.write_bytes(content.data, content.len);
         break;
     }
     case PacketType::DapResponse: {
         auto &content = payload.dap_response;
-        if (content.data == nullptr || content.len > kMaxDapPayloadSize)
+        if (content.data == nullptr || content.len > MAX_DAP_PAYLOAD_SIZE)
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        __check_size(s, 2);
+        MLINK_CHECK_SIZE(s, 2);
         s.write_u16(content.len);
-        __check_size(s, content.len);
+        MLINK_CHECK_SIZE(s, content.len);
         s.write_bytes(content.data, content.len);
         break;
     }
@@ -495,4 +501,4 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
     return ESP_OK;
 }
 
-#undef __check_size
+#undef MLINK_CHECK_SIZE

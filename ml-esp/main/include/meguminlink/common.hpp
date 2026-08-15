@@ -3,7 +3,7 @@
 #define __MEGUMINLINK_COMMON_HPP__
 
 #ifdef __MEGUMINLINK_EXPORT_MACROS__
-#define __check(...)                                                                                                   \
+#define MLINK_CHECK(...)                                                                                               \
     if (ret != ESP_OK)                                                                                                 \
     {                                                                                                                  \
         ESP_LOGE(TAG, __VA_ARGS__);                                                                                    \
@@ -26,4 +26,4 @@ using i64 = int64_t;
 using f32 = float;
 using f64 = double;
 
-#endif // __MEGUMIN_LINK_COMMON_H__
+#endif // __MEGUMINLINK_COMMON_HPP__
