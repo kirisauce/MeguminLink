@@ -23,10 +23,18 @@
 
 namespace mlink
 {
+/** Local 模式是否可达：USB 支持未编译时（含非 S3 目标）Local 不可达，强制 Wireless */
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+inline constexpr bool kLocalModeSupported = true;
+#else
+inline constexpr bool kLocalModeSupported = false;
+#endif
+
 /**
  * Application 运行模式（唯一状态机，见 Application）。
  *
- * Local：本地调试，USB CMSIS-DAP（+ UART 桥）正常工作；
+ * Local：本地调试，USB CMSIS-DAP（+ UART 桥）正常工作；仅
+ * kLocalModeSupported（USB 支持启用）时可达，否则强制 Wireless；
  * Wireless：无线调试，USB 设备整体禁用，无线逻辑尚未实现（占位）。
  *
  * 配对（ESP-NOW 建链）是 Wireless 的子流程，统一由配对流程管理
@@ -42,7 +50,7 @@ namespace mlink
  */
 enum class Mode
 {
-    Local,    // 本地调试（USB）
+    Local,    // 本地调试（USB）；仅 kLocalModeSupported 时可达，否则不可用
     Wireless, // 无线调试（USB 禁用，未实现；未配对时自动配对）
 };
 

@@ -36,6 +36,23 @@ Application::Application()
     const u8 v = m_mode_key.get();
     m_mode = (v == static_cast<u8>(Mode::Wireless)) ? Mode::Wireless : Mode::Local;
 
+    // USB 支持未编译（kLocalModeSupported=false）时 Local 不可达：
+    // 强制 Wireless，并改写 NVS 自愈（仅发生一次，下次启动直接是 Wireless）。
+    if (!kLocalModeSupported && m_mode == Mode::Local)
+    {
+        m_mode = Mode::Wireless;
+        const esp_err_t ret = m_mode_key.set(static_cast<u8>(Mode::Wireless));
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to persist wireless mode (Local unsupported): %s",
+                     esp_err_to_name(ret));
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Local mode unsupported (USB disabled); forced wireless");
+        }
+    }
+
     // 在此初始化 USB 与模式切换按键，并应用当前模式（无线模式立即禁用 USB）。
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     ESP_ERROR_CHECK(m_usb.init());
@@ -56,6 +73,13 @@ Mode Application::mode() const
 
 void Application::set_mode(Mode new_mode)
 {
+    // USB 支持未编译（kLocalModeSupported=false）时 Local 不可达：
+    // 静默忽略（不持久化、不应用、无日志），双击切 Local 等价于锁死 Wireless。
+    if (new_mode == Mode::Local && !kLocalModeSupported)
+    {
+        return;
+    }
+
     m_mode = new_mode; // 先更新状态：apply_mode 按新模式应用系统行为
 
     // 配对是 Wireless 子流程：离开 Wireless 即终止配对（切回时未配对会重新自动进入）

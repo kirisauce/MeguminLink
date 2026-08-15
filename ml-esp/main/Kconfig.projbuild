@@ -9,6 +9,10 @@ config MEGUMINLINK_USB_SUPPORT
         peripheral is only available on ESP32-S3, so this option is only
         configurable when building for that target; on other targets the
         file is always excluded from the build.
+        When disabled, the Local (USB CMSIS-DAP) mode is unavailable: the
+        device always runs in Wireless mode, a stored Local mode in NVS is
+        corrected to Wireless on boot, and the mode switch button cannot
+        switch to Local.
 
 config MEGUMINLINK_USB_MAX_PACKET_SIZE
     int "USB max packet size"
@@ -95,7 +99,9 @@ config MEGUMINLINK_MODE_SWITCH_ENABLE
     default y
     help
         Double click toggles between local (USB CMSIS-DAP) and wireless
-        debug modes; a long press (in wireless mode) enters pairing mode.
+        debug modes (with USB support disabled, Local is unavailable and
+        the toggle is a silent no-op, leaving the device in Wireless); a
+        long press (in wireless mode) enters pairing mode.
         Disable to strip the button driver (e.g. when the GPIO is needed
         for something else).
 
