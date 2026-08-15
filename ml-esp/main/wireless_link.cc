@@ -24,8 +24,8 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/** 无线发送帧缓冲大小（栈上）：帧 ≤ DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE = 67B */
-constexpr size_t MAX_FRAME_SIZE = DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE;
+/** 无线发送帧缓冲大小（栈上）：UartData 帧最大（3B 头 + 200B 数据 = 203B，> DAP 帧 67B） */
+constexpr size_t MAX_FRAME_SIZE = UART_FRAME_HEADER_SIZE + MAX_UART_PAYLOAD_SIZE;
 
 /** 无线侧 DAP 执行器：命令队列深度 */
 constexpr size_t DAP_QUEUE_DEPTH = 8;
@@ -79,6 +79,15 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     case PacketType::DapResponse: {
         const auto &resp = rp.packet.payload.dap_response;
         app.push_wireless_response(resp.data, resp.len);
+        return;
+    }
+    case PacketType::UartData: {
+        // 串口数据直通投递（不经主循环）：与 DAP 命令同路径优化。接收端
+        // 动作由本机角色决定——USB 侧（S3）写 CDC，无 USB 侧（C3）写 UART
+        // （见 Application::on_uart_data）。入队/拷贝均为轻量操作，可安全
+        // 在 esp_wifi 任务上下文执行。
+        const auto &uart = rp.packet.payload.uart_data;
+        app.on_uart_data(uart.data, uart.len);
         return;
     }
     default:
@@ -272,6 +281,24 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
     return send(dest_mac, packet);
 }
 
+esp_err_t WirelessLink::send_uart_data(const u8 *dest_mac, const u8 *data, size_t len)
+{
+    if (len > MAX_UART_PAYLOAD_SIZE)
+    {
+        ESP_LOGE(TAG, "UART data too large (%u bytes, max %u)", static_cast<unsigned>(len),
+                 static_cast<unsigned>(MAX_UART_PAYLOAD_SIZE));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Packet 为指针视图：data 指向调用方串口缓冲，零拷贝
+    Packet packet;
+    packet.packet_type = PacketType::UartData;
+    auto &content = packet.payload.uart_data;
+    content.len = static_cast<u16>(len);
+    content.data = data;
+    return send(dest_mac, packet);
+}
+
 esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len)
 {
     u8 peer_mac[ESP_NOW_ETH_ALEN];
@@ -305,9 +332,8 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
                  CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS, static_cast<unsigned>(len));
         return ESP_ERR_TIMEOUT;
     }
-    ESP_LOGD(TAG, "Wireless: DAP response %uB received (tick=%u, wireless_rtt=%u ms)",
-             static_cast<unsigned>(rlen), static_cast<unsigned>(xTaskGetTickCount()),
-             static_cast<unsigned>(xTaskGetTickCount() - sent_tick));
+    ESP_LOGD(TAG, "Wireless: DAP response %uB received (tick=%u, wireless_rtt=%u ms)", static_cast<unsigned>(rlen),
+             static_cast<unsigned>(xTaskGetTickCount()), static_cast<unsigned>(xTaskGetTickCount() - sent_tick));
 
     if (rlen > resp_cap)
     {
@@ -423,6 +449,9 @@ size_t Packet::serialized_size() const
         const u16 len = (packet_type == PacketType::DapCommand) ? payload.dap_command.len : payload.dap_response.len;
         return DAP_FRAME_HEADER_SIZE + len;
     }
+    case PacketType::UartData: {
+        return UART_FRAME_HEADER_SIZE + payload.uart_data.len;
+    }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
@@ -483,6 +512,20 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.data = storage;
         break;
     }
+    case PacketType::UartData: {
+        auto &content = payload.uart_data;
+        MLINK_CHECK_SIZE(p, 2);
+        const u16 n = p.read_u16();
+        if (n > storage_cap)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        MLINK_CHECK_SIZE(p, n);
+        p.read_bytes(storage, n);
+        content.len = n;
+        content.data = storage;
+        break;
+    }
     default: {
         break;
     }
@@ -529,6 +572,18 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
     case PacketType::DapResponse: {
         auto &content = payload.dap_response;
         if (content.data == nullptr || content.len > MAX_DAP_PAYLOAD_SIZE)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        MLINK_CHECK_SIZE(s, 2);
+        s.write_u16(content.len);
+        MLINK_CHECK_SIZE(s, content.len);
+        s.write_bytes(content.data, content.len);
+        break;
+    }
+    case PacketType::UartData: {
+        auto &content = payload.uart_data;
+        if (content.data == nullptr || content.len > MAX_UART_PAYLOAD_SIZE)
         {
             return ESP_ERR_INVALID_SIZE;
         }

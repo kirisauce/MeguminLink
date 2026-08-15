@@ -1,4 +1,5 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
+#include "meguminlink/app.hpp" // Application（CDC 数据按模式分流）
 #include "meguminlink/usb/usb.hpp"
 
 #include <driver/uart.h>
@@ -16,8 +17,10 @@ constexpr int RX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_RX_BUFFER_SIZE;
 constexpr int TX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_TX_BUFFER_SIZE;
 constexpr int QUEUE_SIZE = CONFIG_MEGUMINLINK_UART_EVENT_QUEUE_SIZE;
 
-// CDC RX 回调运行在 TinyUSB 任务上下文（tinyusb_task 派发）：只 read + 写 UART TX。
-// uart_write_bytes 是任务安全 API，TX 环形缓冲满时阻塞——受 USB 速率上界约束，可接受。
+// CDC RX 回调运行在 TinyUSB 任务上下文（tinyusb_task 派发）：只 read + 分流。
+// Local 模式：写 UART TX（uart_write_bytes 任务安全，TX 环形缓冲满时阻塞——
+// 受 USB 速率上界约束，可接受）；Wireless 模式：打包为 UartData 帧无线转发
+// 给配对 peer（尽力而为，未配对丢弃）。
 void uart_cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
 {
     static u8 rx_buffer[256];
@@ -29,6 +32,14 @@ void uart_cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *eve
         ESP_LOGW(TAG, "CDC read failed: %s", esp_err_to_name(ret));
         return;
     }
+
+    auto &app = mlink::Application::get_instance();
+    if (app.mode() == mlink::Mode::Wireless)
+    {
+        app.send_uart_data(rx_buffer, rx_size);
+        return;
+    }
+
     const int written = uart_write_bytes(UART_NUM, rx_buffer, rx_size);
     if (written < 0)
     {
@@ -219,5 +230,41 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
 
 err:
     return ret;
+}
+
+void CmsisDapUsb::uart_data_to_cdc(const u8 *data, size_t len)
+{
+    // 与 uart_bridge_task 的 UART_DATA 分支同构：write_queue 同步拷贝入 CDC
+    // TX FIFO，满时返回已入队数；flush 非阻塞发起 IN 传输（短数据必须显式
+    // flush 才能送达主机）。尽力而为：FIFO 满丢弃多余字节并告警。
+    const size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data, len);
+    if (queued < len)
+    {
+        ESP_LOGW(TAG, "CDC TX queue full, dropped %d of %d bytes", static_cast<int>(len - queued),
+                 static_cast<int>(len));
+    }
+    const esp_err_t ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
+    }
+}
+
+void CmsisDapUsb::set_uart_bridge_active(bool active)
+{
+    // vTaskSuspend/vTaskResume 幂等：重复调用对已处于目标状态的任务无副作用。
+    // 任务可能正阻塞在事件队列接收，下个调度点即挂起，无并发风险。
+    if (m_uart_bridge_task == nullptr)
+    {
+        return;
+    }
+    if (active)
+    {
+        vTaskResume(m_uart_bridge_task);
+    }
+    else
+    {
+        vTaskSuspend(m_uart_bridge_task);
+    }
 }
 } // namespace mlink

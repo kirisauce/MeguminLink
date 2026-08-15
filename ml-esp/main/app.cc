@@ -62,6 +62,10 @@ Application::Application()
     // 无线链路初始化（WiFi/ESP-NOW/广播 peer + 无线侧 DAP 执行器）：
     // 任何构建都创建，仅主循环投递命令时工作（Local 模式下空闲阻塞）
     ESP_ERROR_CHECK(m_wireless_link.init());
+#if !CONFIG_MEGUMINLINK_USB_SUPPORT
+    // 目标侧无线 UART 桥（C3）：UART <-> ESP-NOW，与无线链路同生命周期
+    ESP_ERROR_CHECK(m_wireless_uart.init());
+#endif
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     ESP_ERROR_CHECK(m_usb.init());
 #endif
@@ -111,7 +115,12 @@ void Application::apply_mode()
     // USB 设备常驻启用（Local 与 Wireless 均保持）：Wireless 模式下不再
     // 整体禁用 USB，而是由 usb.cc 的 dap_task 把 USB 收到的 DAP 命令无线
     // 转发给配对 peer（旧行为：无线模式 tud_disconnect + 挂起 DAP/UART 任务）。
-    // 副作用：CDC ACM 串口（UART 桥）在 Wireless 下也保持可用，但不参与转发。
+    // 副作用：CDC ACM 串口（UART 桥）在 Wireless 下也保持可用——CDC 数据
+    // 由 uart_bridge.cc 回调按模式分流（Local 写本地 UART1 / Wireless 发
+    // 无线帧），本地 UART1 桥任务仅 Local 模式运行。
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    m_usb.set_uart_bridge_active(m_mode == Mode::Local);
+#endif
     ESP_LOGI(TAG, "Mode: %s", mode_to_string(m_mode));
 }
 
@@ -182,6 +191,39 @@ CmsisDapUsb &Application::usb()
 WirelessLink &Application::wireless_link()
 {
     return m_wireless_link;
+}
+
+void Application::send_uart_data(const u8 *data, size_t len)
+{
+    // 尽力而为：未配对/发送失败一律丢弃（与 DAP 转发语义一致，串口无重试）。
+    // 未配对时通常还处于配对流程（PC 端不会发串口数据），DEBUG 级即可。
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (!mlink::peer_mac_load(peer_mac))
+    {
+        ESP_LOGD(TAG, "Wireless UART: no paired peer, %u bytes dropped", static_cast<unsigned>(len));
+        return;
+    }
+
+    const esp_err_t ret = m_wireless_link.send_uart_data(peer_mac, data, len);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Wireless UART: failed to send %u bytes: %s", static_cast<unsigned>(len), esp_err_to_name(ret));
+    }
+}
+
+void Application::on_uart_data(const u8 *data, size_t len)
+{
+    // 接收端动作由本机角色决定（recv_cb 直通调用，运行在 esp_wifi 任务上下文）：
+    // USB 侧（S3）写 CDC 串口；无 USB 侧（C3）写 UART TX。USB 存在但 UART 桥
+    // 关闭时（无 CDC 接口）收到的无线串口数据直接丢弃。
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    m_usb.uart_data_to_cdc(data, len);
+#elif !CONFIG_MEGUMINLINK_USB_SUPPORT
+    m_wireless_uart.write_uart(data, len);
+#else
+    (void)data;
+    (void)len;
+#endif
 }
 
 void Application::enter_pairing(bool manual)

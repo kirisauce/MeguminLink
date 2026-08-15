@@ -36,8 +36,8 @@ config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
         When disabled, the USB device only exposes the CMSIS-DAP
         interface and no serial port is visible to the host.
 
-if MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-
+# UART 桥参数：USB 侧本地桥（S3）与目标侧无线 UART 桥（C3）共用同一套
+# 参数。放在 USB 条件之外，非 USB 端（如 ESP32-C3 无线接收端）也能配置。
 config MEGUMINLINK_UART_RX_BUFFER_SIZE
     int "UART receive buffer size"
     default 256
@@ -66,8 +66,6 @@ config MEGUMINLINK_UART_BRIDGE_RX_IO
 config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
     int "UART bridge baud rate"
     default 115200
-
-endif
 
 config MEGUMINLINK_DAP_SWCLK_IO
     int "CMSIS-DAP SWCLK/TCK GPIO number"
@@ -100,7 +98,7 @@ config MEGUMINLINK_DAP_NTRST_IO
 
 config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
     int "Wireless DAP response timeout (ms)"
-    default 300
+    default 1800
     range 10 5000
     help
         How long the USB-side (sender) waits for a wireless DAP response
@@ -140,7 +138,7 @@ config MEGUMINLINK_MODE_SWITCH_DOUBLE_CLICK_MS
 
 config MEGUMINLINK_MODE_SWITCH_LONG_PRESS_MS
     int "Mode switch button long-press threshold (ms)"
-    default 1000
+    default 1700
     range 300 5000
     help
         Hold the button this long (in wireless mode, when already paired) to

@@ -15,6 +15,10 @@
 #include "meguminlink/usb/usb.hpp"
 #endif
 
+#if !CONFIG_MEGUMINLINK_USB_SUPPORT
+#include "meguminlink/wireless_uart.hpp"
+#endif
+
 #if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
 #include "meguminlink/led/led_controller.hpp"
 #endif
@@ -106,6 +110,20 @@ class Application
     /** 无线链路访问器（配对/转发/执行接线使用） */
     WirelessLink &wireless_link();
 
+    /**
+     * 本地串口口收到数据 → 打包 UartData 帧发给配对 peer（尽力而为）。
+     * 调用方：S3 侧 CDC RX 回调、C3 侧 UART 桥任务。未配对/发送失败时
+     * 丢弃（与 DAP 转发一致，PC 端串口无重试语义，丢了就是丢了）。
+     */
+    void send_uart_data(const u8 *data, size_t len);
+
+    /**
+     * 收到无线 UartData 帧 → 写入本地串口（recv_cb 直通调用，esp_wifi
+     * 任务上下文）。接收端动作由本机角色决定：USB 侧（S3）写 CDC，
+     * 无 USB 侧（C3）写 UART。
+     */
+    void on_uart_data(const u8 *data, size_t len);
+
     void run();
 
     /** 是否处于配对流程（供 LedController 自行读取） */
@@ -171,6 +189,11 @@ class Application
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb m_usb;
+#endif
+
+#if !CONFIG_MEGUMINLINK_USB_SUPPORT
+    /** 目标侧无线 UART 桥（UART <-> ESP-NOW，仅无 USB 端如 C3 编译） */
+    WirelessUartBridge m_wireless_uart;
 #endif
 
     /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless_link.hpp） */

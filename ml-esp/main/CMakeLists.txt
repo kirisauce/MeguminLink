@@ -1,5 +1,12 @@
 file(GLOB __src ${CMAKE_CURRENT_LIST_DIR}/*.cc ${CMAKE_CURRENT_LIST_DIR}/*.c)
 
+# 目标侧无线 UART 桥（UART <-> ESP-NOW）：仅无 USB 端（如 ESP32-C3 接收端）
+# 编译。S3 侧串口走 USB CDC（usb/uart_bridge.cc 按模式分流），本文件不参与
+# USB 构建。
+if(CONFIG_MEGUMINLINK_USB_SUPPORT)
+    list(REMOVE_ITEM __src ${CMAKE_CURRENT_LIST_DIR}/wireless_uart.cc)
+endif()
+
 # main/usb/ 子目录（TinyUSB + UART 桥）仅在 CONFIG_MEGUMINLINK_USB_SUPPORT 开启时编译，
 # 该选项仅对 ESP32-S3 可用（见同目录 Kconfig.projbuild）
 if(CONFIG_MEGUMINLINK_USB_SUPPORT)

@@ -44,6 +44,23 @@ class CmsisDapUsb
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     esp_err_t uart_bridge_init();
     static void uart_bridge_task(void *arg);
+
+  public:
+    /**
+     * 无线 UartData 帧到达 → 写入 CDC TX（recv_cb 直通调用，esp_wifi 任务
+     * 上下文；tinyusb_cdcacm_write_queue/flush 为任务安全 API）。
+     * 尽力而为：CDC TX FIFO 满时丢弃多余字节并告警。
+     */
+    void uart_data_to_cdc(const u8 *data, size_t len);
+
+    /**
+     * 本地 UART 桥任务启停（apply_mode 调用）：仅 Local 模式运行，
+     * Wireless 模式下 S3 本地 UART1 无数据流，挂起任务避免空转。
+     * 幂等：重复 suspend/resume 安全。
+     */
+    void set_uart_bridge_active(bool active);
+
+  private:
 #endif
 
     bool m_initialized = false;

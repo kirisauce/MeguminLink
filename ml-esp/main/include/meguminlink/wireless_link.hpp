@@ -29,6 +29,15 @@ inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xf
 inline constexpr size_t DAP_FRAME_HEADER_SIZE = 3;
 inline constexpr size_t MAX_DAP_PAYLOAD_SIZE = DAP_MAX_REQUEST_SIZE; // 64B，见 dap_executor.hpp
 
+/**
+ * UartData 帧格式与 DAP 帧一致：[type:1B][len:2B 大端][data:len B]。
+ * payload 上限 = 200B：ESP-NOW 单帧数据段上限 250B，扣 3B 帧头后取 200B
+ * 留余量。串口是流式数据，64B 单包语义（DAP）对吞吐是瓶颈——115200
+ * 波特率下 200B 帧约 58 帧/秒，突发日志余量远大于 64B 帧。
+ */
+inline constexpr size_t UART_FRAME_HEADER_SIZE = 3;
+inline constexpr size_t MAX_UART_PAYLOAD_SIZE = 200;
+
 namespace payload
 {
 struct Probe
@@ -64,6 +73,18 @@ struct DapResponse
     u16 len;        /**< 有效数据长度（data[0..len-1]） */
     const u8 *data; /**< 响应字节流（指向调用方存储） */
 };
+
+/**
+ * 无线转发的串口数据（尽力而为，不重传）：PC 侧 CDC ↔ 目标侧 UART 双向。
+ * 角色天然区分数据方向：发送端（USB 侧）把 CDC RX 打包发送，接收端
+ * （无 USB 侧）把收到的帧写入 UART TX；反向同理。数据段上限
+ * MAX_UART_PAYLOAD_SIZE = 200B，与 DapCommand 同为指针视图。
+ */
+struct UartData
+{
+    u16 len;        /**< 有效数据长度（data[0..len-1]） */
+    const u8 *data; /**< 串口字节流（指向调用方存储） */
+};
 } // namespace payload
 
 enum class PacketType
@@ -73,6 +94,7 @@ enum class PacketType
     PairingAccepted, /** 接受配对请求，作为对`PairingRequest`的回应 */
     DapCommand,      /** 无线转发的 DAP 命令载荷（USB 收到的 CMSIS-DAP 请求原样打包） */
     DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
+    UartData,        /** 无线转发的串口数据载荷（PC↔目标 UART 双向，尽力而为） */
 };
 
 union PacketPayload {
@@ -81,6 +103,7 @@ union PacketPayload {
     payload::PairingAccepted pairing_accepted;
     payload::DapCommand dap_command;
     payload::DapResponse dap_response;
+    payload::UartData uart_data;
 };
 
 class Packet
@@ -115,7 +138,9 @@ struct ReceivedPacket
 {
     Packet packet;
     u8 src_mac[ESP_NOW_ETH_ALEN];
-    u8 storage[MAX_DAP_PAYLOAD_SIZE];
+    // 按最大的 payload 存储预留：UartData（200B）> DapCommand/DapResponse（64B）。
+    // UartData 在 recv_cb 内直通处理（不排队），storage 仅为反序列化中转。
+    u8 storage[MAX_UART_PAYLOAD_SIZE];
 
     ReceivedPacket() = default;
 
@@ -151,6 +176,9 @@ struct ReceivedPacket
         case PacketType::DapResponse:
             packet.payload.dap_response.data = storage;
             break;
+        case PacketType::UartData:
+            packet.payload.uart_data.data = storage;
+            break;
         default:
             break;
         }
@@ -176,6 +204,12 @@ class WirelessLink
     /** 打包一条 DAP 命令/响应（原样字节流）为对应帧并发送给对端 */
     esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len);
     esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
+
+    /**
+     * 打包一段串口数据为 UartData 帧并发送给对端（尽力而为，不重传）。
+     * @param len 数据长度（> MAX_UART_PAYLOAD_SIZE 时拒绝）
+     */
+    esp_err_t send_uart_data(const u8 *dest_mac, const u8 *data, size_t len);
 
     /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
