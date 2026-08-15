@@ -140,4 +140,53 @@ config MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS
 
 endif
 
+choice MEGUMINLINK_LED_DRIVER
+    prompt "LED indicator driver"
+    default MEGUMINLINK_LED_DRIVER_GPIO
+    help
+        Select the LED indicator driver. "Disabled" removes the whole LED
+        module from the build. GPIO drives two LEDs (default GPIO12/GPIO13,
+        active low).
+
+config MEGUMINLINK_LED_DRIVER_NONE
+    bool "Disabled"
+    help
+        Do not compile the LED indicator module.
+
+config MEGUMINLINK_LED_DRIVER_GPIO
+    bool "GPIO direct drive (2 LEDs)"
+    help
+        Two LEDs on plain GPIOs, active-low by default. LED1 (mode
+        indicator) and LED2 (pairing/connection indicator) GPIO numbers
+        are configured below.
+
+if MEGUMINLINK_LED_DRIVER_GPIO
+
+config MEGUMINLINK_LED_DRIVER_GPIO_LED1_IO
+    int "LED1 (mode) GPIO number"
+    default 12
+
+config MEGUMINLINK_LED_DRIVER_GPIO_LED2_IO
+    int "LED2 (pairing/connection) GPIO number"
+    default 13
+
+config MEGUMINLINK_LED_DRIVER_GPIO_ACTIVE_LOW
+    bool "LEDs active low (low level lights the LED)"
+    default y
+    help
+        Enable for boards where the LED cathode is connected to the GPIO
+        (LED on = GPIO output low). Disable for active-high boards.
+
+config MEGUMINLINK_LED_DRIVER_GPIO_BLINK_PERIOD_MS
+    int "Blink half-period (ms)"
+    default 250
+    range 50 2000
+    help
+        Half of one full blink cycle: a blinking LED toggles every this
+        many milliseconds.
+
+endif
+
+endchoice
+
 endmenu

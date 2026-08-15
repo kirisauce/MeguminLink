@@ -43,6 +43,9 @@ Application::Application()
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
+#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+    ESP_ERROR_CHECK(m_leds.init(*this));
+#endif
     apply_mode();
 }
 
@@ -148,6 +151,11 @@ void Application::leave_pairing(const char *reason)
     ESP_LOGI(TAG, "Left pairing (%s)", reason);
 }
 
+bool Application::pairing_active() const
+{
+    return m_pairing_active;
+}
+
 void Application::pairing_completed()
 {
     // 配对成功落盘后由 PairingState 回调：统一退出配对流程
@@ -159,6 +167,11 @@ void Application::run()
     while (true)
     {
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
+
+#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+        // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
+        m_leds.update();
+#endif
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
         // 按键事件由 m_button（状态机）识别，这里只消费并执行动作：

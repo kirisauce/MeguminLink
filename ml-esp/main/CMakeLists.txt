@@ -15,5 +15,11 @@ if(CONFIG_MEGUMINLINK_USB_SUPPORT)
     list(APPEND __src ${__dap_src})
 endif()
 
+# LED 指示灯模块：仅在 GPIO 驱动被选中时编译（Disabled 时整个模块不参与构建）
+if(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO)
+    file(GLOB __led_src ${CMAKE_CURRENT_LIST_DIR}/led/*.cc)
+    list(APPEND __src ${__led_src})
+endif()
+
 idf_component_register(SRCS ${__src}
                     INCLUDE_DIRS "./include" "./cmsis_dap/Include" "./cmsis_dap/Config")

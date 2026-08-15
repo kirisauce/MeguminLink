@@ -14,6 +14,10 @@
 #include "meguminlink/usb/usb.hpp"
 #endif
 
+#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+#include "meguminlink/led/led_controller.hpp"
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <vector>
 
@@ -77,6 +81,9 @@ class Application
     /**
      * 配对成功落盘后由 PairingState 回调：统一退出配对流程。
      */
+    /** 是否处于配对流程（供 LedController 自行读取） */
+    bool pairing_active() const;
+
     void pairing_completed();
 
     static Application &get_instance();
@@ -117,6 +124,10 @@ class Application
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ButtonState m_button; /**< 模式切换按键状态机（防抖/双击/长按识别） */
+#endif
+
+#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+    LedController m_leds; /**< LED 指示灯控制器（主循环周期刷新，内部读本对象状态） */
 #endif
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
