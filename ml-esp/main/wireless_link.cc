@@ -178,7 +178,8 @@ esp_err_t mlink::wireless_link_peer_remove(const u8 *peer_mac)
 
 esp_err_t mlink::wireless_link_send(const u8 *dest_mac, const Packet &packet)
 {
-    u8 buffer[16];
+    // 栈上缓冲按 ESP-NOW v2.0 最大帧长预留（配对帧仅 ~7B，DapCommand 可到 1470B）
+    u8 buffer[ESP_NOW_MAX_DATA_LEN_V2];
     const esp_err_t ret = packet.serialize(buffer, sizeof(buffer));
     if (ret != ESP_OK)
     {
@@ -187,6 +188,23 @@ esp_err_t mlink::wireless_link_send(const u8 *dest_mac, const Packet &packet)
     }
 
     return esp_now_send(dest_mac, buffer, packet.serialized_size());
+}
+
+esp_err_t mlink::wireless_link_send_dap_command(const u8 *dest_mac, const u8 *data, size_t len)
+{
+    if (len > kMaxDapPayloadSize)
+    {
+        ESP_LOGE(TAG, "DAP command too large (%u bytes, max %u)", static_cast<unsigned>(len),
+                 static_cast<unsigned>(kMaxDapPayloadSize));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    Packet packet;
+    packet.packet_type = PacketType::DapCommand;
+    auto &content = packet.payload.dap_command;
+    content.len = static_cast<u16>(len);
+    std::memcpy(content.data, data, len);
+    return wireless_link_send(dest_mac, packet);
 }
 
 #define __check_size(parser, expected_size)                                                                            \
@@ -211,6 +229,9 @@ size_t Packet::serialized_size() const
     }
     case PacketType::PairingAccepted: {
         return 1 + ESP_NOW_ETH_ALEN;
+    }
+    case PacketType::DapCommand: {
+        return kDapFrameHeaderSize + payload.dap_command.len;
     }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
@@ -243,6 +264,18 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len)
         p.read_bytes(content.target_mac, sizeof(content.target_mac));
         break;
     }
+    case PacketType::DapCommand: {
+        auto &content = payload.dap_command;
+        __check_size(p, 2);
+        content.len = p.read_u16();
+        if (content.len > sizeof(content.data))
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        __check_size(p, content.len);
+        p.read_bytes(content.data, content.len);
+        break;
+    }
     default: {
         break;
     }
@@ -272,6 +305,18 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         auto &content = payload.pairing_accepted;
         __check_size(s, 6);
         s.write_bytes(content.target_mac, sizeof(content.target_mac));
+        break;
+    }
+    case PacketType::DapCommand: {
+        auto &content = payload.dap_command;
+        if (content.len > sizeof(content.data))
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        __check_size(s, 2);
+        s.write_u16(content.len);
+        __check_size(s, content.len);
+        s.write_bytes(content.data, content.len);
         break;
     }
     default: {

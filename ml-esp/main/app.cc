@@ -4,6 +4,7 @@
 
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
+#include <esp_mac.h> // MACSTR/MAC2STR（接收端 DAP 命令日志）
 #include <sdkconfig.h>
 
 #include <freertos/FreeRTOS.h>
@@ -24,6 +25,51 @@ const char *mode_to_string(Mode mode)
         return "wireless";
     }
     return "?";
+}
+
+/**
+ * DAP 命令号 → 可读名称（CMSIS-DAP v2 命令 ID，见 DAP.h 的 ID_DAP_*）。
+ * 接收端日志用；与 cmsis_dap 实现解耦，不 include DAP.h。
+ */
+const char *dap_command_name(u8 id)
+{
+    switch (id)
+    {
+    case 0x00: return "DAP_Info";
+    case 0x01: return "DAP_HostStatus";
+    case 0x02: return "DAP_Connect";
+    case 0x03: return "DAP_Disconnect";
+    case 0x04: return "DAP_TransferConfigure";
+    case 0x05: return "DAP_Transfer";
+    case 0x06: return "DAP_TransferBlock";
+    case 0x07: return "DAP_TransferAbort";
+    case 0x08: return "DAP_WriteABORT";
+    case 0x09: return "DAP_Delay";
+    case 0x0A: return "DAP_ResetTarget";
+    case 0x10: return "DAP_SWJ_Pins";
+    case 0x11: return "DAP_SWJ_Clock";
+    case 0x12: return "DAP_SWJ_Sequence";
+    case 0x13: return "DAP_SWD_Configure";
+    case 0x14: return "DAP_JTAG_Sequence";
+    case 0x15: return "DAP_JTAG_Configure";
+    case 0x16: return "DAP_JTAG_IDCODE";
+    case 0x17: return "DAP_SWO_Transport";
+    case 0x18: return "DAP_SWO_Mode";
+    case 0x19: return "DAP_SWO_Baudrate";
+    case 0x1A: return "DAP_SWO_Control";
+    case 0x1B: return "DAP_SWO_Status";
+    case 0x1C: return "DAP_SWO_Data";
+    case 0x1D: return "DAP_SWD_Sequence";
+    case 0x1E: return "DAP_SWO_ExtendedStatus";
+    case 0x1F: return "DAP_UART_Transport";
+    case 0x20: return "DAP_UART_Configure";
+    case 0x21: return "DAP_UART_Transfer";
+    case 0x22: return "DAP_UART_Control";
+    case 0x23: return "DAP_UART_Status";
+    case 0x7E: return "DAP_QueueCommands";
+    case 0x7F: return "DAP_ExecuteCommands";
+    default: return "unknown";
+    }
 }
 } // namespace
 
@@ -53,7 +99,8 @@ Application::Application()
         }
     }
 
-    // 在此初始化 USB 与模式切换按键，并应用当前模式（无线模式立即禁用 USB）。
+    // 在此初始化 USB 与模式切换按键，并应用当前模式（USB 常驻，模式差异
+    // 在 dap_task 的本地执行/无线转发分流）。
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     ESP_ERROR_CHECK(m_usb.init());
 #endif
@@ -100,10 +147,10 @@ void Application::set_mode(Mode new_mode)
 
 void Application::apply_mode()
 {
-    // 无线模式禁用整个 USB 设备（主机端表现为拔线），本地模式恢复
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-    m_usb.set_enabled(m_mode == Mode::Local);
-#endif
+    // USB 设备常驻启用（Local 与 Wireless 均保持）：Wireless 模式下不再
+    // 整体禁用 USB，而是由 usb.cc 的 dap_task 把 USB 收到的 DAP 命令无线
+    // 转发给配对 peer（旧行为：无线模式 tud_disconnect + 挂起 DAP/UART 任务）。
+    // 副作用：CDC ACM 串口（UART 桥）在 Wireless 下也保持可用，但不参与转发。
     ESP_LOGI(TAG, "Mode: %s", mode_to_string(m_mode));
 }
 
@@ -261,8 +308,35 @@ void Application::run()
             }
             else
             {
-                // 已配对：无线调试就绪（TODO 转发调试协议到 peer）
-                take_received_packets();
+                // 已配对：无线调试就绪。先确保 ESP-NOW peer 已登记——配对完成
+                // 时 drop_peer() 会移除 peer（pairing.cc），重启后 peer list 也为空，
+                // 而 dap_task 转发依赖 peer 在 ESP-NOW list 中；peer_add 幂等，
+                // 周期调用开销可忽略，配对完成后下一轮循环即恢复转发。
+                u8 peer_mac[ESP_NOW_ETH_ALEN];
+                if (peer_mac_load(peer_mac))
+                {
+                    wireless_link_peer_add(peer_mac);
+                }
+                // USB 收到的 DAP 命令已由 dap_task 转发给 peer（见 usb.cc）。
+                // 这里消费无线链路收到的帧：第一版 DapCommand 仅打日志
+                // （不执行、不回响应），配对控制帧在已配对状态下不应出现，
+                // 防御性忽略。
+                auto packets = take_received_packets();
+                for (const auto &rp : packets)
+                {
+                    if (rp.packet.packet_type == PacketType::DapCommand)
+                    {
+                        const auto &cmd = rp.packet.payload.dap_command;
+                        ESP_LOGI(TAG, "DAP cmd from " MACSTR ": id=0x%02X (%s) len=%u", MAC2STR(rp.src_mac),
+                                 cmd.data[0], dap_command_name(cmd.data[0]), static_cast<unsigned>(cmd.len));
+                        ESP_LOG_BUFFER_HEX_LEVEL(TAG, cmd.data, cmd.len, ESP_LOG_INFO);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "Unexpected packet type %d in paired state, ignored",
+                                 static_cast<int>(rp.packet.packet_type));
+                    }
+                }
             }
             break;
         }

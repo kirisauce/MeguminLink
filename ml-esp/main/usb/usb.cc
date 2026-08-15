@@ -1,6 +1,7 @@
 #define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
+#include "meguminlink/nvs_flash.hpp" // peer_mac_load（Wireless 转发目标）
 
 #include <esp_log.h>
 #include <esp_mac.h>
@@ -182,6 +183,30 @@ void dap_task(void *arg)
         if (!tud_vendor_n_mounted(ITF_NUM_DAP))
         {
             continue; // 主机未枚举完成前不处理
+        }
+
+        // Wireless 模式：USB 收到的 DAP 命令不本地执行，打包无线转发给
+        // 已配对 peer（接收端当前仅打日志、不回响应，PC 端会超时）。
+        // 未配对（peer 未落盘）时丢弃并记录，配对完成后自动恢复转发。
+        auto &app = mlink::Application::get_instance();
+        if (app.mode() == mlink::Mode::Wireless)
+        {
+            u8 peer_mac[ESP_NOW_ETH_ALEN];
+            if (!mlink::peer_mac_load(peer_mac))
+            {
+                ESP_LOGW(TAG, "Wireless: no paired peer, %u-byte DAP request dropped",
+                         static_cast<unsigned>(item_size));
+            }
+            else
+            {
+                const esp_err_t ret = mlink::wireless_link_send_dap_command(peer_mac, dap_request, item_size);
+                if (ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Wireless: failed to forward %u-byte DAP request: %s",
+                             static_cast<unsigned>(item_size), esp_err_to_name(ret));
+                }
+            }
+            continue; // 不回响应：第一版接收端只做日志，无 DAP 执行结果
         }
 
         const u32 n = DAP_ExecuteCommand(dap_request, dap_response);

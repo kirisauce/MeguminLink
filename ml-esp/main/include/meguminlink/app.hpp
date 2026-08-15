@@ -35,7 +35,9 @@ inline constexpr bool kLocalModeSupported = false;
  *
  * Local：本地调试，USB CMSIS-DAP（+ UART 桥）正常工作；仅
  * kLocalModeSupported（USB 支持启用）时可达，否则强制 Wireless；
- * Wireless：无线调试，USB 设备整体禁用，无线逻辑尚未实现（占位）。
+ * Wireless：无线调试，USB 设备保持启用（主机可枚举），USB 收到的
+ * DAP 命令由 dap_task 打包为 DapCommand 帧无线转发到配对 peer；
+ * 接收端当前仅打日志、不回响应（第一版，无 DAP 执行逻辑）。
  *
  * 配对（ESP-NOW 建链）是 Wireless 的子流程，统一由配对流程管理
  * （enter_pairing / leave_pairing），两个入口共用一个状态：
@@ -51,7 +53,7 @@ inline constexpr bool kLocalModeSupported = false;
 enum class Mode
 {
     Local,    // 本地调试（USB）；仅 kLocalModeSupported 时可达，否则不可用
-    Wireless, // 无线调试（USB 禁用，未实现；未配对时自动配对）
+    Wireless, // 无线调试（USB 常驻，DAP 命令无线转发；未配对时自动配对）
 };
 
 /** 模式在 NVS 中的 key（持久化 Local/Wireless 维度） */
@@ -67,8 +69,9 @@ class Application
     Mode mode() const;
 
     /**
-     * 设置运行模式：持久化到 NVS 并应用系统行为（USB 启用/禁用）。
-     * 调用前需保证 NVS 与 USB 已初始化（延迟构造保证）。
+     * 设置运行模式：持久化到 NVS 并应用系统行为（USB 常驻，模式差异在
+     * dap_task 的本地执行/无线转发分流）。调用前需保证 NVS 与 USB 已初始化
+     * （延迟构造保证）。
      */
     void set_mode(Mode new_mode);
 

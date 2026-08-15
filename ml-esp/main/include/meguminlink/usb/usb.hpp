@@ -30,7 +30,10 @@ class CmsisDapUsb
      *
      * disabled：tud_disconnect() 断开 USB 总线（主机端表现为拔线），
      * 并挂起 DAP/UART 桥处理任务；enabled：tud_connect() 重新枚举并恢复任务。
-     * 用于无线调试模式下完全停用本地 USB 通路。
+     *
+     * 注意：当前无调用方——USB 在 Local 与 Wireless 模式下都常驻启用
+     * （Wireless 下 DAP 命令由 dap_task 无线转发，见 usb.cc），此接口保留
+     * 以备将来按需启停（如省电、仅断开 CDC 等场景）。
      */
     void set_enabled(bool enabled);
 
