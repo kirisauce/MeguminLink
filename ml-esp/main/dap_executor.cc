@@ -99,7 +99,9 @@ const char *dap_command_name(u8 id)
 
 u16 mlink::dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t response_cap)
 {
-    ESP_LOGI(TAG, "Executing DAP cmd: id=0x%02X (%s) len=%u", request[0], dap_command_name(request[0]),
+    // 每命令两行日志降为 DEBUG（默认不打印）：A/B 实测（2026-08-15）日志
+    // 降级单独贡献 ~0.2s（UART FIFO 异步排空，非阻塞路径）。
+    ESP_LOGD(TAG, "Executing DAP cmd: id=0x%02X (%s) len=%u", request[0], dap_command_name(request[0]),
              static_cast<unsigned>(req_len));
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, request, req_len, ESP_LOG_DEBUG);
 
@@ -113,7 +115,7 @@ u16 mlink::dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t
         ESP_LOGW(TAG, "DAP response truncated (%u -> %u)", resp_len, static_cast<unsigned>(response_cap));
         return static_cast<u16>(response_cap);
     }
-    ESP_LOGI(TAG, "DAP cmd 0x%02X done, response %u bytes", request[0], static_cast<unsigned>(resp_len));
+    ESP_LOGD(TAG, "DAP cmd 0x%02X done, response %u bytes", request[0], static_cast<unsigned>(resp_len));
     return resp_len;
 }
 

@@ -57,6 +57,36 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         return;
     }
 
+    // DAP 数据帧直通投递（不经主循环）。A/B 实测（2026-08-15）：这是
+    // 最大收益项——接收端（C3，单核）原来每帧要经主循环（优先级 1）中转，
+    // 而 esp_wifi 任务（优先级 23）收帧后持续占用 CPU，主循环迟迟得不到
+    // 调度，每命令多 ~9ms；直通后 dap_task（优先级 24）立即抢占执行。
+    // 发送端（S3，双核）直通收益小（~0.2s）。入队/拷贝均为非阻塞轻量
+    // 操作，可安全在 esp_wifi 任务上下文执行。
+    auto &app = Application::get_instance();
+    switch (rp.packet.packet_type)
+    {
+    case PacketType::DapCommand: {
+        const auto &cmd = rp.packet.payload.dap_command;
+        const esp_err_t ret = app.wireless_link().dap_execute(rp.src_mac, cmd.data, cmd.len);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),
+                     esp_err_to_name(ret));
+        }
+        return;
+    }
+    case PacketType::DapResponse: {
+        const auto &resp = rp.packet.payload.dap_response;
+        app.push_wireless_response(resp.data, resp.len);
+        return;
+    }
+    default:
+        // 配对控制帧（Probe/PairingRequest/PairingAccepted）：维持经主循环
+        // 统一驱动配对状态机的原路径
+        break;
+    }
+
     Application::get_instance().push_received_packet(rp);
 }
 
@@ -104,6 +134,12 @@ esp_err_t WirelessLink::init()
 
         ret = esp_wifi_start();
         MLINK_CHECK("esp_wifi_start() failed");
+
+        // 禁用 WiFi 省电（modem sleep）。A/B 实测（2026-08-15，两端一致）：
+        // PS 默认（MIN_MODEM）3.28-3.40s vs PS 禁用 3.12-3.17s，禁用省电
+        // 贡献 ~0.2s（往返 ~0.3ms/命令）。保留禁用。
+        ret = esp_wifi_set_ps(WIFI_PS_NONE);
+        MLINK_CHECK("esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(ret));
 
         ret = esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
         MLINK_CHECK("esp_wifi_set_channel() failed");
@@ -252,6 +288,12 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
                  esp_err_to_name(ret));
         return ret;
     }
+    // 性能诊断（DEBUG 级）：转发命令发出的时刻。配合接收端（C3）的
+    // Executing/Done 日志与下方的"收到响应"日志，可分离 USB/ESP-NOW/执行
+    // 各段延迟（无线 DAP 路径单命令往返约 12ms 的实测瓶颈定位用）。
+    const TickType_t sent_tick = xTaskGetTickCount();
+    ESP_LOGD(TAG, "Wireless: DAP request %uB sent (tick=%u)", static_cast<unsigned>(len),
+             static_cast<unsigned>(sent_tick));
 
     // 阻塞等待接收端响应（一次一个在途请求，与 CMSIS-DAP v2 同步请求/响应
     // 语义一致；等待期间不处理下一个请求）。
@@ -263,6 +305,9 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
                  CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS, static_cast<unsigned>(len));
         return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGD(TAG, "Wireless: DAP response %uB received (tick=%u, wireless_rtt=%u ms)",
+             static_cast<unsigned>(rlen), static_cast<unsigned>(xTaskGetTickCount()),
+             static_cast<unsigned>(xTaskGetTickCount() - sent_tick));
 
     if (rlen > resp_cap)
     {
