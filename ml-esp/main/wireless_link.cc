@@ -205,7 +205,8 @@ esp_err_t WirelessLink::peer_add(const u8 *peer_mac)
 {
     if (esp_now_is_peer_exist(peer_mac))
     {
-        return ESP_OK;
+        // 已存在也确保速率配置正确（重复调用幂等）。
+        return set_peer_rate(peer_mac);
     }
 
     esp_now_peer_info_t peer = {};
@@ -218,6 +219,30 @@ esp_err_t WirelessLink::peer_add(const u8 *peer_mac)
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to add peer " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
+        return ret;
+    }
+
+    return set_peer_rate(peer_mac);
+}
+
+esp_err_t WirelessLink::set_peer_rate(const u8 *peer_mac)
+{
+    if (peer_mac == nullptr || std::memcmp(peer_mac, ESP_NOW_BROADCAST, ESP_NOW_ETH_ALEN) == 0)
+    {
+        return ESP_OK;
+    }
+
+    // 对端级固定 HT20/MCS7(SGI) 高速率。ESP-NOW 的速率以 peer rate config 为准，
+    // 仅设全局接口速率不一定生效；小包场景下可降低空中耗时。
+    esp_now_rate_config_t rate_cfg = {};
+    rate_cfg.phymode = WIFI_PHY_MODE_HT20;
+    rate_cfg.rate = WIFI_PHY_RATE_MCS7_SGI;
+    rate_cfg.ersu = false;
+    rate_cfg.dcm = false;
+    const esp_err_t ret = esp_now_set_peer_rate_config(peer_mac, &rate_cfg);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(MCS7_SGI) failed: %s", esp_err_to_name(ret));
     }
     return ret;
 }

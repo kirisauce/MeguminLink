@@ -268,6 +268,9 @@ class WirelessLink
     static void dap_resp_sink(const u8 *data, u16 len, void *arg);
     static void dap_task_fn(void *arg);
 
+    /** 设置单播 peer 的 ESP-NOW 发送速率（广播地址跳过） */
+    esp_err_t set_peer_rate(const u8 *peer_mac);
+
     static constexpr u8 CHANNEL = 10; // ESP-NOW 固定信道
 
     bool m_initialized = false;
