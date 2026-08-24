@@ -1,8 +1,8 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/app.hpp" // Application（CDC 数据按模式分流）
 #include "meguminlink/usb/usb.hpp"
 
 #include <driver/uart.h>
+#include <esp_check.h>
 #include <esp_log.h>
 #include <sdkconfig.h>
 #include <tinyusb_cdc_acm.h>
@@ -206,7 +206,7 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
     static_assert(TX_BUF_SIZE == 0 || TX_BUF_SIZE > UART_HW_FIFO_LEN(UART_NUM));
 
     ret = uart_driver_install(UART_NUM, RX_BUF_SIZE, TX_BUF_SIZE, QUEUE_SIZE, &m_uart_queue, 0);
-    MLINK_CHECK("uart_driver_install(UART_NUM_%d, ...) failed", CONFIG_MEGUMINLINK_UART_BRIDGE_NUM);
+    ESP_RETURN_ON_ERROR(ret, TAG, "uart_driver_install(UART_NUM_%d, ...) failed", CONFIG_MEGUMINLINK_UART_BRIDGE_NUM);
 
     {
         uart_config_t cfg = {};
@@ -218,11 +218,11 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
         cfg.source_clk = UART_SCLK_DEFAULT;
 
         ret = uart_param_config(UART_NUM, &cfg);
-        MLINK_CHECK("uart_param_config() failed with default configuration");
+        ESP_RETURN_ON_ERROR(ret, TAG, "uart_param_config() failed with default configuration");
     }
 
     ret = uart_set_pin(UART_NUM, CONFIG_MEGUMINLINK_UART_BRIDGE_TX_IO, CONFIG_MEGUMINLINK_UART_BRIDGE_RX_IO, -1, -1);
-    MLINK_CHECK("uart_set_pin() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "uart_set_pin() failed");
 
     {
         tinyusb_config_cdcacm_t cfg = {};
@@ -233,12 +233,9 @@ esp_err_t CmsisDapUsb::uart_bridge_init()
 
     ret =
         xTaskCreate(uart_bridge_task, "uart_bridge", 4096, this, 5, &m_uart_bridge_task) == pdPASS ? ESP_OK : ESP_FAIL;
-    MLINK_CHECK("Failed to create UART bridge task");
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to create UART bridge task");
 
     return ESP_OK;
-
-err:
-    return ret;
 }
 
 void CmsisDapUsb::uart_data_to_cdc(const u8 *data, size_t len)

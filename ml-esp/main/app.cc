@@ -1,4 +1,3 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
 #include "meguminlink/wireless_link.hpp" // WirelessDapExecutor（DapCommand 投递）

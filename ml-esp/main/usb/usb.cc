@@ -1,9 +1,9 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
 #include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
 #include "meguminlink/wireless_link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
 
+#include <esp_check.h>
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_rom_sys.h> // esp_rom_delay_us
@@ -21,7 +21,7 @@
 // clang-format 的字典序排序会把它们排反，此处保持顺序：
 // clang-format off
 #include "DAP_config.h"
-#include "DAP.h"
+#include "DAP.h" // IWYU pragma: keep
 // clang-format on
 
 static constexpr char TAG[] = "mlink::usb";
@@ -303,7 +303,7 @@ esp_err_t CmsisDapUsb::init()
         // 串号 = 芯片 MAC，保证多个 probe 可同时枚举
         u8 mac[6];
         ret = esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
-        MLINK_CHECK("Failed to read MAC address");
+        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read MAC address");
         snprintf(m_serial, sizeof(m_serial), MACSTR, MAC2STR(mac));
     }
 
@@ -325,12 +325,12 @@ esp_err_t CmsisDapUsb::init()
 #endif
 
         ret = tinyusb_driver_install(&tinyusb_config);
-        MLINK_CHECK("Failed to initialize TinyUSB driver");
+        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to initialize TinyUSB driver");
     }
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     ret = uart_bridge_init();
-    MLINK_CHECK("Failed to initialize USB CDC ACM interface");
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to initialize USB CDC ACM interface");
 #endif
 
     // 创建DAP处理任务。
@@ -348,9 +348,6 @@ esp_err_t CmsisDapUsb::init()
 
     m_initialized = true;
     return ESP_OK;
-
-err:
-    return ret;
 }
 
 void CmsisDapUsb::set_enabled(bool enabled)

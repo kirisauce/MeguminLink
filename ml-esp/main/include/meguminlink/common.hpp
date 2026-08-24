@@ -2,15 +2,6 @@
 #ifndef __MEGUMINLINK_COMMON_HPP__
 #define __MEGUMINLINK_COMMON_HPP__
 
-#ifdef __MEGUMINLINK_EXPORT_MACROS__
-#define MLINK_CHECK(...)                                                                                               \
-    if (ret != ESP_OK)                                                                                                 \
-    {                                                                                                                  \
-        ESP_LOGE(TAG, __VA_ARGS__);                                                                                    \
-        goto err;                                                                                                      \
-    }
-#endif
-
 #include <cstdint>
 
 using u8 = uint8_t;

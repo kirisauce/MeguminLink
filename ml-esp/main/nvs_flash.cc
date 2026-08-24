@@ -1,6 +1,7 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/nvs_flash.hpp"
-#include "esp_log.h"
+
+#include <esp_check.h>
+#include <esp_log.h>
 
 static constexpr char TAG[] = "mlink::nvs_flash";
 
@@ -62,7 +63,7 @@ esp_err_t mlink::NvsKey::raw_store_u8(u8 value) const
 {
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    MLINK_CHECK("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
 
     ret = nvs_set_u8(handle, m_key, value);
     if (ret == ESP_OK)
@@ -70,9 +71,6 @@ esp_err_t mlink::NvsKey::raw_store_u8(u8 value) const
         ret = nvs_commit(handle);
     }
     nvs_close(handle);
-    return ret;
-
-err:
     return ret;
 }
 
@@ -93,7 +91,7 @@ esp_err_t mlink::NvsKey::raw_store_blob(const void *value, size_t len) const
 {
     nvs_handle_t handle;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    MLINK_CHECK("Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
 
     ret = nvs_set_blob(handle, m_key, value, len);
     if (ret == ESP_OK)
@@ -101,9 +99,6 @@ esp_err_t mlink::NvsKey::raw_store_blob(const void *value, size_t len) const
         ret = nvs_commit(handle);
     }
     nvs_close(handle);
-    return ret;
-
-err:
     return ret;
 }
 

@@ -1,10 +1,10 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/wireless_uart.hpp"
-#include "esp_log.h"
 #include "meguminlink/app.hpp" // Application::send_uart_data（UART RX → 无线帧）
 #include "meguminlink/common.hpp"
 
 #include <driver/uart.h>
+#include <esp_check.h>
+#include <esp_log.h>
 #include <sdkconfig.h>
 
 static constexpr char TAG[] = "mlink::wireless_uart";
@@ -40,7 +40,7 @@ esp_err_t WirelessUartBridge::init()
     static_assert(TX_BUF_SIZE == 0 || TX_BUF_SIZE > UART_HW_FIFO_LEN(UART_NUM));
 
     ret = uart_driver_install(UART_NUM, RX_BUF_SIZE, TX_BUF_SIZE, QUEUE_SIZE, &m_uart_queue, 0);
-    MLINK_CHECK("uart_driver_install(UART_NUM_%d, ...) failed", static_cast<int>(UART_NUM));
+    ESP_RETURN_ON_ERROR(ret, TAG, "uart_driver_install(UART_NUM_%d, ...) failed", static_cast<int>(UART_NUM));
 
     {
         uart_config_t cfg = {};
@@ -52,11 +52,11 @@ esp_err_t WirelessUartBridge::init()
         cfg.source_clk = UART_SCLK_DEFAULT;
 
         ret = uart_param_config(UART_NUM, &cfg);
-        MLINK_CHECK("uart_param_config() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "uart_param_config() failed");
     }
 
     ret = uart_set_pin(UART_NUM, UART_TX_IO, UART_RX_IO, -1, -1);
-    MLINK_CHECK("uart_set_pin() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "uart_set_pin() failed");
 
     // 优先级 5（与 S3 本地 UART 桥任务一致）：DAP 执行器（优先级 24）运行
     // 期间本任务被抢占，UART RX 靠硬件 FIFO + 环形缓冲兜底（256B @115200 ≈
@@ -69,9 +69,6 @@ esp_err_t WirelessUartBridge::init()
 
     m_initialized = true;
     return ESP_OK;
-
-err:
-    return ret;
 }
 
 void WirelessUartBridge::write_uart(const u8 *data, size_t len)

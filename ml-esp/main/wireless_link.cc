@@ -1,13 +1,15 @@
-#define __MEGUMINLINK_EXPORT_MACROS__
 #include "meguminlink/wireless_link.hpp"
-#include "esp_log.h"
-#include "esp_mac.h"
 #include "meguminlink/app.hpp"
 #include "meguminlink/binfmt.hpp"
 #include "meguminlink/common.hpp"
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（无线侧执行接线）
 #include "meguminlink/nvs_flash.hpp"
+
 #include <cstring>
+
+#include <esp_check.h>
+#include <esp_log.h>
+#include <esp_mac.h>
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc 一致）。
 // DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
@@ -15,7 +17,7 @@
 // clang-format 的字典序排序会把它们排反，此处保持顺序：
 // clang-format off
 #include "DAP_config.h" // DAP_PACKET_SIZE（命令长度上限/请求缓冲）
-#include "DAP.h"
+#include "DAP.h" // IWYU pragma: keep
 // clang-format on
 
 using namespace mlink;
@@ -122,55 +124,55 @@ esp_err_t WirelessLink::init()
 
     esp_err_t ret;
     ret = mlink::nvs_flash_init();
-    MLINK_CHECK("mlink::nvs_flash_init() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "mlink::nvs_flash_init() failed");
 
     ret = esp_netif_init();
-    MLINK_CHECK("esp_netif_init() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "esp_netif_init() failed");
     ret = esp_event_loop_create_default();
-    MLINK_CHECK("esp_event_loop_create_default() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "esp_event_loop_create_default() failed");
 
     {
         wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
         ret = esp_wifi_init(&wifi_init_cfg);
-        MLINK_CHECK("esp_wifi_init() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_init() failed");
         ESP_LOGI(TAG, "WiFi initialized");
 
         ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-        MLINK_CHECK("esp_wifi_set_storage() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_storage() failed");
     }
 
     {
         ret = esp_wifi_set_mode(WIFI_MODE_STA);
-        MLINK_CHECK("esp_wifi_set_mode() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_mode() failed");
 
         wifi_config_t wifi_cfg = {};
         ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-        MLINK_CHECK("esp_wifi_set_config() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_config() failed");
 
         ret = esp_wifi_start();
-        MLINK_CHECK("esp_wifi_start() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_start() failed");
 
         // 禁用 WiFi 省电（modem sleep）。A/B 实测（2026-08-15，两端一致）：
         // PS 默认（MIN_MODEM）3.28-3.40s vs PS 禁用 3.12-3.17s，禁用省电
         // 贡献 ~0.2s（往返 ~0.3ms/命令）。保留禁用。
         ret = esp_wifi_set_ps(WIFI_PS_NONE);
-        MLINK_CHECK("esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(ret));
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(ret));
 
         ret = esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
-        MLINK_CHECK("esp_wifi_set_channel() failed");
+        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_channel() failed");
     }
 
     ret = esp_now_init();
-    MLINK_CHECK("esp_now_init() failed");
+    ESP_RETURN_ON_ERROR(ret, TAG, "esp_now_init() failed");
 
     ret = peer_add(ESP_NOW_BROADCAST);
-    MLINK_CHECK("peer_add(ESP_NOW_BROADCAST) failed: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "peer_add(ESP_NOW_BROADCAST) failed: %s", esp_err_to_name(ret));
 
     ret = esp_now_register_recv_cb(recv_cb);
-    MLINK_CHECK("Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
 
     ret = esp_now_register_send_cb(send_cb);
-    MLINK_CHECK("Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
 
     // 无线侧 DAP 执行器：命令队列 + 高优先级任务（收到 DapCommand → 执行 → 回发）
     m_dap_queue = xQueueCreate(DAP_QUEUE_DEPTH, sizeof(DapExecuteRequest));
