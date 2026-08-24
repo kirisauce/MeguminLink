@@ -6,11 +6,25 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
 
+#include <array>
+
 #include "meguminlink/common.hpp"
 #include "sdkconfig.h"
 
 namespace mlink
 {
+enum class UsbStringIndex {
+  LangId = 0,
+  Manufacturer,
+  Product,
+  SerialNumber,
+  DapInterfaceName,
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+  UartBridgeInterfaceName,
+#endif
+  Max,
+};
+
 /**
  * CMSIS-DAP v2 USB 设备。
  *
@@ -65,7 +79,7 @@ class CmsisDapUsb
 
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
-    const char *m_string_descriptors[5];
+    std::array<const char*, (usize)UsbStringIndex::Max> m_string_descriptors;
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     QueueHandle_t m_uart_queue;

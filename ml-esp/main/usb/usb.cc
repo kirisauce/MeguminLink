@@ -28,6 +28,8 @@ static constexpr char TAG[] = "mlink::usb";
 
 namespace
 {
+using namespace mlink;
+
 // ---- CMSIS-DAP v2 descriptors ----
 // 接口结构：vendor specific 接口 (class 0xFF) + bulk 端点 承载 CMSIS-DAP v2
 // 命令/响应；CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时追加 IAD 组合的
@@ -55,9 +57,9 @@ constexpr tusb_desc_device_t DEVICE_DESCRIPTOR = {
     .idVendor = USB_VID,
     .idProduct = USB_PID,
     .bcdDevice = 0x0100,
-    .iManufacturer = 0x01,
-    .iProduct = 0x02,
-    .iSerialNumber = 0x03,
+    .iManufacturer = (u8)UsbStringIndex::Manufacturer,
+    .iProduct = (u8)UsbStringIndex::Product,
+    .iSerialNumber = (u8)UsbStringIndex::SerialNumber,
     .bNumConfigurations = 0x01,
 };
 
@@ -95,9 +97,10 @@ constexpr u8 CONFIG_DESCRIPTOR[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN, 0x80, 500),
 #endif
 
-    TUD_VENDOR_DESCRIPTOR(ITF_NUM_DAP, 4, EP_DAP_OUT, EP_DAP_IN, 64),
+    TUD_VENDOR_DESCRIPTOR(ITF_NUM_DAP, (u8)UsbStringIndex::DapInterfaceName, EP_DAP_OUT, EP_DAP_IN, 64),
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 0, EP_CDC_NOTIF, 64, EP_CDC_OUT, EP_CDC_IN, 64),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, (u8)UsbStringIndex::UartBridgeInterfaceName, EP_CDC_NOTIF, 64, EP_CDC_OUT,
+                       EP_CDC_IN, 64),
 #endif
 
     // 如需 SWO 流，在此追加 EP3 Bulk In (0x83, 64B) 描述符
@@ -269,11 +272,11 @@ namespace mlink
 {
 CmsisDapUsb::CmsisDapUsb()
 {
-    m_string_descriptors[0] = LANGID;
-    m_string_descriptors[1] = "MeguminLink";                     // Manufacturer
-    m_string_descriptors[2] = "CMSIS-DAP on " CONFIG_IDF_TARGET; // Product（必须含 "CMSIS-DAP"）
-    m_string_descriptors[3] = m_serial;                          // Serial（init 时填充）
-    m_string_descriptors[4] = "CMSIS-DAP v2";                    // Interface
+    m_string_descriptors[(usize)UsbStringIndex::LangId] = LANGID;
+    m_string_descriptors[(usize)UsbStringIndex::Manufacturer] = "MeguminLink";
+    m_string_descriptors[(usize)UsbStringIndex::Product] = "CMSIS-DAP on " CONFIG_IDF_TARGET;
+    m_string_descriptors[(usize)UsbStringIndex::SerialNumber] = m_serial;
+    m_string_descriptors[(usize)UsbStringIndex::DapInterfaceName] = "CMSIS-DAP v2";
 
     constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
 
@@ -310,9 +313,8 @@ esp_err_t CmsisDapUsb::init()
     {
         tinyusb_config_t tinyusb_config = TINYUSB_DEFAULT_CONFIG(tinyusb_event_callback);
         tinyusb_config.descriptor.device = &DEVICE_DESCRIPTOR;
-        tinyusb_config.descriptor.string = m_string_descriptors;
-        tinyusb_config.descriptor.string_count =
-            static_cast<int>(sizeof(m_string_descriptors) / sizeof(m_string_descriptors[0]));
+        tinyusb_config.descriptor.string = m_string_descriptors.data();
+        tinyusb_config.descriptor.string_count = static_cast<int>(m_string_descriptors.size());
         tinyusb_config.descriptor.full_speed_config = CONFIG_DESCRIPTOR;
 
 #if !CONFIG_FREERTOS_UNICORE
