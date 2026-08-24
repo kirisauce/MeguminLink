@@ -1,5 +1,46 @@
 menu "MeguminLink"
 
+menu "Debug Probe (CMSIS-DAP)"
+
+config MEGUMINLINK_PACKET_BUFFER_DEPTH
+    int "Packet buffer depth"
+    default 8
+    help
+        Depth of the USB bulk RX ringbuffer (USB targets) and, at the same
+        time, the CMSIS-DAP DAP_PACKET_COUNT (see DAP_config.h). Kept
+        available on non-USB targets (e.g. wireless receiver ESP32-C3).
+
+config MEGUMINLINK_DAP_SWCLK_IO
+    int "CMSIS-DAP SWCLK/TCK GPIO number"
+    default 4
+    help
+        SWD/JTAG I/O pins of the CMSIS-DAP core. Used both by the local
+        (USB) CMSIS-DAP implementation and by the wireless target-side
+        executor, so these are available on every target (including
+        non-USB ones like ESP32-C3 used as the wireless receiver).
+
+config MEGUMINLINK_DAP_SWDIO_IO
+    int "CMSIS-DAP SWDIO/TMS GPIO number"
+    default 5
+
+config MEGUMINLINK_DAP_NRESET_IO
+    int "CMSIS-DAP nRESET GPIO number"
+    default 6
+
+config MEGUMINLINK_DAP_TDI_IO
+    int "CMSIS-DAP TDI GPIO number"
+    default 7
+
+config MEGUMINLINK_DAP_TDO_IO
+    int "CMSIS-DAP TDO GPIO number"
+    default 8
+
+config MEGUMINLINK_DAP_NTRST_IO
+    int "CMSIS-DAP nTRST GPIO number"
+    default 9
+
+endmenu
+
 config MEGUMINLINK_USB_SUPPORT
     bool "Enable USB (TinyUSB) support"
     default y
@@ -14,27 +55,24 @@ config MEGUMINLINK_USB_SUPPORT
         corrected to Wireless on boot, and the mode switch button cannot
         switch to Local.
 
+menu "USB (TinyUSB)"
+    depends on MEGUMINLINK_USB_SUPPORT
+
 config MEGUMINLINK_USB_MAX_PACKET_SIZE
     int "USB max packet size"
     default 512
-    depends on MEGUMINLINK_USB_SUPPORT
-
-config MEGUMINLINK_PACKET_BUFFER_DEPTH
-    int "Packet buffer depth"
-    default 8
-    help
-        Depth of the USB bulk RX ringbuffer (USB targets) and, at the same
-        time, the CMSIS-DAP DAP_PACKET_COUNT (see DAP_config.h). Kept
-        available on non-USB targets (e.g. wireless receiver ESP32-C3).
 
 config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     bool "Enable UART bridge (CDC ACM)"
     default y
-    depends on MEGUMINLINK_USB_SUPPORT
     help
         Compile the UART bridge and expose a CDC ACM interface on USB.
         When disabled, the USB device only exposes the CMSIS-DAP
         interface and no serial port is visible to the host.
+
+endmenu
+
+menu "UART Bridge"
 
 # UART 桥参数：USB 侧本地桥（S3）与目标侧无线 UART 桥（C3）共用同一套
 # 参数。放在 USB 条件之外，非 USB 端（如 ESP32-C3 无线接收端）也能配置。
@@ -67,34 +105,9 @@ config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
     int "UART bridge baud rate"
     default 115200
 
-config MEGUMINLINK_DAP_SWCLK_IO
-    int "CMSIS-DAP SWCLK/TCK GPIO number"
-    default 4
-    help
-        SWD/JTAG I/O pins of the CMSIS-DAP core. Used both by the local
-        (USB) CMSIS-DAP implementation and by the wireless target-side
-        executor, so these are available on every target (including
-        non-USB ones like ESP32-C3 used as the wireless receiver).
+endmenu
 
-config MEGUMINLINK_DAP_SWDIO_IO
-    int "CMSIS-DAP SWDIO/TMS GPIO number"
-    default 5
-
-config MEGUMINLINK_DAP_NRESET_IO
-    int "CMSIS-DAP nRESET GPIO number"
-    default 6
-
-config MEGUMINLINK_DAP_TDI_IO
-    int "CMSIS-DAP TDI GPIO number"
-    default 7
-
-config MEGUMINLINK_DAP_TDO_IO
-    int "CMSIS-DAP TDO GPIO number"
-    default 8
-
-config MEGUMINLINK_DAP_NTRST_IO
-    int "CMSIS-DAP nTRST GPIO number"
-    default 9
+menu "Wireless"
 
 config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
     int "Wireless DAP response timeout (ms)"
@@ -107,6 +120,8 @@ config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
         PC-side debugger (pyOCD/OpenOCD) will see a command timeout and
         retry on its own.
 
+endmenu
+
 config MEGUMINLINK_MODE_SWITCH_ENABLE
     bool "Enable debug mode switch button (double click + long press)"
     default y
@@ -118,7 +133,8 @@ config MEGUMINLINK_MODE_SWITCH_ENABLE
         Disable to strip the button driver (e.g. when the GPIO is needed
         for something else).
 
-if MEGUMINLINK_MODE_SWITCH_ENABLE
+menu "Mode Switch Button"
+    depends on MEGUMINLINK_MODE_SWITCH_ENABLE
 
 config MEGUMINLINK_MODE_SWITCH_GPIO
     int "Mode switch button GPIO number"
@@ -157,7 +173,7 @@ config MEGUMINLINK_PAIRING_MODE_TIMEOUT_MS
         NVS) is not affected and only ends on success. The NVS pairing
         record is never erased by entering/leaving the pairing flow.
 
-endif
+endmenu
 
 choice MEGUMINLINK_LED_DRIVER
     prompt "LED indicator driver"
@@ -179,7 +195,10 @@ config MEGUMINLINK_LED_DRIVER_GPIO
         indicator) and LED2 (pairing/connection indicator) GPIO numbers
         are configured below.
 
-if MEGUMINLINK_LED_DRIVER_GPIO
+endchoice
+
+menu "LED Indicator"
+    depends on MEGUMINLINK_LED_DRIVER_GPIO
 
 config MEGUMINLINK_LED_DRIVER_GPIO_LED1_IO
     int "LED1 (mode) GPIO number"
@@ -204,8 +223,6 @@ config MEGUMINLINK_LED_DRIVER_GPIO_BLINK_PERIOD_MS
         Half of one full blink cycle: a blinking LED toggles every this
         many milliseconds.
 
-endif
-
-endchoice
+endmenu
 
 endmenu
