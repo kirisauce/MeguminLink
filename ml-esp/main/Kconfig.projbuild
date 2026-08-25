@@ -70,6 +70,34 @@ config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
         When disabled, the USB device only exposes the CMSIS-DAP
         interface and no serial port is visible to the host.
 
+config MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    bool "Enable WebUSB capability"
+    default y
+    help
+        Advertise the WebUSB platform capability in the BOS descriptor and
+        answer the WebUSB GET_URL vendor request with the landing page URL
+        (see below). Lets browsers supporting WebUSB (Chrome/Edge) talk to
+        the device without manual driver setup.
+
+config MEGUMINLINK_USB_WEBUSB_LANDING_PAGE
+    string "WebUSB landing page"
+    default "https://example.com"
+    depends on MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    help
+        Landing page URL returned by the WebUSB GET_URL request, exposed as
+        USB string index iLandingPage. A leading "https://" or "http://" is
+        stripped from the URL descriptor body and encoded as its scheme; any
+        other form is embedded verbatim (scheme = full URL).
+
+config MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+    bool "Enable WinUSB capability"
+    default y
+    help
+        Advertise the Microsoft OS 2.0 platform capability in the BOS
+        descriptor and serve the MS OS 2.0 descriptor set via its vendor
+        request, so Windows can bind the WinUSB driver automatically
+        (no manual driver installation needed).
+
 endmenu
 
 menu "UART Bridge"

@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 cmsis_dap/Source/*.c 一致）。
 // DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
@@ -49,7 +50,7 @@ constexpr char LANGID[] = {0x09, 0x04};
 constexpr tusb_desc_device_t DEVICE_DESCRIPTOR = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
-    .bcdUSB = 0x0200,
+    .bcdUSB = 0x0210,
     .bDeviceClass = 0x00,
     .bDeviceSubClass = 0x00,
     .bDeviceProtocol = 0x00,
@@ -105,6 +106,153 @@ constexpr u8 CONFIG_DESCRIPTOR[] = {
 
     // 如需 SWO 流，在此追加 EP3 Bulk In (0x83, 64B) 描述符
 };
+
+enum
+{
+    VENDOR_CODE_MS_OS_20 = 0x20,
+    VENDOR_CODE_WEBUSB = 0x22,
+};
+
+enum
+{
+    MS_OS_20_OP_GET_DESCRIPTOR_SET = 0x0007,
+    WEBUSB_OP_GET_URL = 0x0002,
+};
+
+#if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+
+// ---- MS OS 2.0 描述符集（GET_DESCRIPTOR_SET 的响应体）----
+// 布局对齐《Microsoft OS 2.0 Descriptors Specification》：集合头 + 配置/
+// 功能子集头 + Compatible ID("WINUSB")。本设备是复合设备（含 CDC），裸
+// Compatible ID 无接口范围、Windows 不会套用到任何子功能上，必须用子集
+// 圈定到 DAP vendor 接口，才会自动绑定 winusb.sys 且不干扰 CDC。
+
+// dwWindowsVersion：声明由 Windows 8.1+ 处理本描述符集（与 BOS 平台能力一致）
+constexpr u32 MS_OS_20_WINDOWS_VERSION = 0x06030000;
+
+constexpr size_t MS_OS_20_SET_HEADER_LEN = 10;
+constexpr size_t MS_OS_20_CONFIG_SUBSET_HEADER_LEN = 8;
+constexpr size_t MS_OS_20_FUNCTION_SUBSET_HEADER_LEN = 8;
+constexpr size_t MS_OS_20_COMPATIBLE_ID_LEN = 20;
+
+// 零填充辅助
+#define MS_OS_20_PAD_4 0x00, 0x00, 0x00, 0x00
+#define MS_OS_20_PAD_8 MS_OS_20_PAD_4, MS_OS_20_PAD_4
+
+// 集合头描述符：wLength + 类型 + dwWindowsVersion + 整个集合的 wTotalLength
+#define MS_OS_20_DESC_SET_HEADER(_total_len)                                                          \
+    U16_TO_U8S_LE(MS_OS_20_SET_HEADER_LEN), U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR),            \
+        U32_TO_U8S_LE(MS_OS_20_WINDOWS_VERSION), U16_TO_U8S_LE(_total_len)
+
+// 配置子集头：wLength + 类型 + bConfigurationValue + 保留 + 子集 wTotalLength
+#define MS_OS_20_DESC_CONFIG_SUBSET(_config_value, _total_len)                                        \
+    U16_TO_U8S_LE(MS_OS_20_CONFIG_SUBSET_HEADER_LEN),                                                 \
+        U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION), (_config_value), 0x00,                   \
+        U16_TO_U8S_LE(_total_len)
+
+// 功能子集头：wLength + 类型 + bFirstInterface + 保留 + 子集 wTotalLength
+#define MS_OS_20_DESC_FUNCTION_SUBSET(_first_interface, _total_len)                                   \
+    U16_TO_U8S_LE(MS_OS_20_FUNCTION_SUBSET_HEADER_LEN),                                               \
+        U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION), (_first_interface), 0x00,                     \
+        U16_TO_U8S_LE(_total_len)
+
+// Compatible ID 描述符：CompatibleID="WINUSB"、SubCompatibleID 为空
+// （规范 Table 13：总长固定 0x14，无尾部填充）
+#define MS_OS_20_DESC_COMPATIBLE_ID_WINUSB()                                                          \
+    U16_TO_U8S_LE(MS_OS_20_COMPATIBLE_ID_LEN), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID),          \
+        'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00, /* CompatibleID */                                  \
+        MS_OS_20_PAD_8                            /* SubCompatibleID */
+
+u8 MS_OS_20_DESCRIPTOR_SET[] = {
+    MS_OS_20_DESC_SET_HEADER(MS_OS_20_SET_HEADER_LEN + MS_OS_20_CONFIG_SUBSET_HEADER_LEN +
+                             MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN),
+    MS_OS_20_DESC_CONFIG_SUBSET(1,
+                                MS_OS_20_CONFIG_SUBSET_HEADER_LEN + MS_OS_20_FUNCTION_SUBSET_HEADER_LEN +
+                                    MS_OS_20_COMPATIBLE_ID_LEN),
+    MS_OS_20_DESC_FUNCTION_SUBSET(ITF_NUM_DAP, MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN),
+    MS_OS_20_DESC_COMPATIBLE_ID_WINUSB(),
+};
+
+// 长度自洽：BOS 平台能力里的 wDescriptorSetLength 引用 sizeof 本数组
+static_assert(sizeof(MS_OS_20_DESCRIPTOR_SET) == MS_OS_20_SET_HEADER_LEN + MS_OS_20_CONFIG_SUBSET_HEADER_LEN +
+                                                     MS_OS_20_FUNCTION_SUBSET_HEADER_LEN +
+                                                     MS_OS_20_COMPATIBLE_ID_LEN);
+
+#endif
+
+consteval u8 bos_descriptor_total_len()
+{
+    u8 len = TUD_BOS_DESC_LEN;
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    len += TUD_BOS_WEBUSB_DESC_LEN;
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+    len += TUD_BOS_MICROSOFT_OS_DESC_LEN;
+#endif
+
+    return len;
+}
+
+consteval u8 bos_descriptors_num()
+{
+    u8 num = 0;
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    num += 1;
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+    num += 1;
+#endif
+
+    return num;
+}
+
+constexpr u8 BOS_DESCRIPTOR[] = {
+    TUD_BOS_DESCRIPTOR(bos_descriptor_total_len(), bos_descriptors_num()),
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    TUD_BOS_WEBUSB_DESCRIPTOR(VENDOR_CODE_WEBUSB, static_cast<u8>(UsbStringIndex::WebUsbLandingPage)),
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+    TUD_BOS_MS_OS_20_DESCRIPTOR(sizeof(MS_OS_20_DESCRIPTOR_SET), VENDOR_CODE_MS_OS_20),
+#endif
+};
+
+static_assert(sizeof(BOS_DESCRIPTOR) == bos_descriptor_total_len());
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+// WebUSB URL Descriptor（GET_URL 的响应体）：3 字节头 bLength /
+// bDescriptorType(WEBUSB_URL = 0x03) / bScheme + URL 文本。编译期从 Kconfig
+// 字符串生成：带 "https://" 或 "http://" 前缀时剥离前缀并把前缀编码进
+// bScheme（1/0），其余形式按完整 URL 处理（bScheme = 255）。
+constexpr std::string_view WEBUSB_LANDING_PAGE = CONFIG_MEGUMINLINK_USB_WEBUSB_LANDING_PAGE;
+constexpr bool WEBUSB_URL_IS_HTTPS = WEBUSB_LANDING_PAGE.starts_with("https://");
+constexpr bool WEBUSB_URL_IS_HTTP = WEBUSB_LANDING_PAGE.starts_with("http://");
+constexpr size_t WEBUSB_URL_PREFIX_LEN = WEBUSB_URL_IS_HTTPS ? 8 : WEBUSB_URL_IS_HTTP ? 7 : 0;
+constexpr u8 WEBUSB_URL_SCHEME = WEBUSB_URL_IS_HTTPS ? 1 : WEBUSB_URL_IS_HTTP ? 0 : 255;
+constexpr size_t WEBUSB_URL_BODY_LEN = WEBUSB_LANDING_PAGE.size() - WEBUSB_URL_PREFIX_LEN;
+
+consteval std::array<u8, 3 + WEBUSB_URL_BODY_LEN> make_webusb_url_descriptor()
+{
+    std::array<u8, 3 + WEBUSB_URL_BODY_LEN> desc{};
+    desc[0] = static_cast<u8>(desc.size());
+    desc[1] = 0x03; // bDescriptorType: WEBUSB_URL
+    desc[2] = WEBUSB_URL_SCHEME;
+    for (size_t i = 0; i < WEBUSB_URL_BODY_LEN; i++)
+    {
+        desc[3 + i] = static_cast<u8>(WEBUSB_LANDING_PAGE[WEBUSB_URL_PREFIX_LEN + i]);
+    }
+    return desc;
+}
+
+// 静态存储：tud_control_xfer 只保存指针，DATA 阶段（含多包续传）仍会读取，
+// 不能放在回调栈上。
+constexpr auto WEBUSB_URL_DESCRIPTOR = make_webusb_url_descriptor();
+#endif
 
 void tinyusb_event_callback([[maybe_unused]] tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
@@ -268,6 +416,49 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
     }
 }
 
+const u8 *tud_descriptor_bos_cb()
+{
+    return BOS_DESCRIPTOR;
+}
+
+bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_t *request)
+{
+    if (stage != CONTROL_STAGE_SETUP)
+    {
+        return true;
+    }
+
+    switch (request->bRequest)
+    {
+#if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
+    case VENDOR_CODE_MS_OS_20:
+        if (request->wIndex == MS_OS_20_OP_GET_DESCRIPTOR_SET)
+        {
+            tud_control_xfer(rhport, request, MS_OS_20_DESCRIPTOR_SET, sizeof(MS_OS_20_DESCRIPTOR_SET));
+            return true;
+        }
+        break;
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    case VENDOR_CODE_WEBUSB:
+        if (request->wIndex == WEBUSB_OP_GET_URL)
+        {
+            // URL Descriptor 在 flash 中只读，TinyUSB 传输路径按 void* 读取，
+            // 去掉 const 仅是接口要求
+            tud_control_xfer(rhport, request, const_cast<u8 *>(WEBUSB_URL_DESCRIPTOR.data()),
+                             sizeof(WEBUSB_URL_DESCRIPTOR));
+            return true;
+        }
+        break;
+#endif
+    }
+
+    // 未识别的 vendor 请求：返回 false 让 usbd 对 EP0 发 STALL，
+    // 避免主机干等超时
+    return false;
+}
+
 namespace mlink
 {
 CmsisDapUsb::CmsisDapUsb()
@@ -277,6 +468,10 @@ CmsisDapUsb::CmsisDapUsb()
     m_string_descriptors[(usize)UsbStringIndex::Product] = "CMSIS-DAP on " CONFIG_IDF_TARGET;
     m_string_descriptors[(usize)UsbStringIndex::SerialNumber] = m_serial;
     m_string_descriptors[(usize)UsbStringIndex::DapInterfaceName] = "CMSIS-DAP v2";
+
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+    m_string_descriptors[(usize)UsbStringIndex::WebUsbLandingPage] = WEBUSB_LANDING_PAGE.data();
+#endif
 
     constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
 

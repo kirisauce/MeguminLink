@@ -22,6 +22,9 @@ enum class UsbStringIndex {
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
   UartBridgeInterfaceName,
 #endif
+#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
+  WebUsbLandingPage,
+#endif
   Max,
 };
 
