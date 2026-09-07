@@ -71,7 +71,7 @@ Application::Application()
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
-#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
     ESP_ERROR_CHECK(m_leds.init(*this));
 #endif
     apply_mode();
@@ -308,7 +308,7 @@ void Application::run()
     {
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
         m_leds.update();
 #endif

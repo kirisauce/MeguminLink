@@ -19,7 +19,7 @@
 #include "meguminlink/wireless_uart.hpp"
 #endif
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
 #include "meguminlink/led/led_controller.hpp"
 #endif
 
@@ -195,7 +195,7 @@ class Application
     ButtonState m_button; /**< 模式切换按键状态机（防抖/双击/长按识别） */
 #endif
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
+#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
     LedController m_leds; /**< LED 指示灯控制器（主循环周期刷新，内部读本对象状态） */
 #endif
 

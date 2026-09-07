@@ -2,11 +2,11 @@
 #ifndef __MEGUMINLINK_GPIO_LED_DRIVER_HPP__
 #define __MEGUMINLINK_GPIO_LED_DRIVER_HPP__
 
-#include "driver/gpio.h" // gpio_num_t
+#include "driver/gpio.h" // IWYU pragma: keep
 #include "esp_err.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h" // portMUX_TYPE
-#include "sdkconfig.h"
+#include "freertos/FreeRTOS.h" // IWYU pragma: keep
+#include "sdkconfig.h"         // IWYU pragma: keep
 
 #include <array>
 

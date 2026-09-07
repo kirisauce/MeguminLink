@@ -9,6 +9,8 @@
 // 一个 #elif 分支切换 using 即可。
 #if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
 #include "meguminlink/led/gpio_led_driver.hpp"
+#elif CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
+#include "meguminlink/led/ws2812_led_driver.hpp"
 #endif
 
 namespace mlink
@@ -16,6 +18,8 @@ namespace mlink
 #if CONFIG_MEGUMINLINK_LED_DRIVER_GPIO
 /** 当前 Kconfig 选中的 LED 驱动（LedController 静态持有） */
 using LedDriver = GpioLedDriver;
+#elif CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
+using LedDriver = Ws2812LedDriver;
 #endif
 } // namespace mlink
 

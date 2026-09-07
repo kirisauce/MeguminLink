@@ -24,10 +24,17 @@ endif()
 file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
 list(APPEND __src ${__dap_src})
 
-# LED 指示灯模块：仅在 GPIO 驱动被选中时编译（Disabled 时整个模块不参与构建）
-if(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO)
-    file(GLOB __led_src ${CMAKE_CURRENT_LIST_DIR}/led/*.cc)
-    list(APPEND __src ${__led_src})
+# LED 指示灯模块：LED 驱动被选中时编译（choice 非 NONE）；Disabled 时整个模块不参与构建。
+# 各驱动源文件仅在对应的 CONFIG 选项选中时加入（led_controller.cc 为门面，任何
+# 非 NONE 配置都需要）。
+if(NOT CONFIG_MEGUMINLINK_LED_DRIVER_NONE)
+    list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/led_controller.cc)
+    if(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO)
+        list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/gpio_led_driver.cc)
+    endif()
+    if(CONFIG_MEGUMINLINK_LED_DRIVER_WS2812)
+        list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/ws2812_led_driver.cc)
+    endif()
 endif()
 
 idf_component_register(SRCS ${__src}

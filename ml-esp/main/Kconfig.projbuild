@@ -209,7 +209,8 @@ choice MEGUMINLINK_LED_DRIVER
     help
         Select the LED indicator driver. "Disabled" removes the whole LED
         module from the build. GPIO drives two LEDs (default GPIO12/GPIO13,
-        active low).
+        active low). WS2812 drives a single addressable LED on the RMT
+        peripheral (default GPIO1).
 
 config MEGUMINLINK_LED_DRIVER_NONE
     bool "Disabled"
@@ -223,9 +224,17 @@ config MEGUMINLINK_LED_DRIVER_GPIO
         indicator) and LED2 (pairing/connection indicator) GPIO numbers
         are configured below.
 
+config MEGUMINLINK_LED_DRIVER_WS2812
+    bool "WS2812 (RMT, 1 LED)"
+    help
+        One WS2812 addressable LED driven by the RMT peripheral (protocol
+        sampling: bit0 = 300ns high/900ns low, bit1 = 700ns high/500ns
+        low, GRB byte order). The single LED encodes the device status
+        (mode/pairing) with color and effect (see LedController).
+
 endchoice
 
-menu "LED Indicator"
+menu "LED Indicator (GPIO)"
     depends on MEGUMINLINK_LED_DRIVER_GPIO
 
 config MEGUMINLINK_LED_DRIVER_GPIO_LED1_IO
@@ -250,6 +259,19 @@ config MEGUMINLINK_LED_DRIVER_GPIO_BLINK_PERIOD_MS
     help
         Half of one full blink cycle: a blinking LED toggles every this
         many milliseconds.
+
+endmenu
+
+menu "LED Indicator (WS2812)"
+    depends on MEGUMINLINK_LED_DRIVER_WS2812
+
+config MEGUMINLINK_LED_DRIVER_WS2812_GPIO
+    int "WS2812 data (DIN) GPIO number"
+    default 1
+    range 0 48
+    help
+        GPIO connected to the single WS2812 LED's DIN pin. The RMT
+        peripheral drives this pin with the WS2812 protocol.
 
 endmenu
 
