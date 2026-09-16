@@ -26,6 +26,9 @@ config MEGUMINLINK_DAP_SWDIO_IO
 config MEGUMINLINK_DAP_NRESET_IO
     int "CMSIS-DAP nRESET GPIO number"
     default 6
+    help
+        Target device reset line. The JTAG nTRST signal shares this GPIO
+        (DAP_nTRST_GPIO aliases DAP_nRESET_GPIO).
 
 config MEGUMINLINK_DAP_TDI_IO
     int "CMSIS-DAP TDI GPIO number"
@@ -34,10 +37,6 @@ config MEGUMINLINK_DAP_TDI_IO
 config MEGUMINLINK_DAP_TDO_IO
     int "CMSIS-DAP TDO GPIO number"
     default 8
-
-config MEGUMINLINK_DAP_NTRST_IO
-    int "CMSIS-DAP nTRST GPIO number"
-    default 9
 
 endmenu
 

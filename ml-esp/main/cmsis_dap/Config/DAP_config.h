@@ -206,8 +206,8 @@ static const char TargetBoardName    [] = TARGET_BOARD_NAME;
 #define DAP_SWDIO_TMS_GPIO      ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_SWDIO_IO)  // SWDIO/TMS:  Data I/O
 #define DAP_TDI_GPIO            ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_TDI_IO)    // TDI:        Test Data Input
 #define DAP_TDO_GPIO            ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_TDO_IO)    // TDO:        Test Data Output
-#define DAP_nTRST_GPIO          ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_NTRST_IO)  // nTRST:      Test Reset (optional)
 #define DAP_nRESET_GPIO         ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_NRESET_IO) // nRESET:     Device Reset
+#define DAP_nTRST_GPIO          DAP_nRESET_GPIO                                // nTRST:      Test Reset（与 nRESET 共用同一根复位线）
 
 /** Get Vendor Name string.
 \param str Pointer to buffer to store the string (max 60 characters).
@@ -377,15 +377,14 @@ __STATIC_INLINE void PORT_JTAG_SETUP (void) {
   gpio_set_level(DAP_SWCLK_TCK_GPIO, 1);
   gpio_set_level(DAP_SWDIO_TMS_GPIO, 1);
   gpio_set_level(DAP_TDI_GPIO, 1);
-  // nTRST/nRESET: 开漏输出 + 上拉（输入缓冲开启以便读回），默认高（释放复位）
+  // nRESET/nTRST（共用同一根复位线）: 开漏输出 + 上拉（输入缓冲开启以便读回），默认高（释放复位）
   gpio_config_t od;
-  od.pin_bit_mask = (1ULL << DAP_nTRST_GPIO) | (1ULL << DAP_nRESET_GPIO);
+  od.pin_bit_mask = (1ULL << DAP_nRESET_GPIO);
   od.mode = GPIO_MODE_INPUT_OUTPUT_OD;
   od.pull_up_en = GPIO_PULLUP_ENABLE;
   od.pull_down_en = GPIO_PULLDOWN_DISABLE;
   od.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&od);
-  gpio_set_level(DAP_nTRST_GPIO, 1);
   gpio_set_level(DAP_nRESET_GPIO, 1);
   // TDO: 输入
   gpio_config_t tdo;
@@ -425,8 +424,7 @@ __STATIC_INLINE void PORT_SWD_SETUP (void) {
   // TDI/TDO/nTRST: 高阻输入（SWD 模式未使用）
   gpio_config_t hz;
   hz.pin_bit_mask = (1ULL << DAP_TDI_GPIO) |
-                    (1ULL << DAP_TDO_GPIO) |
-                    (1ULL << DAP_nTRST_GPIO);
+                    (1ULL << DAP_TDO_GPIO);
   hz.mode = GPIO_MODE_INPUT;
   hz.pull_up_en = GPIO_PULLUP_DISABLE;
   hz.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -445,7 +443,6 @@ __STATIC_INLINE void PORT_OFF (void) {
   gpio_ll_pin_filter_disable(&GPIO, DAP_SWDIO_TMS_GPIO);
   gpio_ll_pin_filter_disable(&GPIO, DAP_TDI_GPIO);
   gpio_ll_pin_filter_disable(&GPIO, DAP_TDO_GPIO);
-  gpio_ll_pin_filter_disable(&GPIO, DAP_nTRST_GPIO);
   gpio_ll_pin_filter_disable(&GPIO, DAP_nRESET_GPIO);
   // 全部 7 脚 → 输入高阻
   gpio_config_t io;
@@ -460,7 +457,7 @@ __STATIC_INLINE void PORT_OFF (void) {
   gpio_config(&io);
   // nRESET/nTRST: 高阻输入，保留弱上拉（复位线悬空时需拉高）
   gpio_config_t od;
-  od.pin_bit_mask = (1ULL << DAP_nTRST_GPIO) | (1ULL << DAP_nRESET_GPIO);
+  od.pin_bit_mask = (1ULL << DAP_nRESET_GPIO);
   od.mode = GPIO_MODE_INPUT;
   od.pull_up_en = GPIO_PULLUP_ENABLE;
   od.pull_down_en = GPIO_PULLDOWN_DISABLE;
