@@ -69,6 +69,24 @@ config MEGUMINLINK_USB_UART_BRIDGE_ENABLE
         When disabled, the USB device only exposes the CMSIS-DAP
         interface and no serial port is visible to the host.
 
+config MEGUMINLINK_USB_HID_DAP_ENABLE
+    bool "Enable CMSIS-DAP v1 (HID) interface"
+    default y
+    depends on TINYUSB_HID_COUNT > 0
+    help
+        Expose an extra HID interface (vendor-defined 64-byte reports,
+        interrupt IN/OUT endpoints) carrying CMSIS-DAP v1 next to the
+        CMSIS-DAP v2 vendor bulk interface, so hosts and tools that only
+        speak CMSIS-DAP v1 over HID can use the probe as well (no driver
+        installation needed on Windows/macOS, hidraw on Linux).
+
+        Both interfaces share one DAP execution loop, so commands arriving
+        on either transport are serialized; a host should use only one of
+        them at a time.
+
+        Requires TinyUSB HID class support: TINYUSB_HID_COUNT > 0 (set to 1
+        by sdkconfig.defaults; the option is hidden otherwise).
+
 config MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
     bool "Enable WebUSB capability"
     default y

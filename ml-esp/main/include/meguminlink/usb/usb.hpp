@@ -13,23 +13,27 @@
 
 namespace mlink
 {
-enum class UsbStringIndex {
-  LangId = 0,
-  Manufacturer,
-  Product,
-  SerialNumber,
-  DapInterfaceName,
+enum class UsbStringIndex
+{
+    LangId = 0,
+    Manufacturer,
+    Product,
+    SerialNumber,
+    DapInterfaceName,
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-  UartBridgeInterfaceName,
+    UartBridgeInterfaceName,
+#endif
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    HidInterfaceName,
 #endif
 #if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
-  WebUsbLandingPage,
+    WebUsbLandingPage,
 #endif
-  Max,
+    Max,
 };
 
 /**
- * CMSIS-DAP v2 USB 设备。
+ * CMSIS-DAP USB 设备（复合设备）。
  *
  * 仅负责描述符与 TinyUSB 驱动初始化；DAP 命令处理在 usb.cc 的 dap_task 中。
  */
@@ -55,7 +59,12 @@ class CmsisDapUsb
     void set_enabled(bool enabled);
 
     TaskHandle_t m_dap_task = nullptr;
-    RingbufHandle_t m_bulk_rx_buffer;
+    /**
+     * DAP 命令队列（NOSPLIT ringbuffer，元素为 usb.cc 的 DapCommand）：
+     * vendor bulk（CMSIS-DAP v2）与 HID（CMSIS-DAP v1）两条传输通道共用，
+     * 由 dap_task 顺序消费——DAP 执行器不可重入，命令必须串行执行。
+     */
+    RingbufHandle_t m_dap_command_buffer;
 
   private:
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
@@ -82,7 +91,7 @@ class CmsisDapUsb
 
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
-    std::array<const char*, (usize)UsbStringIndex::Max> m_string_descriptors;
+    std::array<const char *, (usize)UsbStringIndex::Max> m_string_descriptors;
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     QueueHandle_t m_uart_queue;
