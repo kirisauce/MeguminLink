@@ -53,6 +53,14 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     ReceivedPacket rp = {};
     std::memcpy(rp.src_mac, recv_info->src_addr, ESP_NOW_ETH_ALEN);
 
+    // 链路层统计：收到的每一帧都计（含反序列化失败的畸形帧——它们同样
+    // 占用了空口与 ESP-NOW 任务），RSSI 随帧更新
+    if (recv_info->rx_ctrl != nullptr)
+    {
+        Application::get_instance().config_channel().add_wireless_rx(static_cast<u16>(data_len),
+                                                                     recv_info->rx_ctrl->rssi);
+    }
+
     if (rp.packet.deserialize(data, data_len, rp.storage, sizeof(rp.storage)) != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to deserialize %d-byte frame from " MACSTR, data_len, MAC2STR(rp.src_mac));
@@ -275,7 +283,14 @@ esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
         return ret;
     }
 
-    return esp_now_send(dest_mac, buffer, packet.serialized_size());
+    const esp_err_t send_ret = esp_now_send(dest_mac, buffer, packet.serialized_size());
+    if (send_ret == ESP_OK)
+    {
+        // 链路层统计：成功交给 ESP-NOW 的帧（发送结果由 send_cb 另行处理，
+        // 这里只反映"已发出"的字节量）
+        Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(packet.serialized_size()));
+    }
+    return send_ret;
 }
 
 esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len)

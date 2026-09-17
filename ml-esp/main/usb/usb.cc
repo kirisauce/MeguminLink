@@ -480,12 +480,13 @@ bool dap_source_ready(DapSource source)
     return tud_vendor_n_mounted(ITF_NUM_DAP);
 }
 
-// 执行器上下文：命令队列、当前在途命令的来源（响应路由依据）。
-// cmd_src 与 resp_sink 由同一任务（dap_task）串行调用，无需同步。
+// 执行器上下文：命令队列、当前在途命令的来源（响应路由依据）与请求长度
+// （统计用）。cmd_src 与 resp_sink 由同一任务（dap_task）串行调用，无需同步。
 struct DapTaskContext
 {
     mlink::CmsisDapUsb *usb;
     DapSource source = DapSource::VendorBulk;
+    u16 request_len = 0;
 };
 
 // 执行器命令源（USB 输入，dap_executor_run 的 cmd_src）：
@@ -515,6 +516,7 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     vRingbufferReturnItem(ctx.usb->m_dap_command_buffer, item);
     *len = req_len;
     ctx.source = source;
+    ctx.request_len = req_len;
 
     if (!dap_source_ready(source))
     {
@@ -555,6 +557,7 @@ void usb_resp_sink(const u8 *data, u16 len, void *arg)
         out_len = DAP_PACKET_SIZE;
     }
     dap_send_response(ctx.source, data, out_len);
+    Application::get_instance().config_channel().add_dap_command(ctx.request_len, out_len);
 }
 
 void dap_task(void *arg)
@@ -636,6 +639,13 @@ const u8 *tud_descriptor_bos_cb()
 
 bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_t *request)
 {
+    // 配置通道（bRequest = 0x4D）：EP0 厂商请求，与下述 MS OS 2.0 / WebUSB
+    // 的描述符请求按 bRequest 分派；非本模块的请求交回下方原逻辑处理
+    if (mlink::Application::get_instance().config_channel().handle_control(rhport, stage, request))
+    {
+        return true;
+    }
+
     if (stage != CONTROL_STAGE_SETUP)
     {
         return true;

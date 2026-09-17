@@ -2,6 +2,7 @@
 #ifndef __MEGUMINLINK_APP_HPP__
 #define __MEGUMINLINK_APP_HPP__
 
+#include "meguminlink/config_channel.hpp"
 #include "meguminlink/nvs_flash.hpp"
 #include "meguminlink/pairing.hpp"
 #include "meguminlink/wireless_link.hpp"
@@ -110,6 +111,9 @@ class Application
     /** 无线链路访问器（配对/转发/执行接线使用） */
     WirelessLink &wireless_link();
 
+    /** 配置/遥测通道访问器（统计挂点累加、EP0 厂商请求处理） */
+    ConfigChannel &config_channel();
+
     /**
      * 本地串口口收到数据 → 打包 UartData 帧发给配对 peer（尽力而为）。
      * 调用方：S3 侧 CDC RX 回调、C3 侧 UART 桥任务。未配对/发送失败时
@@ -210,6 +214,9 @@ class Application
 
     /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless_link.hpp） */
     WirelessLink m_wireless_link;
+
+    /** 配置/遥测通道（统计计数器 + EP0 厂商请求处理，见 config_channel.hpp） */
+    ConfigChannel m_config_channel;
 };
 } // namespace mlink
 

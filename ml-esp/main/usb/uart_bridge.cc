@@ -37,6 +37,7 @@ void uart_cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *eve
     if (app.mode() == mlink::Mode::Wireless)
     {
         app.send_uart_data(rx_buffer, rx_size);
+        mlink::Application::get_instance().config_channel().add_uart_wireless_rx(static_cast<u16>(rx_size));
         return;
     }
 
@@ -44,7 +45,9 @@ void uart_cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *eve
     if (written < 0)
     {
         ESP_LOGW(TAG, "UART write failed: %s", esp_err_to_name(written));
+        return;
     }
+    mlink::Application::get_instance().config_channel().add_uart_rx(static_cast<u16>(written));
 }
 
 // ---- CDC 行编码回调（主机 SET_LINE_CODING）----
@@ -181,6 +184,7 @@ void CmsisDapUsb::uart_bridge_task(void *arg)
                 {
                     ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
                 }
+                Application::get_instance().config_channel().add_uart_tx(static_cast<u16>(queued));
             }
             break;
         }
@@ -254,6 +258,7 @@ void CmsisDapUsb::uart_data_to_cdc(const u8 *data, size_t len)
     {
         ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
     }
+    Application::get_instance().config_channel().add_uart_wireless_tx(static_cast<u16>(queued));
 }
 
 void CmsisDapUsb::set_uart_bridge_active(bool active)

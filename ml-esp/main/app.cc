@@ -192,6 +192,11 @@ WirelessLink &Application::wireless_link()
     return m_wireless_link;
 }
 
+ConfigChannel &Application::config_channel()
+{
+    return m_config_channel;
+}
+
 void Application::send_uart_data(const u8 *data, size_t len)
 {
     // 尽力而为：未配对/发送失败一律丢弃（与 DAP 转发语义一致，串口无重试）。
