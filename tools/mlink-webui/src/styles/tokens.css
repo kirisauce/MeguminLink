@@ -1,0 +1,115 @@
+/**
+ * Material 3 设计 token（手写，不引 UI 组件库）。
+ *
+ * 主色取 Megumin 红，围绕它推出一整套明暗色板；状态语义色 M3 未定义
+ * success/warning，因此以 --mlink-status-* 前缀作为项目扩展。
+ * 变量一律定义在 :root —— ::view-transition-* 之类挂在 html 上的伪元素
+ * 才能继承到（挂到 body 会解析失败）。
+ */
+
+:root {
+	color-scheme: light dark;
+
+	/* 主色与容器 */
+	--md-sys-color-primary: #9c1f2e;
+	--md-sys-color-on-primary: #ffffff;
+	--md-sys-color-primary-container: #ffdad9;
+	--md-sys-color-on-primary-container: #40000a;
+
+	/* 次要/第三级容器（中性偏红，用于信息性高亮） */
+	--md-sys-color-secondary-container: #f6ddda;
+	--md-sys-color-on-secondary-container: #2b1614;
+	--md-sys-color-tertiary-container: #cee9d9;
+	--md-sys-color-on-tertiary-container: #092017;
+
+	/* 表面层级 */
+	--md-sys-color-surface: #fff8f7;
+	--md-sys-color-surface-container-low: #fdf1ef;
+	--md-sys-color-surface-container: #f8ecea;
+	--md-sys-color-surface-container-high: #f2e4e2;
+	--md-sys-color-on-surface: #201a19;
+	--md-sys-color-on-surface-variant: #534341;
+	--md-sys-color-outline: #857371;
+	--md-sys-color-outline-variant: #d8c2c0;
+
+	/* 错误 */
+	--md-sys-color-error: #ba1a1a;
+	--md-sys-color-on-error: #ffffff;
+	--md-sys-color-error-container: #ffdad6;
+	--md-sys-color-on-error-container: #410002;
+
+	/* 状态语义色（项目扩展） */
+	--mlink-status-ok: #10462c;
+	--mlink-status-ok-container: #cfeadb;
+	--mlink-status-busy: #4f3200;
+	--mlink-status-busy-container: #ffe2b8;
+	--mlink-status-idle: #3c3231;
+	--mlink-status-idle-container: #e6e1df;
+	--mlink-status-error: #7f1d1d;
+	--mlink-status-error-container: #ffdad6;
+
+	--md-sys-elevation-1: 0 1px 2px rgb(0 0 0 / 0.08), 0 1px 3px rgb(0 0 0 / 0.04);
+
+	--md-sys-shape-corner-xs: 4px;
+	--md-sys-shape-corner-sm: 8px;
+	--md-sys-shape-corner-md: 12px;
+	--md-sys-shape-corner-lg: 16px;
+	--md-sys-shape-corner-full: 999px;
+
+	--md-sys-space-xs: 0.25rem;
+	--md-sys-space-sm: 0.5rem;
+	--md-sys-space-md: 0.75rem;
+	--md-sys-space-lg: 1rem;
+	--md-sys-space-xl: 1.5rem;
+	--md-sys-space-2xl: 2rem;
+
+	--md-sys-typescale-font: system-ui, -apple-system, 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif;
+	--md-sys-typescale-font-mono: ui-monospace, 'JetBrains Mono', 'Cascadia Mono', 'SFMono-Regular', monospace;
+
+	--md-sys-typescale-label-sm: 0.6875rem;
+	--md-sys-typescale-label-md: 0.75rem;
+	--md-sys-typescale-body-sm: 0.8125rem;
+	--md-sys-typescale-body-md: 0.875rem;
+	--md-sys-typescale-title-md: 1rem;
+	--md-sys-typescale-title-lg: 1.25rem;
+	--md-sys-typescale-headline-sm: 1.5rem;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--md-sys-color-primary: #ffb3b1;
+		--md-sys-color-on-primary: #5f1120;
+		--md-sys-color-primary-container: #7f1c29;
+		--md-sys-color-on-primary-container: #ffdad9;
+
+		--md-sys-color-secondary-container: #4a3330;
+		--md-sys-color-on-secondary-container: #f6ddda;
+		--md-sys-color-tertiary-container: #2b4c3c;
+		--md-sys-color-on-tertiary-container: #cee9d9;
+
+		--md-sys-color-surface: #1a1110;
+		--md-sys-color-surface-container-low: #221817;
+		--md-sys-color-surface-container: #271d1c;
+		--md-sys-color-surface-container-high: #332726;
+		--md-sys-color-on-surface: #f0dedc;
+		--md-sys-color-on-surface-variant: #d8c2c0;
+		--md-sys-color-outline: #a08c8a;
+		--md-sys-color-outline-variant: #534341;
+
+		--md-sys-color-error: #ffb4ab;
+		--md-sys-color-on-error: #690005;
+		--md-sys-color-error-container: #93000a;
+		--md-sys-color-on-error-container: #ffdad6;
+
+		--mlink-status-ok: #b6ecc9;
+		--mlink-status-ok-container: #17402a;
+		--mlink-status-busy: #ffdf9e;
+		--mlink-status-busy-container: #4a3200;
+		--mlink-status-idle: #d7c1be;
+		--mlink-status-idle-container: #38302f;
+		--mlink-status-error: #ffb4ab;
+		--mlink-status-error-container: #5c1a16;
+
+		--md-sys-elevation-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 3px rgb(0 0 0 / 0.24);
+	}
+}

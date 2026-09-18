@@ -9,6 +9,7 @@
  */
 
 import { ProtocolError, STAT_FIELDS, VID, PID, readStats, type Stats } from './protocol';
+import { computeRates, type Rates } from './rate';
 
 /** 页面在前台时的采样间隔。 */
 const POLL_INTERVAL_MS = 200;
@@ -35,6 +36,8 @@ function describeError(error: unknown): string {
 export class MlinkSession {
 	state = $state<ConnectionState>('disconnected');
 	stats = $state<Stats | null>(null);
+	/** 最近两个相邻快照之间的每秒增量；不足两帧或间隔不连续时为 null。 */
+	rates = $state<Rates | null>(null);
 	/** 最近一次失败的说明；成功读回一帧后清空。 */
 	error = $state<string | null>(null);
 	device = $state<USBDevice | null>(null);
@@ -103,6 +106,7 @@ export class MlinkSession {
 		const device = this.device;
 		this.device = null;
 		this.stats = null;
+		this.rates = null;
 		this.error = null;
 		this.state = this.supported ? 'disconnected' : 'unsupported';
 		if (device?.opened === true) {
@@ -149,6 +153,8 @@ export class MlinkSession {
 		try {
 			const stats = await readStats(device, this.#seq);
 			this.#seq = (this.#seq + 1) & 0xff;
+			const previous = this.stats;
+			this.rates = previous === null ? null : computeRates(previous, stats);
 			this.stats = stats;
 			this.error = null;
 			if (this.state !== 'streaming') this.state = 'streaming';
@@ -156,6 +162,7 @@ export class MlinkSession {
 			this.#fail(describeError(error));
 			this.device = null;
 			this.stats = null;
+			this.rates = null;
 			return;
 		}
 		this.#schedule();
@@ -182,6 +189,7 @@ export class MlinkSession {
 			if (event.device !== this.device) return;
 			this.device = null;
 			this.stats = null;
+			this.rates = null;
 			this.#cancel();
 			this.state = 'disconnected';
 			this.error = '设备已断开';
