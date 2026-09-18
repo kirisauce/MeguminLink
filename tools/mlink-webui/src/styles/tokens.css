@@ -63,8 +63,13 @@
 	--md-sys-space-xl: 1.5rem;
 	--md-sys-space-2xl: 2rem;
 
-	--md-sys-typescale-font: system-ui, -apple-system, 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif;
-	--md-sys-typescale-font-mono: ui-monospace, 'JetBrains Mono', 'Cascadia Mono', 'SFMono-Regular', monospace;
+	/* 字体：先点名真实存在的字体，再按平台通用性补齐 fallback，末尾一律落到
+	   通用族。栈里若全是缺席名字，会由 fontconfig 的 monospace 别名（本机是
+	   新宋体）兜出意外结果。 */
+	--md-sys-typescale-font: 'LXGW WenKai Screen', system-ui, 'Noto Sans SC', 'Noto Sans', 'Segoe UI',
+		Arial, 'Helvetica Neue', sans-serif;
+	--md-sys-typescale-font-mono: 'Maple Mono NF CN', 'LXGW WenKai Mono Screen', ui-monospace,
+		'Noto Sans Mono', 'Liberation Mono', Hack, Consolas, 'Cascadia Mono', 'Courier New', monospace;
 
 	--md-sys-typescale-label-sm: 0.6875rem;
 	--md-sys-typescale-label-md: 0.75rem;
@@ -112,4 +117,21 @@
 
 		--md-sys-elevation-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 3px rgb(0 0 0 / 0.24);
 	}
+}
+
+/* 基础元素。Svelte island 渲染出的元素不带 Astro 的 scoped 属性，元素级字体
+   规则必须留在全局样式表里，放进 Layout 的 <style> 只能命中 Astro 模板自身
+   渲染的节点。 */
+body {
+	font-family: var(--md-sys-typescale-font);
+	background: var(--md-sys-color-surface);
+	color: var(--md-sys-color-on-surface);
+	-webkit-font-smoothing: antialiased;
+}
+
+code,
+kbd,
+samp,
+pre {
+	font-family: var(--md-sys-typescale-font-mono);
 }
