@@ -1,0 +1,170 @@
+/**
+ * MeguminLink 配置通道的 EP0 厂商控制请求与 TLV 响应解析。
+ *
+ * 传输：bmRequestType = 0xC0（IN、vendor、device recipient）、bRequest = 0x4D（'M'）、
+ * wValue = 命令码、wIndex = seq（设备原样回显）、wLength = 期望响应长度。
+ * 只读命令没有 DATA OUT 阶段，命令参数走 wValue，因此请求不带帧头，响应才是完整一帧。
+ *
+ * 帧头 8B 大端：magic u16（0x4D4C，字节流恒为 'M' 'L'）+ cmd u8 + seq u8
+ * + len u16（TLV 区长度）+ status u8 + reserved u8，后接 len 字节 TLV 区。
+ * TLV：tag u8 | len u8 | value，len == 0xFF 时后接 u16 大端扩展长度；
+ * 整数一律大端，字符串不带结尾 NUL。新增 tag 不影响本解析器。
+ *
+ * 请求的 recipient 是 device，按 WebUSB 规范不需要 claimInterface ——
+ * 这是本页面能与 pyOCD/OpenOCD 同时访问同一台设备的前提。
+ *
+ * 契约的唯一权威在固件侧 main/config_channel.cc 顶部注释。
+ */
+
+export const VID = 0x303a;
+export const PID = 0x4020;
+
+export const VENDOR_CODE = 0x4d;
+export const CMD_GET_STATS = 0x01;
+/** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
+export const MAX_RESPONSE = 512;
+
+const FRAME_MAGIC = 0x4d4c;
+const FRAME_HEADER_SIZE = 8;
+
+export const STATUS_NAMES: Readonly<Record<number, string>> = {
+	0x00: 'ok',
+	0x01: 'unknown-command',
+	0x02: 'malformed',
+	0x03: 'internal',
+	0x04: 'unsupported',
+};
+
+export const MODE_NAMES: Readonly<Record<number, string>> = { 0: 'local', 1: 'wireless' };
+export const PAIR_NAMES: Readonly<Record<number, string>> = { 0: 'idle', 1: 'paired', 2: 'pairing' };
+
+/** 统计快照。计数器一律 u32 累计值，回绕由上层按 (cur - prev) >>> 0 处理。 */
+export type Stats = {
+	mode: number;
+	pair: number;
+	rssi: number;
+	dapCmds: number;
+	dapReqBytes: number;
+	dapRespBytes: number;
+	wlTxBytes: number;
+	wlRxBytes: number;
+	uartRxBytes: number;
+	uartTxBytes: number;
+	uartWlRxBytes: number;
+	uartWlTxBytes: number;
+	uptimeMs: number;
+};
+
+export type StatField = {
+	tag: number;
+	key: keyof Stats;
+	/** 与 mlinkctl.py 的输出字段名一致，便于两边对照。 */
+	name: string;
+	label: string;
+	signed?: boolean;
+};
+
+/** 字段顺序即 mlinkctl 的打印顺序。 */
+export const STAT_FIELDS: readonly StatField[] = [
+	{ tag: 0x01, key: 'mode', name: 'mode', label: '链路模式' },
+	{ tag: 0x02, key: 'pair', name: 'pair', label: '配对状态' },
+	{ tag: 0x03, key: 'rssi', name: 'rssi', label: 'RSSI', signed: true },
+	{ tag: 0x10, key: 'dapCmds', name: 'dap_cmds', label: 'DAP 命令数' },
+	{ tag: 0x11, key: 'dapReqBytes', name: 'dap_req_bytes', label: 'DAP 请求字节' },
+	{ tag: 0x12, key: 'dapRespBytes', name: 'dap_resp_bytes', label: 'DAP 响应字节' },
+	{ tag: 0x20, key: 'wlTxBytes', name: 'wl_tx_bytes', label: '无线发送字节' },
+	{ tag: 0x21, key: 'wlRxBytes', name: 'wl_rx_bytes', label: '无线接收字节' },
+	{ tag: 0x30, key: 'uartRxBytes', name: 'uart_rx_bytes', label: 'UART 接收字节（Local）' },
+	{ tag: 0x31, key: 'uartTxBytes', name: 'uart_tx_bytes', label: 'UART 发送字节（Local）' },
+	{ tag: 0x32, key: 'uartWlRxBytes', name: 'uart_wl_rx_bytes', label: 'UART 接收字节（Wireless）' },
+	{ tag: 0x33, key: 'uartWlTxBytes', name: 'uart_wl_tx_bytes', label: 'UART 发送字节（Wireless）' },
+	{ tag: 0x40, key: 'uptimeMs', name: 'uptime_ms', label: '开机时长' },
+];
+
+export class ProtocolError extends Error {
+	/** 设备返回的状态码；传输层失败时为 null。 */
+	readonly status: number | null;
+
+	constructor(message: string, status: number | null = null) {
+		super(message);
+		this.name = 'ProtocolError';
+		this.status = status;
+	}
+}
+
+function parseTlv(frame: DataView, start: number, end: number): Map<number, DataView> {
+	const tags = new Map<number, DataView>();
+	let pos = start;
+	while (pos + 2 <= end) {
+		const tag = frame.getUint8(pos);
+		let length = frame.getUint8(pos + 1);
+		pos += 2;
+		if (length === 0xff) {
+			if (pos + 2 > end) break;
+			length = frame.getUint16(pos, false);
+			pos += 2;
+		}
+		if (pos + length > end) break;
+		tags.set(tag, new DataView(frame.buffer, frame.byteOffset + pos, length));
+		pos += length;
+	}
+	return tags;
+}
+
+function readValue(view: DataView | undefined, signed: boolean): number {
+	if (view === undefined || view.byteLength === 0) return 0;
+	switch (view.byteLength) {
+		case 1:
+			return signed ? view.getInt8(0) : view.getUint8(0);
+		case 2:
+			return signed ? view.getInt16(0, false) : view.getUint16(0, false);
+		case 4:
+			return signed ? view.getInt32(0, false) : view.getUint32(0, false);
+		default:
+			throw new ProtocolError(`unexpected TLV length ${view.byteLength}`);
+	}
+}
+
+export function decodeStats(frame: DataView): Stats {
+	if (frame.byteLength < FRAME_HEADER_SIZE) {
+		throw new ProtocolError(`short response (${frame.byteLength} bytes)`);
+	}
+	if (frame.getUint16(0, false) !== FRAME_MAGIC) {
+		throw new ProtocolError('bad frame magic');
+	}
+	const status = frame.getUint8(6);
+	if (status !== 0x00) {
+		const name = STATUS_NAMES[status] ?? `0x${status.toString(16)}`;
+		throw new ProtocolError(`device returned status=${name}`, status);
+	}
+	const declared = frame.getUint16(4, false);
+	const end = Math.min(FRAME_HEADER_SIZE + declared, frame.byteLength);
+	const tags = parseTlv(frame, FRAME_HEADER_SIZE, end);
+
+	const stats = {} as Stats;
+	for (const field of STAT_FIELDS) {
+		stats[field.key] = readValue(tags.get(field.tag), field.signed === true);
+	}
+	return stats;
+}
+
+/** 读一次 GET_STATS。seq 仅用于诊断请求/响应错位，设备原样回显。 */
+export async function readStats(device: USBDevice, seq: number): Promise<Stats> {
+	const result = await device.controlTransferIn(
+		{
+			requestType: 'vendor',
+			recipient: 'device',
+			request: VENDOR_CODE,
+			value: CMD_GET_STATS,
+			index: seq & 0xff,
+		},
+		MAX_RESPONSE
+	);
+	if (result.status !== 'ok') {
+		throw new ProtocolError(`transfer ${result.status}`);
+	}
+	if (!result.data) {
+		throw new ProtocolError('empty response');
+	}
+	return decodeStats(result.data);
+}

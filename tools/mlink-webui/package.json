@@ -12,9 +12,15 @@
     "astro": "astro"
   },
   "dependencies": {
-    "astro": "^7.3.3"
+    "@astrojs/svelte": "^9.0.1",
+    "astro": "^7.3.3",
+    "svelte": "^5.57.0",
+    "uplot": "^1.6.32"
   },
   "allowScripts": {
     "esbuild": true
+  },
+  "devDependencies": {
+    "@types/w3c-web-usb": "^1.0.14"
   }
 }
