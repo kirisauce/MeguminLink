@@ -59,6 +59,19 @@ export function formatRate(value: number): string {
 	return `${formatScaled(scaled)} ${UNITS[unit]}/s`;
 }
 
+/** 轴刻度用：1024 进制缩写，不带单位，避免刻度文字过长。 */
+export function formatCompact(value: number): string {
+	if (!Number.isFinite(value)) return '';
+	let scaled = Math.abs(value);
+	let unit = 0;
+	while (scaled >= 1024 && unit < UNITS.length - 1) {
+		scaled /= 1024;
+		unit += 1;
+	}
+	const suffix = ['', 'K', 'M', 'G'][unit];
+	return `${value < 0 ? '-' : ''}${formatScaled(scaled)}${suffix}`;
+}
+
 /** 命令数按整数显示，速率按每秒次数。 */
 export function formatCount(value: number): string {
 	return Number.isFinite(value) ? String(Math.round(value)) : '—';

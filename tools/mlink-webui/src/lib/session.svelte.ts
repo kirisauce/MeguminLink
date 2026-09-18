@@ -16,6 +16,16 @@ const POLL_INTERVAL_MS = 200;
 /** 页面切到后台时降频，避免被浏览器节流后产生无意义的密集唤醒。 */
 const POLL_INTERVAL_HIDDEN_MS = 1000;
 
+/** 曲线滚动窗口长度。 */
+export const WINDOW_MS = 60_000;
+
+/**
+ * 曲线上的一个采样点。t 是主机时间（performance.now 毫秒），
+ * rates 为 null 表示此处数据不连续（设备重启、断开重连、长时间挂起），
+ * 曲线应当在该点断开而不是把两侧连成一条假直线。
+ */
+export type Sample = { t: number; rates: Rates | null };
+
 export type ConnectionState = 'unsupported' | 'disconnected' | 'connecting' | 'streaming' | 'error';
 
 export const STATE_TEXT: Readonly<Record<ConnectionState, string>> = {
@@ -38,6 +48,8 @@ export class MlinkSession {
 	stats = $state<Stats | null>(null);
 	/** 最近两个相邻快照之间的每秒增量；不足两帧或间隔不连续时为 null。 */
 	rates = $state<Rates | null>(null);
+	/** 滚动窗口内的采样点，供曲线使用。 */
+	history = $state<Sample[]>([]);
 	/** 最近一次失败的说明；成功读回一帧后清空。 */
 	error = $state<string | null>(null);
 	device = $state<USBDevice | null>(null);
@@ -107,6 +119,7 @@ export class MlinkSession {
 		this.device = null;
 		this.stats = null;
 		this.rates = null;
+		this.history = [];
 		this.error = null;
 		this.state = this.supported ? 'disconnected' : 'unsupported';
 		if (device?.opened === true) {
@@ -158,6 +171,7 @@ export class MlinkSession {
 			this.stats = stats;
 			this.error = null;
 			if (this.state !== 'streaming') this.state = 'streaming';
+			this.#appendSample();
 		} catch (error) {
 			this.#fail(describeError(error));
 			this.device = null;
@@ -166,6 +180,15 @@ export class MlinkSession {
 			return;
 		}
 		this.#schedule();
+	}
+
+	/** 追加一个采样点并丢弃滚出窗口的旧点。 */
+	#appendSample(): void {
+		const now = performance.now();
+		const cutoff = now - WINDOW_MS;
+		const kept = this.history.filter((sample) => sample.t >= cutoff);
+		kept.push({ t: now, rates: this.rates });
+		this.history = kept;
 	}
 
 	#cancel(): void {

@@ -1,11 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import type uPlot from 'uplot';
 	import { MlinkSession } from '../lib/session.svelte';
 	import { formatBytes, formatCount, formatRate, type CounterKey } from '../lib/rate';
 	import DeviceBar from './DeviceBar.svelte';
 	import StatusStrip from './StatusStrip.svelte';
 	import StatCard from './StatCard.svelte';
 	import StatTable from './StatTable.svelte';
+	import RateChart from './RateChart.svelte';
 
 	const session = new MlinkSession();
 
@@ -47,6 +49,32 @@
 		{ label: '发送', rate: byteRate('wlTxBytes'), total: byteTotal('wlTxBytes') },
 		{ label: '接收', rate: byteRate('wlRxBytes'), total: byteTotal('wlRxBytes') },
 	]);
+
+	/** 把滚动窗口内的采样点抽成 uPlot 的列式数据；无效点保持 null，曲线在该处断开。 */
+	function buildData(keys: CounterKey[]): uPlot.AlignedData {
+		const xs: number[] = [];
+		const columns = keys.map(() => [] as (number | null)[]);
+		for (const sample of session.history) {
+			xs.push(sample.t / 1000);
+			keys.forEach((key, index) => {
+				columns[index].push(sample.rates === null ? null : sample.rates[key]);
+			});
+		}
+		return [xs, ...columns] as uPlot.AlignedData;
+	}
+
+	const dapData: uPlot.AlignedData = $derived(buildData(['dapReqBytes', 'dapRespBytes']));
+
+	const uartLabels: string[] = $derived(
+		wireless ? ['接收 (CDC)', '发送 (CDC)', '空口发送', '空口接收'] : ['接收', '发送']
+	);
+	const uartData: uPlot.AlignedData = $derived(
+		buildData(
+			wireless
+				? ['uartWlRxBytes', 'uartWlTxBytes', 'wlTxBytes', 'wlRxBytes']
+				: ['uartRxBytes', 'uartTxBytes']
+		)
+	);
 </script>
 
 <div class="page">
@@ -75,6 +103,21 @@
 			{/if}
 		</div>
 
+		<div class="charts">
+			<RateChart
+				title="USB-DAP 速率"
+				subtitle="最近 60 秒，纵轴固定 B/s"
+				labels={['请求', '响应']}
+				data={dapData}
+			/>
+			<RateChart
+				title={wireless ? 'UART 速率 · Wireless' : 'UART 速率 · Local'}
+				subtitle={wireless ? 'CDC ⇄ 无线桥与空口，最近 60 秒' : 'CDC ↔ 片上 UART，最近 60 秒'}
+				labels={uartLabels}
+				data={uartData}
+			/>
+		</div>
+
 		<section class="raw">
 			<h2>原始计数器</h2>
 			<StatTable {stats} />
@@ -95,6 +138,12 @@
 	.cards {
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+		gap: var(--md-sys-space-lg);
+	}
+
+	.charts {
+		display: flex;
+		flex-direction: column;
 		gap: var(--md-sys-space-lg);
 	}
 

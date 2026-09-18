@@ -50,6 +50,12 @@
 
 	--md-sys-elevation-1: 0 1px 2px rgb(0 0 0 / 0.08), 0 1px 3px rgb(0 0 0 / 0.04);
 
+	/* 曲线序列色。uPlot 的 stroke 吃不了 CSS 变量，由组件读实际色值。 */
+	--mlink-chart-1: #9c1f2e;
+	--mlink-chart-2: #0b6bcb;
+	--mlink-chart-3: #1d7a4a;
+	--mlink-chart-4: #7a4bbf;
+
 	--md-sys-shape-corner-xs: 4px;
 	--md-sys-shape-corner-sm: 8px;
 	--md-sys-shape-corner-md: 12px;
@@ -116,6 +122,11 @@
 		--mlink-status-error-container: #5c1a16;
 
 		--md-sys-elevation-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 3px rgb(0 0 0 / 0.24);
+
+		--mlink-chart-1: #ffb3b1;
+		--mlink-chart-2: #a8c8ff;
+		--mlink-chart-3: #8fd8b0;
+		--mlink-chart-4: #d3bbff;
 	}
 }
 
