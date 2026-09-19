@@ -170,7 +170,7 @@ WIFI_RATES = {
 }
 WIFI_RATE_NAMES = {value: name for name, value in WIFI_RATES.items()}
 # 固件默认档（wireless_link.hpp 的 DEFAULT_WIFI_RATE）
-WIFI_RATE_DEFAULT = 0x1F
+WIFI_RATE_DEFAULT = 0x09
 
 # USB 能力（GetUsbConfig）的 tag 与取值域，与固件 usb_capability.hpp 一致
 TAG_USB_SUPPORTED = 0x60

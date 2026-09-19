@@ -182,7 +182,7 @@ export const WIFI_RATE_GROUPS: { group: string; rates: { value: number; label: s
 			{ value: 0x0f, label: '9 Mbps' },
 			{ value: 0x0a, label: '12 Mbps' },
 			{ value: 0x0e, label: '18 Mbps' },
-			{ value: 0x09, label: '24 Mbps' },
+			{ value: 0x09, label: '24 Mbps（固件默认）' },
 			{ value: 0x0d, label: '36 Mbps' },
 			{ value: 0x08, label: '48 Mbps' },
 			{ value: 0x0c, label: '54 Mbps' },
@@ -211,7 +211,7 @@ export const WIFI_RATE_GROUPS: { group: string; rates: { value: number; label: s
 			{ value: 0x1c, label: 'MCS4 · 43.3 Mbps' },
 			{ value: 0x1d, label: 'MCS5 · 57.8 Mbps' },
 			{ value: 0x1e, label: 'MCS6 · 65 Mbps' },
-			{ value: 0x1f, label: 'MCS7 · 72.2 Mbps（固件默认）' },
+			{ value: 0x1f, label: 'MCS7 · 72.2 Mbps' },
 		],
 	},
 ];

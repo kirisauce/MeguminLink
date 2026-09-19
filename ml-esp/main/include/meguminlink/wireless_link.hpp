@@ -21,11 +21,19 @@ namespace mlink
 inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 /**
- * ESP-NOW 发送速率默认档位（HT20 MCS7 + SGI，速率表最高档）。
- * 高 MCS 的长帧误帧率明显高于短帧，档位因此做成可调（配置通道 0x19），
- * 默认值保持既有行为不变。
+ * ESP-NOW 发送速率默认档位（11g OFDM 24 Mbps）。
+ *
+ * 吞吐与档位无关：瓶颈是每条 DAP 命令的往返延迟（~15ms/条）而不是空口时间，
+ * 实测从 HT20 MCS6 到 1 Mbps CCK 的写入耗时几乎相同（96KB 负载都在 2.0-2.1s）。
+ * 高速档因此不换来任何速度，只剩可靠性差异——高阶调制对信噪比与保护间隔
+ * 更敏感，HT20 MCS6/MCS7 在长负载下成片丢帧（MCS7 每命令真丢帧率 ~0.7%），
+ * 而本档在 64KB / 96KB 两种负载下全程零丢帧。
+ *
+ * 取非 HT OFDM 的中间速率而不是 HT20 的某个 MCS：两者实测可靠性相当，但
+ * 11g 少了 SGI/LGI 与 HT 前导这些只增加不确定性的旋钮，空口时间又足够短，
+ * 不会像低速档那样让长帧在空口上占住太久。
  */
-inline constexpr u8 DEFAULT_WIFI_RATE = WIFI_PHY_RATE_MCS7_SGI;
+inline constexpr u8 DEFAULT_WIFI_RATE = WIFI_PHY_RATE_24M;
 
 /**
  * 档位是否可用：限 ESP-NOW 可配置的 11b / 11g / HT20 MCS0-7 段
