@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { MODE_NAMES, MODE_WIRELESS, PAIR_NAMES, PAIR_PAIRED, PEER_OFFLINE, PEER_ONLINE, type Stats } from '../../../lib/protocol';
-	import { formatRtt, formatUartOpen, formatUptime } from '../../../lib/rate';
+	import { formatRtt, formatUptime } from '../../../lib/rate';
+	import StatusChip from '../../ui/StatusChip.svelte';
 
 	let {
 		stats,
@@ -19,12 +20,6 @@
 	type Tone = 'ok' | 'busy' | 'idle';
 
 	const pairTone: Tone = $derived(stats === null ? 'idle' : stats.pair === 1 ? 'ok' : stats.pair === 2 ? 'busy' : 'idle');
-
-	/** 串口状态三项：null = 设备不上报（老固件），此时不给配色 */
-	const uartHostOpen = $derived(stats?.uartHostOpen ?? null);
-	const uartTone: Tone | undefined = $derived(
-		uartHostOpen === null ? undefined : uartHostOpen !== 0 ? 'ok' : 'idle'
-	);
 
 	/**
 	 * 对端存活：手动探测在途时优先显示「探测中…」，周期探测则静默——文案始终停在
@@ -58,7 +53,6 @@
 		{ label: '配对状态', value: stats === null ? '—' : (PAIR_NAMES[stats.pair] ?? '?'), tone: pairTone },
 		{ label: '对端', value: peer.value, tone: peer.tone, ping: true },
 		{ label: 'RSSI', value: stats === null || stats.mode !== 1 ? '—' : `${stats.rssi} dBm` },
-		{ label: '串口', value: formatUartOpen(stats), tone: uartTone },
 		{ label: '开机时长', value: stats === null ? '—' : formatUptime(stats.uptimeMs) },
 	]);
 
@@ -112,7 +106,7 @@
 			{#if item.ping}
 				<!-- 延迟只做展示，刷新独立成一个按钮放在它右边 -->
 				<span class="pair">
-					<span class="value chip" data-tone={item.tone ?? 'idle'}>{item.value}</span>
+					<StatusChip label={item.value} tone={item.tone ?? 'idle'} />
 					<button
 						type="button"
 						class="refresh"
@@ -127,9 +121,7 @@
 					</button>
 				</span>
 			{:else if item.tone}
-				<span class="value chip" data-tone={item.tone}>{item.value}</span>
-			{:else if item.tone}
-				<span class="value chip" data-tone={item.tone}>{item.value}</span>
+				<StatusChip label={item.value} tone={item.tone} />
 			{:else}
 				<span class="value">{item.value}</span>
 			{/if}
@@ -150,6 +142,8 @@
 	li {
 		display: flex;
 		flex-direction: column;
+		/* 起点对齐：状态胶囊在纵向排列里不该被拉满整行 */
+		align-items: flex-start;
 		gap: var(--md-sys-space-xs);
 		padding: var(--md-sys-space-md) var(--md-sys-space-lg);
 		border-radius: var(--md-sys-shape-corner-md);
@@ -168,34 +162,11 @@
 		font-weight: 600;
 	}
 
-	.chip {
-		align-self: flex-start;
-		padding: 0.05rem 0.55rem;
-		border-radius: var(--md-sys-shape-corner-full);
-		font-size: var(--md-sys-typescale-body-md);
-		background: var(--mlink-status-idle-container);
-		color: var(--mlink-status-idle);
-	}
-
-	.chip[data-tone='ok'] {
-		background: var(--mlink-status-ok-container);
-		color: var(--mlink-status-ok);
-	}
-
-	.chip[data-tone='busy'] {
-		background: var(--mlink-status-busy-container);
-		color: var(--mlink-status-busy);
-	}
-
 	/* 「对端」项：延迟是可读展示，刷新是它右边的独立按钮 */
 	.pair {
 		display: flex;
 		align-items: center;
 		gap: var(--md-sys-space-sm);
-	}
-
-	.pair .chip {
-		align-self: center;
 	}
 
 	.refresh {

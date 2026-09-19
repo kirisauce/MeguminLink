@@ -1,11 +1,14 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	let {
 		title,
-		subtitle = '',
+		subtitle,
 		rows,
 	}: {
 		title: string;
-		subtitle?: string;
+		/** 纯文本；需要内嵌状态胶囊等标记时传 snippet */
+		subtitle?: string | Snippet;
 		rows: { label: string; rate: string; total: string }[];
 	} = $props();
 </script>
@@ -13,7 +16,9 @@
 <section class="card">
 	<header>
 		<h2>{title}</h2>
-		{#if subtitle}
+		{#if typeof subtitle === 'function'}
+			<p>{@render subtitle()}</p>
+		{:else if subtitle}
 			<p>{subtitle}</p>
 		{/if}
 	</header>

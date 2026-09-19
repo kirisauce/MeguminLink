@@ -2,13 +2,14 @@
 	import { onMount } from 'svelte';
 	import type uPlot from 'uplot';
 	import { MlinkSession } from '../../../lib/session.svelte';
-	import { formatBytes, formatCount, formatLineCoding, formatRate, type CounterKey } from '../../../lib/rate';
+	import { formatBytes, formatCount, formatLineCoding, formatRate, formatUartOpen, type CounterKey } from '../../../lib/rate';
 	import DeviceBar from './DeviceBar.svelte';
 	import ConfigDrawer from '../drawer/ConfigDrawer.svelte';
 	import StatusStrip from '../panel/StatusStrip.svelte';
 	import StatCard from '../panel/StatCard.svelte';
 	import StatTable from '../panel/StatTable.svelte';
 	import RateChart from '../panel/RateChart.svelte';
+	import StatusChip from '../../ui/StatusChip.svelte';
 
 	const session = new MlinkSession();
 
@@ -54,8 +55,14 @@
 		{ label: '接收', rate: byteRate('wlRxBytes'), total: byteTotal('wlRxBytes') },
 	]);
 
-	/** UART 卡片副标题：桥接形态 + 主机下发的线编码（设备不上报时为「—」）。 */
-	const uartSubtitle = $derived(`${wireless ? 'CDC ⇄ 无线桥' : 'CDC ↔ 片上 UART'} · ${formatLineCoding(stats)}`);
+	/**
+	 * UART 卡片副标题：桥接形态 · 串口打开状态 · 线编码。
+	 * 打开状态带状态配色（已打开=ok、未打开=idle）；设备不上报的项按固定占位显示「—」。
+	 */
+	const uartBridge = $derived(wireless ? 'CDC ⇄ 无线桥' : 'CDC ↔ 片上 UART');
+	const uartOpen = $derived(formatUartOpen(stats));
+	const uartTone = $derived<'ok' | 'idle'>(stats?.uartHostOpen == null ? 'idle' : stats.uartHostOpen !== 0 ? 'ok' : 'idle');
+	const uartCoding = $derived(formatLineCoding(stats));
 
 	/** 把滚动窗口内的采样点抽成 uPlot 的列式数据；无效点保持 null，曲线在该处断开。 */
 	function buildData(keys: CounterKey[]): uPlot.AlignedData {
@@ -105,11 +112,11 @@
 
 		<div class="cards">
 			<StatCard title="USB-DAP" subtitle="CMSIS-DAP 调试链路" rows={dapRows} />
-			<StatCard
-				title={wireless ? 'UART · Wireless' : 'UART · Local'}
-				subtitle={uartSubtitle}
-				rows={uartRows}
-			/>
+			<StatCard title={wireless ? 'UART · Wireless' : 'UART · Local'} rows={uartRows}>
+				{#snippet subtitle()}
+					{uartBridge} · <StatusChip label={uartOpen} tone={uartTone} />（{uartCoding}）
+				{/snippet}
+			</StatCard>
 			{#if wireless}
 				<StatCard title="无线空口" subtitle="ESP-NOW 链路" rows={radioRows} />
 			{/if}
