@@ -43,11 +43,17 @@
 
 <style>
 	.bar {
+		position: sticky;
+		top: 0;
+		/* 低于配置抽屉（10/11）与确认弹窗（20/21）：滚动时顶栏贴在内容之上，
+		   但抽屉打开后必须被抽屉的遮罩盖住 */
+		z-index: 5;
 		display: flex;
 		align-items: center;
 		gap: var(--md-sys-space-md);
 		flex-wrap: wrap;
 		padding: var(--md-sys-space-lg) var(--md-sys-space-xl);
+		/* 背景必须不透明：滚动时下方内容会从顶栏底下穿过 */
 		background: var(--md-sys-color-surface-container-low);
 		border-bottom: 1px solid var(--md-sys-color-outline-variant);
 	}
