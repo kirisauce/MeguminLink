@@ -33,6 +33,7 @@ export const CMD_SET_USB_CONFIG = 0x16;
 export const CMD_APPLY_USB_CONFIG = 0x17;
 export const CMD_PING = 0x18;
 export const CMD_SET_WIFI_RATE = 0x19;
+export const CMD_SET_LOSS = 0x1a;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -56,13 +57,14 @@ export const MODE_WIRELESS = 1;
 /** Stats.pair 的取值：仅已配对时才有可探测的对端。 */
 export const PAIR_PAIRED = 1;
 
-/** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50-0x52 配置项。 */
+/** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50-0x53 配置项。 */
 const TAG_FW_VERSION = 0x41;
 const TAG_CHIP_TARGET = 0x42;
 const TAG_IDF_VERSION = 0x43;
 const TAG_CONFIG_MODE = 0x50;
 const TAG_CONFIG_PEER_MAC = 0x51;
 const TAG_CONFIG_WIFI_RATE = 0x52;
+const TAG_CONFIG_LOSS_PERMILLE = 0x53;
 
 /** CDC ACM 串口状态的 tag（0x30-0x33 是 UART 字节计数器，这里从 0x34 续编）。 */
 const TAG_UART_HOST_OPEN = 0x34;
@@ -76,6 +78,9 @@ const TAG_PEER_ONLINE = 0x22;
 const TAG_PING_RTT = 0x23;
 const TAG_PING_OK = 0x24;
 const TAG_PING_FAIL = 0x25;
+/** 丢包注入的计数器（同在 0x20-0x2F 无线段；固件未编译该功能时不下发）。 */
+const TAG_LOSS_FRAMES = 0x26;
+const TAG_LOSS_DROPPED = 0x27;
 
 /**
  * 对端存活状态（Stats.peerOnline）。
@@ -144,6 +149,12 @@ export type Stats = {
 	pingRttUs: number | null;
 	pingOk: number | null;
 	pingFail: number | null;
+	/**
+	 * 丢包注入的读数：lossFrames 是过白名单、参与判定的出向帧数，lossDropped
+	 * 是其中被判丢的帧数，两者之比即实际注入比例。固件未编译该功能时为 null。
+	 */
+	lossFrames: number | null;
+	lossDropped: number | null;
 };
 
 export type StatField = {
@@ -222,11 +233,29 @@ export const WIFI_RATE_NAMES: ReadonlyMap<number, string> = new Map(
 );
 
 /**
+ * 注入丢包率的界面单位（百分比）与换算。
+ *
+ * 设备端按千分比存放（配置通道给命令参数只留了 8 位，上限 255‰），界面与
+ * CLI 统一按百分比呈现：0-25.5%，步进 0.1%（1‰）。
+ */
+export const LOSS_PERCENT_MAX = 25.5;
+export const LOSS_PERMILLE_PER_PERCENT = 10;
+
+/** 千分比 → 显示文本（0.1% 步进，固定一位小数）。 */
+export function lossPercentText(permille: number): string {
+	return `${(permille / LOSS_PERMILLE_PER_PERCENT).toFixed(1)}%`;
+}
+
+/**
  * 设备身份与配置项快照（GetConfig）。
  *
  * mode 与 Stats.mode 同值域，peerMac 为小写冒号分隔的 6 字节 MAC，
  * 未配对时为 null。wifiRate 是 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值），
  * 不支持该配置的旧固件为 null。
+ *
+ * lossPermille 是注入丢包率，设备端按千分比存放（0-255，0.1% 步进），界面
+ * 上按百分比呈现；固件未编译该功能时既不下发该配置也不认识 0x1A 命令，
+ * 此时为 null。
  */
 export type DeviceConfig = {
 	fwVersion: string;
@@ -235,6 +264,7 @@ export type DeviceConfig = {
 	mode: number;
 	peerMac: string | null;
 	wifiRate: number | null;
+	lossPermille: number | null;
 };
 
 /**
@@ -316,6 +346,12 @@ export type UartStateKey = 'uartHostOpen' | 'uartBaud' | 'uartDataBits' | 'uartS
 /** 对端存活探测字段：与串口状态同待遇，既不进 STAT_FIELDS 也不参与速率差分。 */
 export type PeerStateKey = 'peerOnline' | 'pingRttUs' | 'pingOk' | 'pingFail';
 
+/**
+ * 丢包注入的读数字段：同样是实验读数而不是链路吞吐，既不进 STAT_FIELDS
+ * （不混进主统计表）也不参与速率差分。
+ */
+export type LossStateKey = 'lossFrames' | 'lossDropped';
+
 /** 缺失的 tag 一律为 null：区分"设备上报 0"与"设备根本没上报这个字段"。 */
 function readOptional(view: DataView | undefined): number | null {
 	if (view === undefined || view.byteLength === 0) return null;
@@ -383,6 +419,8 @@ export function decodeStats(frame: DataView): Stats {
 	stats.pingRttUs = readOptional(tags.get(TAG_PING_RTT));
 	stats.pingOk = readOptional(tags.get(TAG_PING_OK));
 	stats.pingFail = readOptional(tags.get(TAG_PING_FAIL));
+	stats.lossFrames = readOptional(tags.get(TAG_LOSS_FRAMES));
+	stats.lossDropped = readOptional(tags.get(TAG_LOSS_DROPPED));
 	return stats;
 }
 
@@ -395,6 +433,7 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		mode: readValue(tags.get(TAG_CONFIG_MODE), false),
 		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
 		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
+		lossPermille: readOptional(tags.get(TAG_CONFIG_LOSS_PERMILLE)),
 	};
 }
 

@@ -7,19 +7,19 @@
  * Δt 为 0 或超过 MAX_GAP_MS 时（设备重启、长时间挂起）本次速率判为无效。
  */
 
-import { STAT_FIELDS, type PeerStateKey, type Stats, type UartStateKey } from './protocol';
+import { STAT_FIELDS, type LossStateKey, type PeerStateKey, type Stats, type UartStateKey } from './protocol';
 
 /** 一次采样跨越这么久就认为数据不再连续（设备重启或页面长时间挂起）。 */
 export const MAX_GAP_MS = 2000;
 
 /**
  * 参与速率计算的字段：STAT_FIELDS 里除状态位与 uptime 之外的全部计数器。
- * 串口状态（UartStateKey）与对端探测结果（PeerStateKey）不在 STAT_FIELDS 里，
- * 这里再从类型上排除一次。
+ * 串口状态（UartStateKey）、对端探测结果（PeerStateKey）与丢包注入读数
+ * （LossStateKey）不在 STAT_FIELDS 里，这里再从类型上排除一次。
  */
 export type CounterKey = Exclude<
 	keyof Stats,
-	'mode' | 'pair' | 'rssi' | 'uptimeMs' | UartStateKey | PeerStateKey
+	'mode' | 'pair' | 'rssi' | 'uptimeMs' | UartStateKey | PeerStateKey | LossStateKey
 >;
 
 export const COUNTER_KEYS = STAT_FIELDS.filter(

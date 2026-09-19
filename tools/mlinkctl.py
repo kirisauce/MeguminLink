@@ -8,6 +8,8 @@
     mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / landing page（cmd 0x03）
     mlinkctl set-usb [...]       设置 USB 能力，保存后设备自动重新枚举（cmd 0x16 + 0x17）
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
+    mlinkctl set-rate <rate>     设置 ESP-NOW 发送速率档位，两端同时应用（cmd 0x19）
+    mlinkctl set-loss <percent>  设置注入丢包率，两端同时应用（cmd 0x1A，需固件编译该功能）
     mlinkctl pair                进入配对流程（cmd 0x11）
     mlinkctl exit-pair           退出配对流程（cmd 0x15）
     mlinkctl ping [-c N]         探测已配对对端：ESP-NOW 往返时延（cmd 0x18）
@@ -61,6 +63,7 @@ CMD_SET_USB_CONFIG = 0x16
 CMD_APPLY_USB_CONFIG = 0x17
 CMD_PING = 0x18
 CMD_SET_WIFI_RATE = 0x19
+CMD_SET_LOSS = 0x1A
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -93,11 +96,14 @@ STATS_FIELDS = [
     (0x31, "uart_tx_bytes"),
     (0x32, "uart_wl_rx_bytes"),
     (0x33, "uart_wl_tx_bytes"),
+    (0x26, "loss_frames"),
+    (0x27, "loss_dropped"),
     (0x40, "uptime_ms"),
 ]
 
-# 配置快照输出字段与 tag 一一对应：0x41-0x43 是设备身份，0x50-0x52 是配置项
+# 配置快照输出字段与 tag 一一对应：0x41-0x43 是设备身份，0x50-0x53 是配置项
 TAG_CONFIG_WIFI_RATE = 0x52
+TAG_CONFIG_LOSS_PERMILLE = 0x53
 CONFIG_FIELDS = [
     (0x41, "fw_version"),
     (0x42, "chip"),
@@ -105,6 +111,7 @@ CONFIG_FIELDS = [
     (0x50, "mode"),
     (0x51, "peer_mac"),
     (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
+    (TAG_CONFIG_LOSS_PERMILLE, "loss_percent"),
 ]
 
 # CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
@@ -171,6 +178,11 @@ WIFI_RATES = {
 WIFI_RATE_NAMES = {value: name for name, value in WIFI_RATES.items()}
 # 固件默认档（wireless_link.hpp 的 DEFAULT_WIFI_RATE）
 WIFI_RATE_DEFAULT = 0x09
+
+# 注入丢包率上限（百分比）：固件按千分比存放，wireless_link.hpp 的
+# MAX_LOSS_PERMILLE = 255 即 25.5%。设备端只在发送端丢 DAP 与串口数据帧，
+# 配置通道的控制帧永远放行，因此丢包率开满也改得回来。
+LOSS_PERCENT_MAX = 25.5
 
 # USB 能力（GetUsbConfig）的 tag 与取值域，与固件 usb_capability.hpp 一致
 TAG_USB_SUPPORTED = 0x60
@@ -317,6 +329,10 @@ def render_config(values):
                 if code is None
                 else f"{WIFI_RATE_NAMES.get(code, 'unknown')}(0x{code:02x})"
             )
+        elif name == "loss_percent":
+            # 设备端按千分比存放，界面上统一按百分比呈现（0.1% 步进）
+            code = int.from_bytes(raw, "big") if raw else None
+            value = "?" if code is None else f"{code / 10:.1f}%"
         else:
             value = raw.decode("utf-8", "replace") if raw is not None else ""
         parts.append(f"{name}={value}")
@@ -453,6 +469,29 @@ def cmd_set_rate(args):
     print("mlinkctl: 档位已下发本机并转发对端（对端未跟随时重发一次）", file=sys.stderr)
 
 
+def cmd_set_loss(args):
+    try:
+        percent = float(args.percent)
+    except ValueError:
+        die(f"丢包率需要是百分比数值，收到 {args.percent!r}")
+
+    # 区间与一位小数一起校验：NaN 与 inf 都过不了这个连比
+    if not 0.0 <= percent <= LOSS_PERCENT_MAX:
+        die(f"丢包率需要在 0-{LOSS_PERCENT_MAX}% 之间（0.1% 步进），收到 {args.percent!r}")
+
+    scaled = percent * 10
+    permille = int(round(scaled))
+    if abs(scaled - permille) > 1e-6:
+        die(f"丢包率最多一位小数（0.1% 步进），收到 {args.percent!r}")
+
+    # 设备端按千分比存放，并把同一条控制请求转发给对端：注入只在发送端生效，
+    # 两端必须各自持有同一个值，否则只有单方向的帧会被丢。转发是尽力而为的，
+    # 对端没跟上时重发一次即可。
+    decode(fetch(find_device(), CMD_SET_LOSS, permille))
+    print(f"status=ok loss={percent:.1f}%")
+    print("mlinkctl: 已下发本机并转发对端；两端固件都需编译该功能（见 Kconfig 的 Wireless 菜单）", file=sys.stderr)
+
+
 def cmd_action(args):
     decode(fetch(find_device(), args.cmd_code))
     print("status=ok")
@@ -543,6 +582,14 @@ def build_parser():
     set_rate.add_argument("rate", nargs="?", help="档位名（如 mcs7-sgi）或数值（如 0x1F）")
     set_rate.add_argument("--list", action="store_true", help="列出全部档位后退出")
     set_rate.set_defaults(handler=cmd_set_rate)
+
+    set_loss = subparsers.add_parser("set-loss", help="设置注入丢包率，两端同时应用（模拟信号变差）")
+    set_loss.add_argument(
+        "percent",
+        metavar="PERCENT",
+        help=f"丢包率百分比，0-{LOSS_PERCENT_MAX}（0.1 步进），0 = 关闭",
+    )
+    set_loss.set_defaults(handler=cmd_set_loss)
 
     ping = subparsers.add_parser("ping", help="探测已配对对端（ESP-NOW 往返时延）")
     ping.add_argument("-c", "--count", type=int, default=1, metavar="N", help="探测次数（默认 1）")

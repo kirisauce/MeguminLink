@@ -7,6 +7,7 @@
 #include "esp_wifi.h"                   // IWYU pragma: export
 #include "meguminlink/common.hpp"       // IWYU pragma: keep
 #include "meguminlink/dap_executor.hpp" // DAP_MAX_REQUEST_SIZE / DAP_MAX_RESPONSE_SIZE（执行器缓冲）
+#include "sdkconfig.h"
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
@@ -41,6 +42,22 @@ inline constexpr u8 DEFAULT_WIFI_RATE = WIFI_PHY_RATE_24M;
  * 供配置通道在投递动作前校验，避免把非法值送进主循环。
  */
 bool wifi_rate_supported(u8 rate);
+
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+/**
+ * 注入丢包率（千分比）：默认不注入，上限 255‰ = 25.5%。
+ *
+ * 单位取千分比而不是百分比，是为了让 0.1% 这一档有意义：无线 DAP 每条命令
+ * 一次往返，0.1% 的丢帧率在 96KB 负载（约 135 条命令）下才刚接近"偶尔失败"，
+ * 百分比整数会把整个可用区间压成一个刻度。
+ *
+ * 参数经配置通道的控制请求下发，那里给命令参数只留了 8 位（见
+ * config_channel.cc 的协议注释），255 因此也是通道上限。上端截断不损失测试
+ * 能力：2% 已足以让无线 DAP 几乎必然超时。
+ */
+inline constexpr u8 DEFAULT_LOSS_PERMILLE = 0;
+inline constexpr u8 MAX_LOSS_PERMILLE = 255;
+#endif
 
 /**
  * DapCommand/DapResponse 帧格式：[type:1B][len:2B 大端][data:len B]。
@@ -346,6 +363,24 @@ class WirelessLink
      */
     esp_err_t set_wifi_rate(u8 rate);
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    /** 当前注入丢包率（千分比，0 = 不注入） */
+    u8 loss_permille() const;
+
+    /**
+     * 设置注入丢包率（主机经配置通道 0x1A 下发，主循环执行）。
+     *
+     * 与速率档位同样同步给已配对对端：注入只在发送端生效，两端必须各自持有
+     * 同一个值，否则只有单方向的帧会被丢，测出来的不是"链路变差"。
+     *
+     * 不做持久化（同速率档位：射频环境参数而非用户偏好），上电与恢复出厂设置
+     * 都回 DEFAULT_LOSS_PERMILLE。
+     *
+     * @param permille 千分比，> MAX_LOSS_PERMILLE 时返回 ESP_ERR_INVALID_ARG
+     */
+    esp_err_t set_loss_permille(u8 permille);
+#endif
+
     /**
      * 主循环每拍调用：应用对端经 RelayedUsbControl 下发的速率档位。
      *
@@ -393,6 +428,22 @@ class WirelessLink
     /** 设置单播 peer 的 ESP-NOW 发送速率（广播地址跳过） */
     esp_err_t set_peer_rate(const u8 *peer_mac);
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    /** xorshift32 取下一个随机数（状态在 send 的发送锁内推进） */
+    u32 next_random();
+
+    /**
+     * 本次发送是否按注入丢包率丢弃。
+     *
+     * 只有 DAP 与串口数据帧参与判定：配对、探测与配置通道控制帧必须永远走得
+     * 通，否则丢包率调高之后连"改回来"的控制请求都会一起丢掉。
+     *
+     * 判定、计数与 PRNG 推进都在调用方持有发送锁期间完成，因此不需要额外的
+     * 临界区（send 会被 USB DAP 任务、UART 桥任务、EP0 上下文与主循环调用）。
+     */
+    bool loss_should_drop(PacketType type);
+#endif
+
     static constexpr u8 CHANNEL = 10; // ESP-NOW 固定信道
 
     bool m_initialized = false;
@@ -413,6 +464,18 @@ class WirelessLink
      */
     volatile u32 m_pending_rate = 0;
     portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
+
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    /**
+     * 注入丢包率（千分比）。只由主循环写（set_loss_permille），读取方是 send
+     * 的判定（各任务上下文）与配置通道 GetConfig（EP0 上下文）——单字节读写，
+     * 与 m_rate 同一口径。
+     */
+    volatile u8 m_loss_permille = DEFAULT_LOSS_PERMILLE;
+    /** PRNG 状态：init() 与改档位时用 esp_random 播种，只在发送锁内推进 */
+    u32 m_loss_rng = 1;
+#endif
+
     /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
     QueueHandle_t m_dap_queue = nullptr;
     TaskHandle_t m_dap_task = nullptr;

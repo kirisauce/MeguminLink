@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { MODE_NAMES, PAIR_NAMES } from '../../../lib/protocol';
 	import type { MlinkSession } from '../../../lib/session.svelte';
+	import AdvancedSettings from './AdvancedSettings.svelte';
 	import ConfigActions from './ConfigActions.svelte';
 	import RateSettings from './RateSettings.svelte';
 	import UsbSettings from './UsbSettings.svelte';
@@ -71,6 +72,8 @@
 	<RateSettings {session} />
 
 	<UsbSettings {session} />
+
+	<AdvancedSettings {session} />
 
 	<ConfigActions {session} />
 </aside>

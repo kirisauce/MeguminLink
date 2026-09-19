@@ -403,6 +403,10 @@ void Application::consume_pending_action()
 #endif
         // 速率档位不做持久化，这里显式回默认档：恢复出厂设置后射频参数也应回到默认
         (void)m_wireless_link.set_wifi_rate(DEFAULT_WIFI_RATE);
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+        // 注入丢包率同理：恢复出厂设置必须回到不注入
+        (void)m_wireless_link.set_loss_permille(DEFAULT_LOSS_PERMILLE);
+#endif
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
@@ -447,6 +451,12 @@ void Application::consume_pending_action()
         // 做——命令的接受方既可能是本机 EP0，也可能是转发的对端请求。
         (void)m_wireless_link.set_wifi_rate(arg);
         break;
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    case ConfigChannel::Action::SetLoss:
+        // 注入丢包率（千分比）。只在发送端生效，两端各自由这条命令设置自己的值。
+        (void)m_wireless_link.set_loss_permille(arg);
+        break;
+#endif
     }
 }
 

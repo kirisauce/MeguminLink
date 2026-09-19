@@ -15,6 +15,7 @@ import {
 	CMD_REBOOT,
 	CMD_RESET,
 	CMD_SET_MODE,
+	CMD_SET_LOSS,
 	CMD_SET_WIFI_RATE,
 	MODE_WIRELESS,
 	PAIR_PAIRED,
@@ -340,6 +341,21 @@ export class MlinkSession {
 		await this.#sendCommand(CMD_SET_WIFI_RATE, rate);
 		if (this.commandError === null && this.config !== null) {
 			this.config = { ...this.config, wifiRate: rate };
+		}
+	}
+
+	/**
+	 * 设置注入丢包率（设备端单位：千分比）。
+	 *
+	 * 与速率档位同形：设备端把同一条命令转发给对端，两端各按同一个丢包率丢
+	 * 自己发出的 DAP/UART 帧。界面按百分比收输入，换算在调用方完成。
+	 *
+	 * 回显值就地更新，理由同 setWifiRate。
+	 */
+	async setLossPermille(permille: number): Promise<void> {
+		await this.#sendCommand(CMD_SET_LOSS, permille);
+		if (this.commandError === null && this.config !== null) {
+			this.config = { ...this.config, lossPermille: permille };
 		}
 	}
 

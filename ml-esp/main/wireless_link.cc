@@ -10,6 +10,7 @@
 #include <esp_check.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_random.h>
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc 一致）。
 // DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
@@ -182,6 +183,12 @@ esp_err_t WirelessLink::init()
         return ESP_ERR_NO_MEM;
     }
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    // 注入丢帧的随机序列：两端各自用 esp_random 播种，不共享序列——固定种子会
+    // 让两台设备在相同帧号上同时丢帧，制造出现实里不存在的人为相关
+    m_loss_rng = esp_random() | 1u;
+#endif
+
     esp_err_t ret;
     ret = mlink::nvs_flash_init();
     ESP_RETURN_ON_ERROR(ret, TAG, "mlink::nvs_flash_init() failed");
@@ -347,6 +354,62 @@ esp_err_t WirelessLink::set_wifi_rate(u8 rate)
     return ESP_OK;
 }
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+u8 WirelessLink::loss_permille() const
+{
+    return m_loss_permille;
+}
+
+esp_err_t WirelessLink::set_loss_permille(u8 permille)
+{
+    if (permille > MAX_LOSS_PERMILLE)
+    {
+        ESP_LOGW(TAG, "Loss permille out of range: %u (max %u)", permille, MAX_LOSS_PERMILLE);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    m_loss_permille = permille;
+    // 换档即重播种：同一档位反复实验不会重放同一串丢帧
+    m_loss_rng = esp_random() | 1u; // xorshift 的 0 是不动点
+
+    // 无 USB 侧（接收端）没有宿主可以读回配置，它有没有收到中继只能靠这条日志
+    ESP_LOGI(TAG, "Link loss injection: %u permille (%u.%u%%)", permille, permille / 10, permille % 10);
+    return ESP_OK;
+}
+
+u32 WirelessLink::next_random()
+{
+    u32 x = m_loss_rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    m_loss_rng = x;
+    return x;
+}
+
+bool WirelessLink::loss_should_drop(PacketType type)
+{
+    // 白名单：只有 DAP 与串口数据帧过这道闸。配对、探测与配置通道控制帧一律
+    // 放行，丢包率因此永远丢不掉"改回来"的那条控制请求。
+    if (type != PacketType::DapCommand && type != PacketType::DapResponse && type != PacketType::UartData)
+    {
+        return false;
+    }
+
+    auto &config = Application::get_instance().config_channel();
+    const u8 permille = m_loss_permille;
+    if (permille == 0)
+    {
+        config.add_loss_frame(false);
+        return false;
+    }
+
+    const bool drop = (next_random() % 1000u) < permille;
+    config.add_loss_frame(drop);
+    return drop;
+}
+#endif
+
 void WirelessLink::poll()
 {
     portENTER_CRITICAL(&m_rate_lock);
@@ -409,6 +472,19 @@ esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
     }
 
     const size_t frame_len = packet.serialized_size();
+
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    // 注入丢帧。被丢的帧照旧计入 wl_tx_bytes：真实丢包时 esp_now_send 也是返回
+    // 成功、这个计数照样加，两种丢帧因此在统计上不可区分（差别只在 send_cb
+    // 那条 ESP-NOW send failed 日志——注入不产生它，逐帧日志会扰动时序）。
+    if (loss_should_drop(packet.packet_type))
+    {
+        xSemaphoreGive(m_tx_mutex);
+        Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(frame_len));
+        return ESP_OK;
+    }
+#endif
+
     const esp_err_t send_ret = esp_now_send(dest_mac, m_tx_frame, frame_len);
     xSemaphoreGive(m_tx_mutex);
 

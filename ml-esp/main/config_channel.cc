@@ -54,6 +54,17 @@ void ConfigChannel::add_uart_wireless_tx(u16 bytes)
     m_uart_wireless_tx_bytes = m_uart_wireless_tx_bytes + bytes;
 }
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+void ConfigChannel::add_loss_frame(bool dropped)
+{
+    m_loss_frames = m_loss_frames + 1;
+    if (dropped)
+    {
+        m_loss_dropped = m_loss_dropped + 1;
+    }
+}
+#endif
+
 void ConfigChannel::set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
     m_uart_baud = baud;
@@ -195,6 +206,8 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
 //   0x18 Ping           探测已配对对端（存活与往返时延，结果走 GetStats）
 //   0x19 SetWifiRate    参数 = wifi_phy_rate_t 原值，ESP-NOW 发送速率档位
+//   0x1A SetLoss        参数 = 注入丢包率千分比 0-255（0.1% 步进），0 = 关闭；
+//                        仅在 CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE 下存在
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
 //
@@ -231,6 +244,9 @@ enum class Cmd : u8
     ApplyUsbConfig = 0x17,
     Ping = 0x18,
     SetWifiRate = 0x19,
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    SetLoss = 0x1A,
+#endif
 };
 
 enum class Status : u8
@@ -329,6 +345,14 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
         return mlink::wifi_rate_supported(arg)
                    ? post_action_response(cmd, seq, Action::SetWifiRate, arg)
                    : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    case Cmd::SetLoss:
+        // 丢包率上限由无线链路定义；越界不占动作槽。未编译该功能时本命令码
+        // 不存在，落到下面的 default 回 UnknownCommand。
+        return arg <= mlink::MAX_LOSS_PERMILLE
+                   ? post_action_response(cmd, seq, Action::SetLoss, arg)
+                   : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+#endif
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     case Cmd::GetStats:
         return build_stats_response(cmd, seq);
@@ -404,6 +428,10 @@ enum : u8
     TAG_PING_RTT = 0x23,         // u32：最近一次成功往返（微秒）
     TAG_PING_OK = 0x24,          // u32：累计探测成功次数
     TAG_PING_FAIL = 0x25,        // u32：累计探测失败次数
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    TAG_LOSS_FRAMES = 0x26,  // u32：参与丢包注入判定的出向帧数
+    TAG_LOSS_DROPPED = 0x27, // u32：被注入丢弃的帧数
+#endif
     TAG_UART_RX = 0x30,          // u32：Local 模式 CDC → UART 字节数
     TAG_UART_TX = 0x31,          // u32：Local 模式 UART → CDC 字节数
     TAG_UART_WIRELESS_RX = 0x32, // u32：Wireless 模式 CDC → 无线 字节数
@@ -420,6 +448,9 @@ enum : u8
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
     TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    TAG_CFG_LOSS_PERMILLE = 0x53, // u8：注入丢包率千分比 0-255
+#endif
     TAG_USB_SUPPORTED = 0x60,    // u8：编译期支持的能力位（bit0 WebUSB / bit1 WinUSB）
     TAG_USB_WEBUSB = 0x61,       // u8：WebUSB 生效值 0/1
     TAG_USB_WINUSB = 0x62,       // u8：WinUSB 生效值 0/1
@@ -615,6 +646,10 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_PING_RTT, ping.rtt_us);
     p += tlv_u32(m_response + p, TAG_PING_OK, ping.ok);
     p += tlv_u32(m_response + p, TAG_PING_FAIL, ping.fail);
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    p += tlv_u32(m_response + p, TAG_LOSS_FRAMES, m_loss_frames);
+    p += tlv_u32(m_response + p, TAG_LOSS_DROPPED, m_loss_dropped);
+#endif
     p += tlv_u32(m_response + p, TAG_UART_RX, m_uart_rx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_TX, m_uart_tx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_WIRELESS_RX, m_uart_wireless_rx_bytes);
@@ -653,6 +688,9 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     }
 
     p += tlv_u8(m_response + p, TAG_CFG_WIFI_RATE, Application::get_instance().wireless_link().wifi_rate());
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    p += tlv_u8(m_response + p, TAG_CFG_LOSS_PERMILLE, Application::get_instance().wireless_link().loss_permille());
+#endif
 
     return finish_response(cmd, seq, p);
 }
@@ -811,6 +849,15 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
     {
         relay_to_peer(cmd, arg);
     }
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    // 丢包注入只在发送端生效：两端必须各自持有同一个值，只改一端只降单方向的
+    // 链路质量。转发帧本身是 RelayedUsbControl，不在注入白名单里，因此丢包率
+    // 开到上限也永远改得回来。
+    else if (cmd == static_cast<u8>(Cmd::SetLoss) && arg <= mlink::MAX_LOSS_PERMILLE)
+    {
+        relay_to_peer(cmd, arg);
+    }
+#endif
 
     u16 len = dispatch_control(cmd, arg, seq);
     if (len > request->wLength)

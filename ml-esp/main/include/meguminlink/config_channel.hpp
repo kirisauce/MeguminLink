@@ -3,7 +3,7 @@
 #define __MEGUMINLINK_CONFIG_CHANNEL_HPP__
 
 #include "meguminlink/common.hpp"
-#include "meguminlink/wireless_link.hpp" // payload::RelayedUsbControl（转发控制请求）
+#include "meguminlink/wireless_link.hpp"
 #include "sdkconfig.h"
 
 // 存活探测状态用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
@@ -11,7 +11,7 @@
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
 #include "meguminlink/usb/usb_capability.hpp"
-#include <tusb.h> // tusb_control_request_t（EP0 厂商请求处理）
+#include <tusb.h>
 #endif
 
 namespace mlink
@@ -54,6 +54,17 @@ class ConfigChannel
 
     /** Wireless 模式 UART 桥：无线 → CDC */
     void add_uart_wireless_tx(u16 bytes);
+
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    /**
+     * 一次丢包注入判定（wireless_link.cc 的 send 调用）：每个过白名单的 DAP /
+     * 串口数据出向帧都记一次，dropped 另计。
+     *
+     * 两者之比即实际注入比例。注入是概率性的，"没注入"与"注入了但被协议掩盖"
+     * 单看现象分不出来，因此这两个数是该项功能唯一的自证手段。
+     */
+    void add_loss_frame(bool dropped);
+#endif
 
     /**
      * 主机下发的线编码（TinyUSB 的 LINE_CODING_CHANGED 回调）。
@@ -138,6 +149,9 @@ class ConfigChannel
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
         Ping,           // 立即探测已配对对端（存活与往返时延）
         SetWifiRate,    // arg: wifi_phy_rate_t 原值（ESP-NOW 发送速率档位）
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+        SetLoss,        // arg: 千分比（DAP/UART 出向帧的注入丢包率，见 wireless_link.hpp）
+#endif
     };
 
     /**
@@ -252,6 +266,10 @@ class ConfigChannel
     volatile u32 m_uart_tx_bytes = 0;
     volatile u32 m_uart_wireless_rx_bytes = 0;
     volatile u32 m_uart_wireless_tx_bytes = 0;
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    volatile u32 m_loss_frames = 0;  /**< 参与注入判定的出向帧数（比例的分母） */
+    volatile u32 m_loss_dropped = 0; /**< 被判丢的帧数（分子） */
+#endif
 
     // 主机下发的线编码（CDC SET_LINE_CODING）。无回调时是桥接默认值 8N1，
     // 与 uart_bridge_init 的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
