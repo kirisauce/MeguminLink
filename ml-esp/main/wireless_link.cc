@@ -470,6 +470,10 @@ bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     std::memcpy(buf, req.data, req.len);
     *len = req.len;
     std::memcpy(link->m_dap_src_mac, req.src_mac, ESP_NOW_ETH_ALEN);
+
+    // 无线接收端只有这一条 DAP 通道：DAP_Info 按无线单帧上限上报，
+    // 主机据此决定一条命令能携带多少数据
+    DAP_Data.packet_size = static_cast<u16>(MAX_DAP_PAYLOAD_SIZE);
     return true;
 }
 

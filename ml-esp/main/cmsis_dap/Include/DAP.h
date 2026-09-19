@@ -261,6 +261,7 @@ typedef struct {
 #endif
   } jtag_dev;
 #endif
+  uint16_t    packet_size;                      // Packet Size reported by DAP_Info (varies per transport)
 } DAP_Data_t;
 
 extern          DAP_Data_t DAP_Data;            // DAP Data

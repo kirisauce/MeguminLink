@@ -430,6 +430,11 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     ctx.source = source;
     ctx.request_len = req_len;
 
+    // DAP_Info 上报的单包尺寸按传输通道设定：vendor bulk 用无线单帧上限，
+    // HID 是定长 64B 报告。主机据此决定一条命令能携带多少数据。
+    DAP_Data.packet_size = (source == DapSource::VendorBulk) ? static_cast<u16>(MAX_DAP_PAYLOAD_SIZE)
+                                                            : HID_REPORT_SIZE;
+
     if (!dap_source_ready(source))
     {
         return false; // 通道不可用（主机未枚举完成）：丢弃
@@ -456,20 +461,14 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
 }
 
 // 执行器响应宿（USB 输出，dap_executor_run 的 resp_sink）。
-// 保持既有语义：超过 DAP_PACKET_SIZE 的响应（仅 0x7F 批量命令可触发）
-// 截断发送，与上游 [DAP_PACKET_COUNT][DAP_PACKET_SIZE] 缓冲同语义。
+// 响应按来源通道原样下发，不在本层截断：HID 通道由 dap_send_hid_response
+// 按定长报告裁剪，vendor bulk 无长度上限（分多次写入 FIFO）。
 void usb_resp_sink(const u8 *data, u16 len, void *arg)
 {
     auto &ctx = *static_cast<DapTaskContext *>(arg);
 
-    u16 out_len = len;
-    if (out_len > DAP_PACKET_SIZE)
-    {
-        ESP_LOGW(TAG, "DAP response truncated (%u -> %u)", out_len, static_cast<unsigned>(DAP_PACKET_SIZE));
-        out_len = DAP_PACKET_SIZE;
-    }
-    dap_send_response(ctx.source, data, out_len);
-    Application::get_instance().config_channel().add_dap_command(ctx.request_len, out_len);
+    dap_send_response(ctx.source, data, len);
+    Application::get_instance().config_channel().add_dap_command(ctx.request_len, len);
 }
 
 void dap_task(void *arg)

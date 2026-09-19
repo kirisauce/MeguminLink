@@ -166,8 +166,8 @@ static uint8_t DAP_Info(uint8_t id, uint8_t *info) {
 #endif
       break;
     case DAP_ID_PACKET_SIZE:
-      info[0] = (uint8_t)(DAP_PACKET_SIZE >> 0);
-      info[1] = (uint8_t)(DAP_PACKET_SIZE >> 8);
+      info[0] = (uint8_t)(DAP_Data.packet_size >> 0);
+      info[1] = (uint8_t)(DAP_Data.packet_size >> 8);
       length = 2U;
       break;
     case DAP_ID_PACKET_COUNT:
@@ -1797,6 +1797,7 @@ void DAP_Setup(void) {
 
   // Default settings
   DAP_Data.debug_port  = 0U;
+  DAP_Data.packet_size = DAP_PACKET_SIZE;
   DAP_Data.transfer.idle_cycles = 0U;
   DAP_Data.transfer.retry_count = 100U;
   DAP_Data.transfer.match_retry = 0U;
