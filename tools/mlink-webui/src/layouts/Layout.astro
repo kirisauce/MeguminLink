@@ -12,6 +12,14 @@ import '../styles/tokens.css';
 	</head>
 	<body>
 		<slot />
+		<footer class="site-footer">
+			<a
+				href="https://github.com/kirisauce/MeguminLink"
+				target="_blank"
+				rel="noreferrer"
+				title="kirisauce/MeguminLink">GitHub 源码 <span aria-hidden="true">↗</span></a
+			>
+		</footer>
 	</body>
 </html>
 
@@ -20,5 +28,30 @@ import '../styles/tokens.css';
 	body {
 		margin: 0;
 		min-height: 100%;
+	}
+
+	/* 页脚与 Dashboard 的 main 同宽（64rem 居中），链接用 state layer 做反馈 */
+	.site-footer {
+		display: flex;
+		justify-content: center;
+		max-width: 64rem;
+		margin: 0 auto;
+		padding: 0 var(--md-sys-space-xl) var(--md-sys-space-xl);
+	}
+
+	.site-footer a {
+		padding: 0.25rem 0.7rem;
+		border-radius: var(--md-sys-shape-corner-full);
+		color: var(--md-sys-color-on-surface-variant);
+		font-size: var(--md-sys-typescale-body-md);
+		text-decoration: none;
+		transition:
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
+	}
+
+	.site-footer a:hover {
+		color: var(--md-sys-color-primary);
+		background: var(--md-sys-color-surface-container);
 	}
 </style>
