@@ -7,16 +7,20 @@
  * Δt 为 0 或超过 MAX_GAP_MS 时（设备重启、长时间挂起）本次速率判为无效。
  */
 
-import { STAT_FIELDS, type Stats, type UartStateKey } from './protocol';
+import { STAT_FIELDS, type PeerStateKey, type Stats, type UartStateKey } from './protocol';
 
 /** 一次采样跨越这么久就认为数据不再连续（设备重启或页面长时间挂起）。 */
 export const MAX_GAP_MS = 2000;
 
 /**
  * 参与速率计算的字段：STAT_FIELDS 里除状态位与 uptime 之外的全部计数器。
- * 串口状态（UartStateKey）不在 STAT_FIELDS 里，这里再从类型上排除一次。
+ * 串口状态（UartStateKey）与对端探测结果（PeerStateKey）不在 STAT_FIELDS 里，
+ * 这里再从类型上排除一次。
  */
-export type CounterKey = Exclude<keyof Stats, 'mode' | 'pair' | 'rssi' | 'uptimeMs' | UartStateKey>;
+export type CounterKey = Exclude<
+	keyof Stats,
+	'mode' | 'pair' | 'rssi' | 'uptimeMs' | UartStateKey | PeerStateKey
+>;
 
 export const COUNTER_KEYS = STAT_FIELDS.filter(
 	(field) => field.key !== 'mode' && field.key !== 'pair' && field.key !== 'rssi' && field.key !== 'uptimeMs'
@@ -98,6 +102,12 @@ export function formatLineCoding(stats: Stats | null): string {
 export function formatUartOpen(stats: Stats | null): string {
 	if (stats === null || stats.uartHostOpen === null) return '—';
 	return stats.uartHostOpen !== 0 ? '已打开' : '未打开';
+}
+
+/** 对端往返时延：设备上报微秒，这里换算成毫秒（两位小数）。 */
+export function formatRtt(us: number | null | undefined): string {
+	if (us === null || us === undefined || !Number.isFinite(us) || us <= 0) return '—';
+	return `${(us / 1000).toFixed(2)} ms`;
 }
 
 export function formatUptime(ms: number): string {

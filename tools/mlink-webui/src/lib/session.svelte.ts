@@ -15,6 +15,8 @@ import {
 	CMD_REBOOT,
 	CMD_RESET,
 	CMD_SET_MODE,
+	MODE_WIRELESS,
+	PAIR_PAIRED,
 	PID,
 	ProtocolError,
 	STATUS_NAMES,
@@ -23,6 +25,7 @@ import {
 	USB_REJECT_TEXT,
 	VID,
 	applyUsbConfig,
+	pingPeer,
 	readConfig,
 	readStats,
 	readUsbConfig,
@@ -41,6 +44,16 @@ const POLL_INTERVAL_MS = 200;
 const POLL_INTERVAL_HIDDEN_MS = 1000;
 /** 重新枚举后等待设备接回的时长：超时则提示用户手动重新连接。 */
 const RECONNECT_TIMEOUT_MS = 5000;
+/**
+ * 对端探测的界面兜底超时：设备端超时窗口（Kconfig，默认 500ms）加上一次轮询
+ * 往返还看不到计数变化，就收起「探测中」状态。
+ */
+const PING_TIMEOUT_MS = 1500;
+/**
+ * 上位机定时探测的间隔：设备不自主发帧，对端在线/往返时延由浏览器按这个节拍
+ * 驱动刷新（点击状态条是同一路径的立即触发）。
+ */
+const PING_INTERVAL_MS = 3000;
 
 /** 曲线滚动窗口长度。 */
 export const WINDOW_MS = 60_000;
@@ -104,9 +117,21 @@ export class MlinkSession {
 	commandPending = $state(false);
 	/** 最近一次控制命令的失败说明；下一条命令开始时清空。 */
 	commandError = $state<string | null>(null);
+	/** 探测在途（等设备结算）：并发保护用，周期探测与手动探测都会置位。 */
+	#pingInFlight = $state(false);
+	/**
+	 * 手动触发的探测在途：只有它让状态条显示「探测中…」。3 秒一次的周期探测
+	 * 静默刷新，文案保持在最近一次结论上，避免每 3 秒闪一下。
+	 */
+	manualPingInFlight = $state(false);
 
 	#timer: ReturnType<typeof setTimeout> | null = null;
 	#reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 探测在途时的 ok/fail 计数基线：任一个变化即说明本次探测已结算。 */
+	#pingBaseline: { ok: number; fail: number } | null = null;
+	#pingTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 上一次定时探测的主机时刻（performance.now 毫秒）。 */
+	#pingProbeAt = 0;
 	#seq = 0;
 	#listenersBound = false;
 	#destroyed = false;
@@ -204,6 +229,7 @@ export class MlinkSession {
 		}
 		this.device = device;
 		this.#seq = 0;
+		this.#pingProbeAt = 0; // 接上设备即尽快探一次，不必等满一个间隔
 		this.#expectingReconnect = false;
 		if (this.#reconnectTimer !== null) {
 			clearTimeout(this.#reconnectTimer);
@@ -319,6 +345,69 @@ export class MlinkSession {
 	}
 
 	/**
+	 * 立即探测已配对对端（点状态条的「对端」项）。
+	 *
+	 * 与周期探测共用同一条下发路径，区别只在界面：只有手动探测会显示「探测中…」。
+	 * 若此刻已有一轮探测在途（周期探测刚发出），不再叠加请求，直接等它结算——
+	 * 「现在就要个结果」在同一轮里同样得到满足。
+	 */
+	async ping(): Promise<void> {
+		if (this.device === null || this.commandPending) return;
+		this.commandError = null;
+		this.#pingProbeAt = performance.now(); // 点击也算一次周期节拍，避免紧接着又发一轮
+		this.manualPingInFlight = true;
+		if (this.#pingInFlight) return;
+		this.commandPending = true;
+		try {
+			await this.#probePing(true);
+		} finally {
+			this.commandPending = false;
+		}
+	}
+
+	/**
+	 * 下发一次探测命令并等轮询结算。
+	 *
+	 * 设备端异步执行：命令只投递，主循环发出 ESP-NOW Ping 并等 Pong，结果落在
+	 * GetStats 快照里。这里记下 ok/fail 计数基线，等轮询发现计数变化即认为本次
+	 * 探测结算完毕（成功后 peerOnline 变 1 且带新的 RTT，超时后变 2）。
+	 *
+	 * @param report 失败时是否写 commandError：定时探测静默跳过，不每 3 秒刷一条报错
+	 */
+	async #probePing(report: boolean): Promise<void> {
+		const device = this.device;
+		if (device === null) return;
+		this.#pingBaseline =
+			this.stats === null ? null : { ok: this.stats.pingOk ?? 0, fail: this.stats.pingFail ?? 0 };
+		this.#pingInFlight = true;
+		this.#schedulePingTimeout();
+		try {
+			await pingPeer(device, this.#seq);
+			this.#seq = (this.#seq + 1) & 0xff;
+		} catch (error) {
+			if (report) this.commandError = describeCommandError(error);
+			this.#finishPing();
+		}
+	}
+
+	/**
+	 * 上位机定时探测：设备端不自主发帧，对端在线状态由这里按固定间隔驱动刷新。
+	 *
+	 * 只在监控中、无线且已配对、设备上报了探测能力（peerOnline 非 null，老固件不支持）
+	 * 时触发；命令在途或上一次探测未结算则跳过本轮，等下一个间隔。
+	 */
+	#schedulePingProbe(): void {
+		const stats = this.stats;
+		if (stats === null || stats.mode !== MODE_WIRELESS || stats.pair !== PAIR_PAIRED) return;
+		if (stats.peerOnline === null) return;
+		if (this.commandPending || this.#pingInFlight) return;
+		const now = performance.now();
+		if (now - this.#pingProbeAt < PING_INTERVAL_MS) return;
+		this.#pingProbeAt = now;
+		void this.#probePing(false);
+	}
+
+	/**
 	 * 下发一条控制命令。
 	 *
 	 * ok 只代表设备已接受投递：动作由设备主循环执行，结果通过轮询的模式与
@@ -362,6 +451,14 @@ export class MlinkSession {
 			if (previous !== null && (previous.pair !== stats.pair || previous.mode !== stats.mode)) {
 				void this.refreshConfig();
 			}
+			// 探测在途：ok/fail 任一计数变化即说明本次探测已由设备结算
+			if (this.#pingInFlight && this.#pingBaseline !== null) {
+				const ok = stats.pingOk ?? 0;
+				const fail = stats.pingFail ?? 0;
+				if (ok !== this.#pingBaseline.ok || fail !== this.#pingBaseline.fail) this.#finishPing();
+			}
+			// 定时探测由上位机发起，节拍与轮询同源（见 #schedulePingProbe）
+			this.#schedulePingProbe();
 			this.error = null;
 			if (this.state !== 'streaming') this.state = 'streaming';
 			this.#appendSample();
@@ -374,6 +471,30 @@ export class MlinkSession {
 			return;
 		}
 		this.#schedule();
+	}
+
+	/** 本次探测已结算（或界面兜底超时）：收起在途状态 */
+	#finishPing(): void {
+		this.#pingInFlight = false;
+		this.manualPingInFlight = false;
+		this.#pingBaseline = null;
+		if (this.#pingTimer !== null) {
+			clearTimeout(this.#pingTimer);
+			this.#pingTimer = null;
+		}
+	}
+
+	/**
+	 * 探测的界面兜底超时：设备端超时窗口（Kconfig，默认 500ms）加一次轮询往返
+	 * 还没看到计数变化就收起状态。老固件不支持该命令时命令本身已失败，这里只
+	 * 负责不让界面永远停在「探测中」。
+	 */
+	#schedulePingTimeout(): void {
+		if (this.#pingTimer !== null) clearTimeout(this.#pingTimer);
+		this.#pingTimer = setTimeout(() => {
+			this.#pingTimer = null;
+			this.#finishPing();
+		}, PING_TIMEOUT_MS);
 	}
 
 	/** 追加一个采样点并丢弃滚出窗口的旧点。 */
@@ -394,6 +515,7 @@ export class MlinkSession {
 			clearTimeout(this.#reconnectTimer);
 			this.#reconnectTimer = null;
 		}
+		this.#finishPing();
 	}
 
 	/**

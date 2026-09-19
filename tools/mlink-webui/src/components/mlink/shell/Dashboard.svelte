@@ -96,7 +96,12 @@
 			<p class="hint">点右上角「连接设备」，在选择器里选 MeguminLink（303a:4020）即可开始监控。</p>
 		{/if}
 
-		<StatusStrip {stats} />
+		<StatusStrip
+			{stats}
+			pinging={session.manualPingInFlight}
+			pingEnabled={session.device !== null && !session.commandPending}
+			onping={() => void session.ping()}
+		/>
 
 		<div class="cards">
 			<StatCard title="USB-DAP" subtitle="CMSIS-DAP 调试链路" rows={dapRows} />

@@ -31,6 +31,7 @@ export const CMD_REBOOT = 0x14;
 export const CMD_EXIT_PAIRING = 0x15;
 export const CMD_SET_USB_CONFIG = 0x16;
 export const CMD_APPLY_USB_CONFIG = 0x17;
+export const CMD_PING = 0x18;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -51,6 +52,8 @@ export const PAIR_NAMES: Readonly<Record<number, string>> = { 0: 'idle', 1: 'pai
 /** SetMode 的参数取值，与固件 Mode 枚举一致。 */
 export const MODE_LOCAL = 0;
 export const MODE_WIRELESS = 1;
+/** Stats.pair 的取值：仅已配对时才有可探测的对端。 */
+export const PAIR_PAIRED = 1;
 
 /** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50/0x51 配置项。 */
 const TAG_FW_VERSION = 0x41;
@@ -65,6 +68,21 @@ const TAG_UART_BAUD = 0x35;
 const TAG_UART_DATA_BITS = 0x36;
 const TAG_UART_STOP_BITS = 0x37;
 const TAG_UART_PARITY = 0x38;
+
+/** 对端存活探测的 tag（0x20-0x2F 无线段，紧跟空口字节计数器续编）。 */
+const TAG_PEER_ONLINE = 0x22;
+const TAG_PING_RTT = 0x23;
+const TAG_PING_OK = 0x24;
+const TAG_PING_FAIL = 0x25;
+
+/**
+ * 对端存活状态（Stats.peerOnline）。
+ * UNKNOWN 是「从未探测」——设备刚上电或刚配对时如此，界面显示「—」而不是
+ * 把未探测当成离线。
+ */
+export const PEER_UNKNOWN = 0;
+export const PEER_ONLINE = 1;
+export const PEER_OFFLINE = 2;
 
 /** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
 const TAG_USB_SUPPORTED = 0x60;
@@ -94,6 +112,12 @@ export const USB_REJECT_TEXT: Readonly<Record<number, string>> = {
  *
  * uart* 五项是 CDC ACM 串口状态（不在 STAT_FIELDS 里，因而也不参与速率差分）：
  * 老固件不上报这些 tag，此时为 null，界面显示「—」而不是把它们当成 0。
+ *
+ * peerOnline / pingRttUs / pingOk / pingFail 是对端存活探测的结果：online 是
+ * 最近一次的结论（未探测为 null 或 PEER_UNKNOWN），rttUs 是最近一次成功的往返
+ * （微秒，从未成功时为 0），ok/fail 是累计计数——界面点一次「探测」后，两个
+ * 计数谁增加就说明这一次是成功还是超时。同样不进速率差分：它们描述探测结果，
+ * 不是链路吞吐。
  */
 export type Stats = {
 	mode: number;
@@ -114,6 +138,10 @@ export type Stats = {
 	uartDataBits: number | null;
 	uartStopBits: number | null;
 	uartParity: number | null;
+	peerOnline: number | null;
+	pingRttUs: number | null;
+	pingOk: number | null;
+	pingFail: number | null;
 };
 
 export type StatField = {
@@ -215,6 +243,9 @@ function parseTlv(frame: DataView, start: number, end: number): Map<number, Data
  */
 export type UartStateKey = 'uartHostOpen' | 'uartBaud' | 'uartDataBits' | 'uartStopBits' | 'uartParity';
 
+/** 对端存活探测字段：与串口状态同待遇，既不进 STAT_FIELDS 也不参与速率差分。 */
+export type PeerStateKey = 'peerOnline' | 'pingRttUs' | 'pingOk' | 'pingFail';
+
 /** 缺失的 tag 一律为 null：区分"设备上报 0"与"设备根本没上报这个字段"。 */
 function readOptional(view: DataView | undefined): number | null {
 	if (view === undefined || view.byteLength === 0) return null;
@@ -278,6 +309,10 @@ export function decodeStats(frame: DataView): Stats {
 	stats.uartDataBits = readOptional(tags.get(TAG_UART_DATA_BITS));
 	stats.uartStopBits = readOptional(tags.get(TAG_UART_STOP_BITS));
 	stats.uartParity = readOptional(tags.get(TAG_UART_PARITY));
+	stats.peerOnline = readOptional(tags.get(TAG_PEER_ONLINE));
+	stats.pingRttUs = readOptional(tags.get(TAG_PING_RTT));
+	stats.pingOk = readOptional(tags.get(TAG_PING_OK));
+	stats.pingFail = readOptional(tags.get(TAG_PING_FAIL));
 	return stats;
 }
 
@@ -352,6 +387,17 @@ export async function runCommand(device: USBDevice, cmd: number, seq: number, ar
 
 export async function readUsbConfig(device: USBDevice, seq: number): Promise<UsbConfig> {
 	return decodeUsbConfig(await transferIn(device, CMD_GET_USB_CONFIG, seq));
+}
+
+/**
+ * 触发一次对端存活探测（cmd 0x18）。
+ *
+ * 与其它动作命令同语义：只表示设备已接受投递，探测由设备主循环发出
+ * ESP-NOW Ping 并等待 Pong（超时由设备的 Kconfig 决定），结果不在本次响应里
+ * 返回——随后的 readStats 读 peerOnline 与 pingOk/pingFail 计数差分即可。
+ */
+export async function pingPeer(device: USBDevice, seq: number): Promise<void> {
+	parseFrame(await transferIn(device, CMD_PING, seq));
 }
 
 function encodeTlv(tag: number, value: Uint8Array): Uint8Array<ArrayBuffer> {
