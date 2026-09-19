@@ -78,8 +78,8 @@
 		visibility: hidden;
 		pointer-events: none;
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			visibility 0s linear var(--md-sys-motion-duration-medium);
+			opacity var(--md-sys-motion-duration-exit) var(--md-sys-motion-easing-exit),
+			visibility 0s linear var(--md-sys-motion-duration-exit);
 	}
 
 	.scrim.open {
@@ -87,7 +87,7 @@
 		visibility: visible;
 		pointer-events: auto;
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
 			visibility 0s;
 	}
 
@@ -108,15 +108,15 @@
 		transform: translateX(100%);
 		visibility: hidden;
 		transition:
-			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			visibility 0s linear var(--md-sys-motion-duration-medium);
+			transform var(--md-sys-motion-duration-exit) var(--md-sys-motion-easing-exit),
+			visibility 0s linear var(--md-sys-motion-duration-exit);
 	}
 
 	.drawer.open {
 		transform: none;
 		visibility: visible;
 		transition:
-			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
 			visibility 0s;
 	}
 

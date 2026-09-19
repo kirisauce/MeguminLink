@@ -52,8 +52,12 @@
 
 	/* 覆盖层遮罩与标准动效（抽屉滑入/遮罩淡入） */
 	--md-sys-color-scrim: rgb(0 0 0 / 0.32);
-	--md-sys-motion-duration-medium: 250ms;
-	--md-sys-motion-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+	--md-sys-motion-duration-medium: 400ms;
+	/* 出场比进场短：注意力已经转移，拖长只会显得黏 */
+	--md-sys-motion-duration-exit: 200ms;
+	/* 进场：强调减速，末段留长拖尾；出场：带初速起步、终点平滑收住（不硬停） */
+	--md-sys-motion-easing-enter: cubic-bezier(0.05, 0.7, 0.1, 1);
+	--md-sys-motion-easing-exit: cubic-bezier(0.3, 0.2, 0.7, 1);
 
 	/* 曲线序列色。uPlot 的 stroke 吃不了 CSS 变量，由组件读实际色值。 */
 	--mlink-chart-1: #9c1f2e;

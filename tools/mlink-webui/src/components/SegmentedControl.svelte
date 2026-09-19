@@ -79,8 +79,8 @@
 
 	.animate .indicator {
 		transition:
-			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard);
+			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
+			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter);
 	}
 
 	.no-selection .indicator {
@@ -99,7 +99,7 @@
 		font: inherit;
 		font-size: var(--md-sys-typescale-body-md);
 		cursor: pointer;
-		transition: color var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard);
+		transition: color var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter);
 	}
 
 	.segment[aria-pressed='true'] {

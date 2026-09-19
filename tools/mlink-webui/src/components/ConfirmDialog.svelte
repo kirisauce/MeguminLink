@@ -112,8 +112,8 @@
 		visibility: hidden;
 		pointer-events: none;
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			visibility 0s linear var(--md-sys-motion-duration-medium);
+			opacity var(--md-sys-motion-duration-exit) var(--md-sys-motion-easing-exit),
+			visibility 0s linear var(--md-sys-motion-duration-exit);
 	}
 
 	.dialog-scrim.open {
@@ -121,7 +121,7 @@
 		visibility: visible;
 		pointer-events: auto;
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
 			visibility 0s;
 	}
 
@@ -137,20 +137,21 @@
 		box-shadow: var(--md-sys-elevation-1);
 		opacity: 0;
 		visibility: hidden;
-		transform: translate(-50%, -50%) scale(0.9);
+		/* 原地 3D 扭转：与打开态保持同一组函数序列，保证 transform 可插值 */
+		transform: translate(-50%, -50%) perspective(1200px) rotateX(6deg) rotateY(-4.5deg) scale(0.9);
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			visibility 0s linear var(--md-sys-motion-duration-medium);
+			opacity var(--md-sys-motion-duration-exit) var(--md-sys-motion-easing-exit),
+			transform var(--md-sys-motion-duration-exit) var(--md-sys-motion-easing-exit),
+			visibility 0s linear var(--md-sys-motion-duration-exit);
 	}
 
 	.dialog.open {
 		opacity: 1;
 		visibility: visible;
-		transform: translate(-50%, -50%) scale(1);
+		transform: translate(-50%, -50%) perspective(1200px) rotateX(0deg) rotateY(0deg) scale(1);
 		transition:
-			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
-			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+			opacity var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
+			transform var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter),
 			visibility 0s;
 	}
 
