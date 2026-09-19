@@ -8,7 +8,7 @@
 	import { onMount } from 'svelte';
 	import uPlot from 'uplot';
 	import 'uplot/dist/uPlot.min.css';
-	import { formatCompact, formatRate } from '../lib/rate';
+	import { formatCompact, formatRate } from '../../../lib/rate';
 
 	let {
 		title,

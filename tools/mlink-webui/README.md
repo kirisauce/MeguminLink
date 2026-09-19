@@ -72,12 +72,15 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="4020", TAG+="uaccess
 ## 代码结构
 
 ```
-src/lib/protocol.ts        EP0 请求构造与 8B 帧头 + TLV 解析（与固件 main/config_channel.cc 契约一致）
-src/lib/session.svelte.ts  WebUSB 会话：授权、轮询、拔插、可见性降频、60 秒采样窗口
-src/lib/rate.ts            速率差分、u32 回绕、数值与时长格式化
-src/styles/tokens.css      M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
-src/components/            DeviceBar / StatusStrip / StatCard / StatTable / RateChart / Dashboard / ConfigDrawer + ConfigActions
-src/pages/index.astro      唯一页面，挂载 Dashboard island
+src/lib/protocol.ts           EP0 请求构造与 8B 帧头 + TLV 解析（与固件 main/config_channel.cc 契约一致）
+src/lib/session.svelte.ts     WebUSB 会话：授权、轮询、拔插、可见性降频、60 秒采样窗口
+src/lib/rate.ts               速率差分、u32 回绕、数值与时长格式化
+src/styles/tokens.css         M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
+src/components/ui/            通用组件（SegmentedControl / ConfirmDialog），不含设备协议知识，可整块复用
+src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar）
+src/components/mlink/panel/   主面板区，Dashboard 直接渲染（StatusStrip / StatCard / StatTable / RateChart）
+src/components/mlink/drawer/  配置抽屉区（ConfigDrawer / ConfigActions / UsbSettings）
+src/pages/index.astro         唯一页面，挂载 Dashboard island
 ```
 
 ## 依赖

@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { USB_CAPABILITY_WEBUSB, USB_CAPABILITY_WINUSB, landingPageError } from '../lib/protocol';
-	import type { MlinkSession } from '../lib/session.svelte';
-	import SegmentedControl from './SegmentedControl.svelte';
+	import { USB_CAPABILITY_WEBUSB, USB_CAPABILITY_WINUSB, landingPageError } from '../../../lib/protocol';
+	import type { MlinkSession } from '../../../lib/session.svelte';
+	import SegmentedControl from '../../ui/SegmentedControl.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 

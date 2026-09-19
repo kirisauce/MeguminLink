@@ -1,14 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type uPlot from 'uplot';
-	import { MlinkSession } from '../lib/session.svelte';
-	import { formatBytes, formatCount, formatRate, type CounterKey } from '../lib/rate';
+	import { MlinkSession } from '../../../lib/session.svelte';
+	import { formatBytes, formatCount, formatRate, type CounterKey } from '../../../lib/rate';
 	import DeviceBar from './DeviceBar.svelte';
-	import ConfigDrawer from './ConfigDrawer.svelte';
-	import StatusStrip from './StatusStrip.svelte';
-	import StatCard from './StatCard.svelte';
-	import StatTable from './StatTable.svelte';
-	import RateChart from './RateChart.svelte';
+	import ConfigDrawer from '../drawer/ConfigDrawer.svelte';
+	import StatusStrip from '../panel/StatusStrip.svelte';
+	import StatCard from '../panel/StatCard.svelte';
+	import StatTable from '../panel/StatTable.svelte';
+	import RateChart from '../panel/RateChart.svelte';
 
 	const session = new MlinkSession();
 

@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { MODE_NAMES, PAIR_NAMES, type Stats } from '../lib/protocol';
-	import { formatUptime } from '../lib/rate';
+	import { MODE_NAMES, PAIR_NAMES, type Stats } from '../../../lib/protocol';
+	import { formatUptime } from '../../../lib/rate';
 
 	let { stats }: { stats: Stats | null } = $props();
 

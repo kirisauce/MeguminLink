@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { MODE_LOCAL, MODE_NAMES, MODE_WIRELESS } from '../lib/protocol';
-	import type { MlinkSession } from '../lib/session.svelte';
-	import ConfirmDialog from './ConfirmDialog.svelte';
-	import SegmentedControl from './SegmentedControl.svelte';
+	import { MODE_LOCAL, MODE_NAMES, MODE_WIRELESS } from '../../../lib/protocol';
+	import type { MlinkSession } from '../../../lib/session.svelte';
+	import ConfirmDialog from '../../ui/ConfirmDialog.svelte';
+	import SegmentedControl from '../../ui/SegmentedControl.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 

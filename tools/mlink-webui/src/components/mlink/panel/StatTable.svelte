@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { MODE_NAMES, PAIR_NAMES, STAT_FIELDS, type Stats } from '../lib/protocol';
+	import { MODE_NAMES, PAIR_NAMES, STAT_FIELDS, type Stats } from '../../../lib/protocol';
 
 	let { stats }: { stats: Stats | null } = $props();
 

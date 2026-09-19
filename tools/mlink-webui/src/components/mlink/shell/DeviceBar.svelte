@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { STATE_TEXT, type MlinkSession } from '../lib/session.svelte';
+	import { STATE_TEXT, type MlinkSession } from '../../../lib/session.svelte';
 
 	let { session, onconfig }: { session: MlinkSession; onconfig: () => void } = $props();
 
