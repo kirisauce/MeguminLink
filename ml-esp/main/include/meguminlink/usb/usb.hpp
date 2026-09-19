@@ -9,6 +9,7 @@
 #include <array>
 
 #include "meguminlink/common.hpp"
+#include "meguminlink/usb/usb_capability.hpp"
 #include "sdkconfig.h"
 
 namespace mlink
@@ -58,6 +59,27 @@ class CmsisDapUsb
      */
     void set_enabled(bool enabled);
 
+    /** 当前生效的 USB 能力配置（BOS 描述符据此构造） */
+    const UsbCapabilitySettings &usb_capability() const
+    {
+        return m_usb_capability;
+    }
+
+    /** 描述符访问器：TinyUSB 的 BOS / GET_URL / GET_DESCRIPTOR_SET 回调用它取数据 */
+    const UsbCapabilityDescriptors &usb_descriptors() const
+    {
+        return m_usb_descriptors;
+    }
+
+    /**
+     * 应用新的 USB 能力配置：断开总线 → 重建描述符（BOS、GET_URL、iLandingPage
+     * 字符串指向的内容）→ 重新连接，主机重新读取描述符后新配置才可见。
+     *
+     * 重建放在断开窗口内：此时主机已停止请求描述符，描述符缓冲与字符串内容
+     * 不会被 TinyUSB 任务并发读取。NVS 落盘由调用方负责（见 app.cc）。
+     */
+    void apply_usb_capability(const UsbCapabilitySettings &settings);
+
     TaskHandle_t m_dap_task = nullptr;
     /**
      * DAP 命令队列（NOSPLIT ringbuffer，元素为 usb.cc 的 DapCommand）：
@@ -92,6 +114,14 @@ class CmsisDapUsb
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
     std::array<const char *, (usize)UsbStringIndex::Max> m_string_descriptors;
+
+    /**
+     * USB 能力状态与描述符缓冲（构造时从 NVS 载入）。
+     * m_usb_capability.landing_page 同时是 iLandingPage 字符串描述符的内容来源，
+     * m_usb_descriptors 持有 BOS 与 GET_URL 响应的常驻缓冲。
+     */
+    UsbCapabilitySettings m_usb_capability;
+    UsbCapabilityDescriptors m_usb_descriptors;
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     QueueHandle_t m_uart_queue;

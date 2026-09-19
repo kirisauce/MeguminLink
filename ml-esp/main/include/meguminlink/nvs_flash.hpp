@@ -15,8 +15,8 @@ esp_err_t nvs_flash_init();
 
 /**
  * NVS 键基类：持有 key 名并收敛 nvs_open/nvs_get/nvs_set/nvs_commit/nvs_close 样板。
- * 不直接实例化；使用类型化子类（NvsKeyU8、NvsKeyBlob），子类把值缓存在内存：
- * 读不重复访问 flash，写相同值自动跳过落盘（省 flash 磨损）。
+ * 不直接实例化；使用类型化子类（NvsKeyU8、NvsKeyBlob、NvsKeyString），子类把值缓存
+ * 在内存：读不重复访问 flash，写相同值自动跳过落盘（省 flash 磨损）。
  */
 class NvsKey
 {
@@ -30,12 +30,31 @@ class NvsKey
     esp_err_t raw_store_u8(u8 value) const;
     bool raw_load_blob(void *value, size_t len) const;
     esp_err_t raw_store_blob(const void *value, size_t len) const;
+    /** 读取变长字符串到 out（容量 cap，含结尾 NUL）；无记录/失败返回 false */
+    bool raw_load_string(char *out, size_t cap) const;
+    /** 写入字符串（含结尾 NUL） */
+    esp_err_t raw_store_string(const char *value) const;
     /** 删除键；键本来就不存在视为成功（删除已达目的） */
     esp_err_t raw_erase() const;
 
   private:
     const char *m_key;
 };
+
+namespace detail
+{
+/** 按目标容量截断拷贝并补结尾 NUL（cap 为 0 时不做任何事） */
+inline void copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (cap == 0)
+    {
+        return;
+    }
+    const size_t len = strnlen(src, cap - 1);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+} // namespace detail
 
 /** u8 型 NVS 键：构造时给默认值；首次访问自动从 flash 加载，无记录用默认值 */
 class NvsKeyU8 : public NvsKey
@@ -111,6 +130,65 @@ template <size_t N> class NvsKeyBlob : public NvsKey
 
   private:
     mutable u8 m_data[N] = {};
+    mutable bool m_loaded = false;
+};
+
+/**
+ * 字符串型 NVS 键：定长缓存（模板 N = 不含结尾 NUL 的最大字符数），
+ * 语义同 NvsKeyU8——首次访问自动从 flash 加载，无记录用构造时的默认值。
+ */
+template <size_t N> class NvsKeyString : public NvsKey
+{
+  public:
+    NvsKeyString(const char *key, const char *default_value) : NvsKey(key), m_default_value(default_value)
+    {
+    }
+
+    /** 拷贝当前值到 out（容量须 ≥ N + 1）；首次调用自动加载 */
+    void get(char *out, size_t cap) const
+    {
+        if (!m_loaded)
+        {
+            if (!raw_load_string(m_data, sizeof(m_data)))
+            {
+                detail::copy_cstr(m_data, sizeof(m_data), m_default_value); // 无记录/失败 → 默认值
+            }
+            m_loaded = true;
+        }
+        detail::copy_cstr(out, cap, m_data);
+    }
+
+    /** 更新缓存并写回 NVS；与缓存相同则跳过落盘；超长返回 ESP_ERR_INVALID_ARG */
+    esp_err_t set(const char *value)
+    {
+        if (value == nullptr || strlen(value) > N)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (m_loaded && strcmp(value, m_data) == 0)
+        {
+            return ESP_OK; // 值未变化：跳过落盘
+        }
+        detail::copy_cstr(m_data, sizeof(m_data), value);
+        m_loaded = true;
+        return raw_store_string(value);
+    }
+
+    /** 删除记录并让缓存回到构造时的默认值（返回 ESP_OK 表示下次 get() 即默认值） */
+    esp_err_t erase()
+    {
+        const esp_err_t ret = raw_erase();
+        if (ret == ESP_OK)
+        {
+            detail::copy_cstr(m_data, sizeof(m_data), m_default_value);
+            m_loaded = true;
+        }
+        return ret;
+    }
+
+  private:
+    const char *m_default_value;
+    mutable char m_data[N + 1] = {};
     mutable bool m_loaded = false;
 };
 

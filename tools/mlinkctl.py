@@ -5,11 +5,13 @@
 
     mlinkctl                     读一次统计快照（cmd 0x01 GET_STATS）
     mlinkctl config              读设备信息与配置项（cmd 0x02 GET_CONFIG）
+    mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / landing page（cmd 0x03）
+    mlinkctl set-usb [...]       设置 USB 能力，保存后设备自动重新枚举（cmd 0x16 + 0x17）
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl pair                进入配对流程（cmd 0x11）
     mlinkctl exit-pair           退出配对流程（cmd 0x15）
     mlinkctl unpair              清除配对记录并重新配对（cmd 0x12）
-    mlinkctl reset               清除配对与模式记录后重启（cmd 0x13）
+    mlinkctl reset               恢复出厂设置：清除配对、模式与 USB 能力记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
 
 `mlinkctl --help` 与 `mlinkctl <command> --help` 由 argparse 生成。
@@ -43,12 +45,15 @@ PID = 0x4020
 VENDOR_CODE = 0x4D
 CMD_GET_STATS = 0x01
 CMD_GET_CONFIG = 0x02
+CMD_GET_USB_CONFIG = 0x03
 CMD_SET_MODE = 0x10
 CMD_ENTER_PAIRING = 0x11
 CMD_CLEAR_PAIR = 0x12
 CMD_RESET = 0x13
 CMD_REBOOT = 0x14
 CMD_EXIT_PAIRING = 0x15
+CMD_SET_USB_CONFIG = 0x16
+CMD_APPLY_USB_CONFIG = 0x17
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -94,12 +99,27 @@ MODE = {0: "local", 1: "wireless"}
 PAIR = {0: "idle", 1: "paired", 2: "pairing"}
 MODE_ARG = {"local": 0, "wireless": 1}
 
+# USB 能力（GetUsbConfig）的 tag 与取值域，与固件 usb_capability.hpp 一致
+TAG_USB_SUPPORTED = 0x60
+TAG_USB_WEBUSB = 0x61
+TAG_USB_WINUSB = 0x62
+TAG_USB_LANDING_PAGE = 0x63
+TAG_USB_DRAFT = 0x64
+TAG_USB_DRAFT_REASON = 0x65
+
+# landing page 上限 = esp_tinyusb 字符串描述符缓冲（128B）减头与结尾 NUL
+USB_LANDING_PAGE_MAX_LEN = 126
+USB_CAPABILITY_WEBUSB = 0x01
+USB_CAPABILITY_WINUSB = 0x02
+DRAFT = {0: "none", 1: "pending", 2: "rejected"}
+REJECT = {1: "too-long", 2: "invalid-char", 3: "unsupported"}
+
 # 无参数动作命令：子命令 → (命令码, 帮助文本)
 ACTIONS = {
     "pair": (CMD_ENTER_PAIRING, "进入配对流程"),
     "exit-pair": (CMD_EXIT_PAIRING, "退出配对流程"),
     "unpair": (CMD_CLEAR_PAIR, "清除配对记录并重新配对"),
-    "reset": (CMD_RESET, "清除配对与模式记录后重启"),
+    "reset": (CMD_RESET, "恢复出厂设置：清除配对、模式与 USB 能力记录"),
     "reboot": (CMD_REBOOT, "重启设备"),
 }
 # 执行后设备会重新枚举的子命令
@@ -187,12 +207,98 @@ def render_config(values):
     return " ".join(parts)
 
 
+def u8_of(values, tag):
+    raw = values.get(tag)
+    return int.from_bytes(raw, "big") if raw else 0
+
+
+def render_usb(values):
+    supported = u8_of(values, TAG_USB_SUPPORTED)
+    compiled = [
+        name
+        for bit, name in ((USB_CAPABILITY_WEBUSB, "webusb"), (USB_CAPABILITY_WINUSB, "winusb"))
+        if supported & bit
+    ]
+    draft = u8_of(values, TAG_USB_DRAFT)
+    parts = [
+        f"compiled={','.join(compiled) if compiled else 'none'}",
+        f"webusb={'on' if u8_of(values, TAG_USB_WEBUSB) else 'off'}",
+        f"winusb={'on' if u8_of(values, TAG_USB_WINUSB) else 'off'}",
+        f"landing_page={values.get(TAG_USB_LANDING_PAGE, b'').decode('utf-8', 'replace')}",
+        f"draft={DRAFT.get(draft, '?')}",
+    ]
+    if draft == 2:
+        parts.append(f"draft_reason={REJECT.get(u8_of(values, TAG_USB_DRAFT_REASON), '?')}")
+    return " ".join(parts)
+
+
+def encode_tlv(tag, value):
+    if len(value) >= 0xFF:
+        return bytes([tag, 0xFF]) + len(value).to_bytes(2, "big") + value
+    return bytes([tag, len(value)]) + value
+
+
+def check_landing_page(url):
+    if len(url) > USB_LANDING_PAGE_MAX_LEN:
+        die(f"landing page 超过 {USB_LANDING_PAGE_MAX_LEN} 字符")
+    for byte in url.encode("utf-8"):
+        if byte < 0x20 or byte > 0x7E:
+            die("landing page 只能是可打印 ASCII 字符")
+
+
 def cmd_read_stats(_args):
     print(render_stats(decode(fetch(find_device(), CMD_GET_STATS))))
 
 
 def cmd_read_config(_args):
     print(render_config(decode(fetch(find_device(), CMD_GET_CONFIG))))
+
+
+def cmd_read_usb(_args):
+    print(render_usb(decode(fetch(find_device(), CMD_GET_USB_CONFIG))))
+
+
+def cmd_set_usb(args):
+    if args.webusb is None and args.winusb is None and args.landing_page is None:
+        die("至少要指定 --webusb / --winusb / --landing-page 之一")
+
+    dev = find_device()
+    current = decode(fetch(dev, CMD_GET_USB_CONFIG))
+
+    webusb = u8_of(current, TAG_USB_WEBUSB)
+    winusb = u8_of(current, TAG_USB_WINUSB)
+    landing = current.get(TAG_USB_LANDING_PAGE, b"").decode("utf-8", "replace")
+
+    if args.webusb is not None:
+        webusb = 1 if args.webusb == "on" else 0
+    if args.winusb is not None:
+        winusb = 1 if args.winusb == "on" else 0
+    if args.landing_page is not None:
+        landing = args.landing_page
+    check_landing_page(landing)
+
+    # 全量提交：设备端按 WebUSB + WinUSB + landing page 三项整体替换草稿
+    payload = (
+        encode_tlv(TAG_USB_WEBUSB, bytes([webusb]))
+        + encode_tlv(TAG_USB_WINUSB, bytes([winusb]))
+        + encode_tlv(TAG_USB_LANDING_PAGE, landing.encode("utf-8"))
+    )
+    try:
+        dev.ctrl_transfer(0x40, VENDOR_CODE, CMD_SET_USB_CONFIG, 0, payload, TIMEOUT_MS)
+    except usb.core.USBError as err:
+        die(f"设备拒绝了该载荷（格式非法、能力未编译或传输失败）：{err}")
+
+    # OUT 请求没有响应阶段：草稿状态由随后的一次 GetUsbConfig 报出
+    status = decode(fetch(dev, CMD_GET_USB_CONFIG))
+    state = u8_of(status, TAG_USB_DRAFT)
+    if state == 2:
+        die(f"设备拒绝了该配置：{REJECT.get(u8_of(status, TAG_USB_DRAFT_REASON), '?')}")
+    if state != 1:
+        die("设备端没有待应用的草稿（可能被其他客户端清掉了）")
+
+    decode(fetch(dev, CMD_APPLY_USB_CONFIG))
+    print(f"status=ok webusb={'on' if webusb else 'off'} winusb={'on' if winusb else 'off'} landing_page={landing}")
+    print("mlinkctl: 设备正在重新枚举 USB，稍后需要重新识别设备", file=sys.stderr)
 
 
 def cmd_set_mode(args):
@@ -218,6 +324,15 @@ def build_parser():
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("config", help="读设备信息与配置项").set_defaults(handler=cmd_read_config)
+    subparsers.add_parser("usb", help="读 USB 能力（WebUSB / WinUSB / landing page）").set_defaults(
+        handler=cmd_read_usb
+    )
+
+    set_usb = subparsers.add_parser("set-usb", help="设置 USB 能力，保存后设备自动重新枚举")
+    set_usb.add_argument("--webusb", choices=("on", "off"), help="WebUSB 能力开关")
+    set_usb.add_argument("--winusb", choices=("on", "off"), help="WinUSB 自动识别驱动开关")
+    set_usb.add_argument("--landing-page", metavar="URL", help="WebUSB landing page URL（空串回退默认值）")
+    set_usb.set_defaults(handler=cmd_set_usb)
 
     set_mode = subparsers.add_parser("set-mode", help="切换运行模式")
     set_mode.add_argument("mode", choices=sorted(MODE_ARG), help="local 或 wireless")

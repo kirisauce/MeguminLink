@@ -8,6 +8,7 @@
 #include <esp_timer.h>
 #include <sdkconfig.h>
 
+#include <algorithm>
 #include <cstring>
 
 using namespace mlink;
@@ -57,28 +58,42 @@ static constexpr char TAG[] = "mlink::config_channel";
 // ---- 协议（固件与上位机的唯一契约，上位机见 tools/mlinkctl.py 与
 //      tools/mlink-webui/src/lib/protocol.ts）----
 //
-// 传输：EP0 厂商控制请求，一律 IN 方向（bmRequestType = 0xC0：IN、vendor、
-// device recipient）、bRequest = 0x4D（'M'）、wValue = 命令码 | (参数 << 8)、
-// wIndex = seq（原样回显）、wLength = 期望响应长度。请求没有 DATA OUT 阶段，
-// 命令参数因此走 wValue；响应帧在 DATA IN 阶段回给主机，一次往返拿到结果。
-// OUT 方向的厂商请求不属于本通道，交回调用方 STALL。
+// 传输：EP0 厂商控制请求，bRequest = 0x4D（'M'），命令码与参数走 wValue
+// （低字节命令码 | 高字节参数）、wIndex = seq（原样回显）。
+//   - 读命令与动作命令一律 IN 方向（bmRequestType = 0xC0：IN、vendor、
+//     device recipient）：wLength = 期望响应长度，响应帧在 DATA IN 阶段回给
+//     主机，一次往返拿到结果；
+//   - SetUsbConfig 是本通道唯一的 OUT 命令（bmRequestType = 0x40）：wLength
+//     = TLV 载荷长度，载荷在 DATA OUT 阶段送达，没有 DATA IN 阶段，因此它
+//     不回状态帧（校验结果由随后的一次 GetUsbConfig 读取）。
+// 不在上表内的厂商请求交回调用方（最终 STALL）。
 //
 // 帧头 8B（大端）：magic u16（0x4D4C，字节流恒为 'M' 'L'）+ cmd u8 + seq u8
 // + len u16（TLV 区长度）+ status u8 + reserved u8，后接 len 字节 TLV 区。
 // TLV：tag u8 | len u8 | value，len == 0xFF 表示扩展长度（后接 u16 大端）；
 // 整数一律大端，字符串不带结尾 NUL。新增 tag 不影响旧上位机解析。
+// SetUsbConfig 的载荷用同一套 TLV 编码，但不带帧头（命令与状态都在请求本身）。
 //
 // 命令表（0x01-0x0F 只读，0x10-0x1F 动作）：
-//   0x01 GetStats     读统计快照
-//   0x02 GetConfig    读设备身份与配置项
-//   0x10 SetMode      参数 0=Local 1=Wireless，其他值回 malformed
-//   0x11 EnterPairing 进入配对流程（无线模式下有效，Local 记日志忽略）
-//   0x12 ClearPair    清除配对记录并进入配对流程
-//   0x13 Reset        清除配对与模式记录后重启
-//   0x14 Reboot       立即重启
-//   0x15 ExitPairing  退出配对流程（无线模式且配对进行中有效）
+//   0x01 GetStats       读统计快照
+//   0x02 GetConfig      读设备身份与配置项
+//   0x03 GetUsbConfig   读 USB 能力（生效值 + 草稿状态）
+//   0x10 SetMode        参数 0=Local 1=Wireless，其他值回 malformed
+//   0x11 EnterPairing   进入配对流程（无线模式下有效，Local 记日志忽略）
+//   0x12 ClearPair      清除配对记录并进入配对流程
+//   0x13 Reset          恢复出厂设置：清除配对、模式与 USB 能力记录后重启
+//   0x14 Reboot         立即重启
+//   0x15 ExitPairing    退出配对流程（无线模式且配对进行中有效）
+//   0x16 SetUsbConfig   OUT：提交 USB 能力草稿，只校验不落盘不生效
+//   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
+//
+// USB 能力三阶段（0x16 → 0x03 → 0x17）：0x16 是 OUT 请求、回不了状态帧，
+// 因此只做接收与校验；主机用 0x03 读出草稿状态（合法待应用 / 被拒 + 原因），
+// 合法才发 0x17 落盘生效。载荷格式非法（缺项或 TLV 越界）在 0x16 的 DATA
+// 阶段直接 STALL；内容非法（URL 超长或含非可打印字符、启用编译期未支持的
+// 能力）留在草稿状态里由 0x03 报出。
 namespace
 {
 constexpr u8 VENDOR_CODE = 0x4D;
@@ -89,12 +104,15 @@ enum class Cmd : u8
 {
     GetStats = 0x01,
     GetConfig = 0x02,
+    GetUsbConfig = 0x03,
     SetMode = 0x10,
     EnterPairing = 0x11,
     ClearPair = 0x12,
     Reset = 0x13,
     Reboot = 0x14,
     ExitPairing = 0x15,
+    SetUsbConfig = 0x16,
+    ApplyUsbConfig = 0x17,
 };
 
 enum class Status : u8
@@ -108,7 +126,7 @@ enum class Status : u8
 };
 
 // tag 段位：0x01-0x0F 设备状态、0x10-0x1F DAP、0x20-0x2F 无线、0x30-0x3F UART、
-// 0x40-0x4F 系统、0x50-0x5F 配置项。
+// 0x40-0x4F 系统、0x50-0x5F 配置项、0x60-0x6F USB 能力。
 enum : u8
 {
     TAG_MODE = 0x01,             // u8：0=Local 1=Wireless
@@ -129,6 +147,12 @@ enum : u8
     TAG_IDF_VERSION = 0x43,      // string：ESP-IDF 版本（esp_app_desc.idf_ver）
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
+    TAG_USB_SUPPORTED = 0x60,    // u8：编译期支持的能力位（bit0 WebUSB / bit1 WinUSB）
+    TAG_USB_WEBUSB = 0x61,       // u8：WebUSB 生效值 0/1
+    TAG_USB_WINUSB = 0x62,       // u8：WinUSB 生效值 0/1
+    TAG_USB_LANDING_PAGE = 0x63, // string：landing page URL（生效值）
+    TAG_USB_DRAFT = 0x64,        // u8：草稿状态 0=无草稿 1=待应用 2=被拒
+    TAG_USB_DRAFT_REASON = 0x65, // u8：被拒原因（UsbConfigReject）
 };
 
 usize tlv_u8(u8 *out, u8 tag, u8 value)
@@ -184,6 +208,94 @@ u8 pair_state()
     }
     u8 peer_mac[ESP_NOW_ETH_ALEN];
     return peer_mac_load(peer_mac) ? 1 : 0;
+}
+
+/** SetUsbConfig 载荷的解析结果 */
+struct ParsedUsbConfig
+{
+    UsbCapabilitySettings settings;
+    /** landing page 的原始长度：超上限时草稿存截断值，但仍按原始长度报 TooLong */
+    usize landing_page_len = 0;
+    /** 三项（WebUSB / WinUSB / landing page）是否齐全 */
+    bool complete = false;
+};
+
+/**
+ * 解析 SetUsbConfig 的 TLV 载荷（全量语义：三项都必须给出）。
+ *
+ * @return true=格式合法；false=TLV 越界/缺项/取值长度不对（调用方在 DATA 阶段
+ *         返回 false，由 TinyUSB 在状态阶段 STALL，主机端拿到传输失败）
+ */
+bool parse_usb_config(const u8 *data, usize len, ParsedUsbConfig *out)
+{
+    bool has_webusb = false;
+    bool has_winusb = false;
+    bool has_landing_page = false;
+
+    usize pos = 0;
+    while (pos + 2 <= len)
+    {
+        const u8 tag = data[pos];
+        usize value_len = data[pos + 1];
+        pos += 2;
+        if (value_len == 0xFF)
+        {
+            if (pos + 2 > len)
+            {
+                return false;
+            }
+            value_len = (static_cast<usize>(data[pos]) << 8) | data[pos + 1];
+            pos += 2;
+        }
+        if (pos + value_len > len)
+        {
+            return false;
+        }
+
+        const u8 *value = data + pos;
+        pos += value_len;
+
+        switch (tag)
+        {
+        case TAG_USB_WEBUSB:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            out->settings.webusb = value[0] != 0 ? 1 : 0;
+            has_webusb = true;
+            break;
+
+        case TAG_USB_WINUSB:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            out->settings.winusb = value[0] != 0 ? 1 : 0;
+            has_winusb = true;
+            break;
+
+        case TAG_USB_LANDING_PAGE: {
+            out->landing_page_len = value_len;
+            const usize copy_len = std::min(value_len, USB_LANDING_PAGE_MAX_LEN);
+            memcpy(out->settings.landing_page, value, copy_len);
+            out->settings.landing_page[copy_len] = '\0';
+            has_landing_page = true;
+            break;
+        }
+
+        default:
+            break; // 未知 tag：忽略，便于将来扩展
+        }
+    }
+
+    if (pos != len)
+    {
+        return false; // 尾部有残留字节：不是合法的 TLV 区
+    }
+
+    out->complete = has_webusb && has_winusb && has_landing_page;
+    return out->complete;
 }
 } // namespace
 
@@ -264,6 +376,130 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     return finish_response(cmd, seq, p);
 }
 
+u16 ConfigChannel::build_usb_config_response(u8 cmd, u8 seq)
+{
+    const UsbCapabilitySettings &active = Application::get_instance().usb().usb_capability();
+    usize p = FRAME_HEADER_SIZE;
+
+    p += tlv_u8(m_response + p, TAG_USB_SUPPORTED, usb_capability_supported_mask());
+    p += tlv_u8(m_response + p, TAG_USB_WEBUSB, active.webusb);
+    p += tlv_u8(m_response + p, TAG_USB_WINUSB, active.winusb);
+    p += tlv_str(m_response + p, TAG_USB_LANDING_PAGE, active.landing_page);
+    p += tlv_u8(m_response + p, TAG_USB_DRAFT, usb_draft_state());
+
+    const UsbConfigReject reason = usb_draft_reject();
+    if (reason != UsbConfigReject::None)
+    {
+        p += tlv_u8(m_response + p, TAG_USB_DRAFT_REASON, static_cast<u8>(reason));
+    }
+
+    return finish_response(cmd, seq, p);
+}
+
+u8 ConfigChannel::usb_draft_state() const
+{
+    portENTER_CRITICAL(&m_usb_draft_lock);
+    const bool present = m_usb_draft_present;
+    const bool rejected = m_usb_draft_rejected;
+    portEXIT_CRITICAL(&m_usb_draft_lock);
+
+    if (!present)
+    {
+        return 0;
+    }
+    return rejected ? 2 : 1;
+}
+
+UsbConfigReject ConfigChannel::usb_draft_reject() const
+{
+    portENTER_CRITICAL(&m_usb_draft_lock);
+    const UsbConfigReject reason = m_usb_draft_rejected ? m_usb_draft_reject : UsbConfigReject::None;
+    portEXIT_CRITICAL(&m_usb_draft_lock);
+    return reason;
+}
+
+bool ConfigChannel::has_valid_usb_draft() const
+{
+    portENTER_CRITICAL(&m_usb_draft_lock);
+    const bool valid = m_usb_draft_present && !m_usb_draft_rejected;
+    portEXIT_CRITICAL(&m_usb_draft_lock);
+    return valid;
+}
+
+bool ConfigChannel::take_usb_config_draft(UsbCapabilitySettings *settings)
+{
+    portENTER_CRITICAL(&m_usb_draft_lock);
+    const bool valid = m_usb_draft_present && !m_usb_draft_rejected;
+    if (valid && settings != nullptr)
+    {
+        *settings = m_usb_draft;
+    }
+    m_usb_draft_present = false;
+    m_usb_draft_rejected = false;
+    m_usb_draft_reject = UsbConfigReject::None;
+    portEXIT_CRITICAL(&m_usb_draft_lock);
+
+    return valid;
+}
+
+bool ConfigChannel::stage_usb_config_draft(const u8 *data, usize len)
+{
+    ParsedUsbConfig parsed;
+    if (!parse_usb_config(data, len, &parsed))
+    {
+        return false; // 格式非法：不改草稿，交回调用方在状态阶段 STALL
+    }
+
+    UsbCapabilitySettings draft = parsed.settings;
+    if (draft.landing_page[0] == '\0')
+    {
+        // 空 URL = 回退编译期默认值（"不设 landing page"与"关闭 WebUSB"是两件事）
+        detail::copy_cstr(draft.landing_page, sizeof(draft.landing_page), usb_landing_page_default());
+    }
+
+    // 超长按原始长度判定：草稿里只留得下截断值，不能拿它比较
+    const UsbConfigReject reject =
+        parsed.landing_page_len > USB_LANDING_PAGE_MAX_LEN ? UsbConfigReject::TooLong : usb_capability_check(draft);
+
+    portENTER_CRITICAL(&m_usb_draft_lock);
+    m_usb_draft = draft;
+    m_usb_draft_present = true;
+    m_usb_draft_rejected = reject != UsbConfigReject::None;
+    m_usb_draft_reject = reject;
+    portEXIT_CRITICAL(&m_usb_draft_lock);
+
+    return true;
+}
+
+bool ConfigChannel::handle_usb_config_out(u8 rhport, u8 stage, const tusb_control_request_t *request)
+{
+    if (static_cast<u8>(request->wValue & 0xFF) != static_cast<u8>(Cmd::SetUsbConfig))
+    {
+        return false; // 其余 OUT 厂商请求不属于本通道
+    }
+
+    if (stage == CONTROL_STAGE_SETUP)
+    {
+        // 编译期两个能力都未启用时没有可调项；空载荷与超长载荷都是协议级错误
+        if (usb_capability_supported_mask() == 0 || request->wLength == 0 ||
+            request->wLength > sizeof(m_usb_draft_buffer))
+        {
+            return false; // STALL
+        }
+        tud_control_xfer(rhport, request, m_usb_draft_buffer, request->wLength);
+        return true;
+    }
+
+    if (stage == CONTROL_STAGE_DATA)
+    {
+        // 格式非法时返回 false：TinyUSB 在状态阶段 STALL 两个方向的控制端点，
+        // 主机端的 controlTransferOut 直接得到失败
+        return stage_usb_config_draft(m_usb_draft_buffer, request->wLength);
+    }
+
+    return true; // ACK 阶段：载荷已在 DATA 阶段处理完
+}
+
 bool ConfigChannel::post_action(Action action, u8 arg)
 {
     portENTER_CRITICAL(&m_action_lock);
@@ -312,17 +548,18 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
     {
         return false;
     }
+
+    // 唯一的 OUT 命令 SetUsbConfig 走独立分支：SETUP 声明接收、DATA 收载荷，
+    // 没有 DATA IN 阶段，所以它自己那一套阶段处理在 handle_usb_config_out 里
+    if (request->bmRequestType_bit.direction != TUSB_DIR_IN)
+    {
+        return handle_usb_config_out(rhport, stage, request);
+    }
+
     if (stage != CONTROL_STAGE_SETUP)
     {
         // 已接管的请求：其余阶段由协议栈继续处理，此处无额外动作
         return true;
-    }
-
-    // 本通道一律 IN 请求（命令码与参数都在 SETUP 包的 wValue 里）：OUT 方向
-    // 的厂商请求不属于本通道，未识别的方向直接 STALL
-    if (request->bmRequestType_bit.direction != TUSB_DIR_IN)
-    {
-        return false;
     }
 
     const u8 cmd = static_cast<u8>(request->wValue & 0xFF);
@@ -336,6 +573,9 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         break;
     case Cmd::GetConfig:
         len = build_config_response(cmd, seq);
+        break;
+    case Cmd::GetUsbConfig:
+        len = build_usb_config_response(cmd, seq);
         break;
     case Cmd::SetMode:
         // 参数只有 local/wireless 两个取值，其余按 malformed 拒绝且不占动作槽
@@ -357,6 +597,15 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         break;
     case Cmd::ExitPairing:
         len = post_action_response(cmd, seq, Action::ExitPairing, 0);
+        break;
+    case Cmd::SetUsbConfig:
+        // OUT 命令出现在 IN 方向：命令码有效但方向不对，按未识别命令处理
+        len = build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
+        break;
+    case Cmd::ApplyUsbConfig:
+        // 没有合法草稿就没什么可应用的（被拒的草稿不算，原因由 GetUsbConfig 报出）
+        len = has_valid_usb_draft() ? post_action_response(cmd, seq, Action::ApplyUsbConfig, 0)
+                                    : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
         break;
     default:
         // 未定义的命令码：回带 UnknownCommand 状态的空帧（不回 STALL，

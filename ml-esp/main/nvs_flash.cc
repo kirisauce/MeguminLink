@@ -102,6 +102,34 @@ esp_err_t mlink::NvsKey::raw_store_blob(const void *value, size_t len) const
     return ret;
 }
 
+bool mlink::NvsKey::raw_load_string(char *out, size_t cap) const
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+    {
+        return false;
+    }
+    size_t out_len = cap;
+    const esp_err_t ret = nvs_get_str(handle, m_key, out, &out_len);
+    nvs_close(handle);
+    return ret == ESP_OK;
+}
+
+esp_err_t mlink::NvsKey::raw_store_string(const char *value) const
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open NVS namespace '%s': %s", NVS_NAMESPACE, esp_err_to_name(ret));
+
+    ret = nvs_set_str(handle, m_key, value);
+    if (ret == ESP_OK)
+    {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
 esp_err_t mlink::NvsKey::raw_erase() const
 {
     nvs_handle_t handle;

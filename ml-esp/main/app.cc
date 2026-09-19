@@ -1,5 +1,6 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/usb/usb_capability.hpp"
 #include "meguminlink/wireless_link.hpp" // WirelessDapExecutor（DapCommand 投递）
 
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
@@ -383,9 +384,10 @@ void Application::consume_pending_action()
         break;
     case ConfigChannel::Action::Reset:
         // 删除失败不回滚：重启后的构造逻辑会按残留记录自愈
-        ESP_LOGI(TAG, "Reset: erasing pairing and mode records, rebooting");
+        ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and USB capability records, rebooting");
         (void)peer_mac_erase();
         (void)m_mode_key.erase();
+        (void)usb_capability_erase();
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
@@ -394,6 +396,29 @@ void Application::consume_pending_action()
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
+    case ConfigChannel::Action::ApplyUsbConfig: {
+        UsbCapabilitySettings draft;
+        if (!m_config_channel.take_usb_config_draft(&draft))
+        {
+            break;
+        }
+
+        // 与生效值一致时不重新枚举：省掉一次无意义的断连（落盘也由 NVS 键的
+        // 相同值跳过落盘兜住）
+        if (draft == m_usb.usb_capability())
+        {
+            ESP_LOGI(TAG, "USB capabilities unchanged; re-enumeration skipped");
+            break;
+        }
+
+        const esp_err_t ret = usb_capability_store(draft);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to store USB capabilities: %s", esp_err_to_name(ret));
+        }
+        m_usb.apply_usb_capability(draft);
+        break;
+    }
     }
 }
 #endif

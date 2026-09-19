@@ -7,7 +7,8 @@
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
-#include <tusb.h>              // tusb_control_request_t（EP0 厂商请求处理）
+#include "meguminlink/usb/usb_capability.hpp"
+#include <tusb.h> // tusb_control_request_t（EP0 厂商请求处理）
 #endif
 
 namespace mlink
@@ -65,13 +66,14 @@ class ConfigChannel
      */
     enum class Action : u8
     {
-        None,         // 空槽
-        SetMode,      // arg: 0=Local 1=Wireless
-        EnterPairing, // 进入配对流程（无线模式下有效）
-        ExitPairing,  // 退出配对流程（无线模式且配对进行中有效）
-        ClearPair,    // 清除配对记录并进入配对流程
-        Reset,        // 清除配对与模式记录后重启
-        Reboot,       // 立即重启
+        None,           // 空槽
+        SetMode,        // arg: 0=Local 1=Wireless
+        EnterPairing,   // 进入配对流程（无线模式下有效）
+        ExitPairing,    // 退出配对流程（无线模式且配对进行中有效）
+        ClearPair,      // 清除配对记录并进入配对流程
+        Reset,          // 恢复出厂设置：清除配对、模式与 USB 能力记录后重启
+        Reboot,         // 立即重启
+        ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
     };
 
     /**
@@ -87,6 +89,14 @@ class ConfigChannel
      * @return true=取到动作；false=当前无动作
      */
     bool take_action(Action *action, u8 *arg = nullptr);
+
+    /**
+     * 取走待应用的 USB 能力草稿并清空槽（主循环执行 ApplyUsbConfig 时调用）。
+     *
+     * SetUsbConfig 只写草稿不落盘：校验失败的草稿在此处按"无草稿"处理
+     * （取走后槽一律清空），主机已通过 GetUsbConfig 读到被拒原因。
+     */
+    bool take_usb_config_draft(UsbCapabilitySettings *settings);
 #endif
 
   private:
@@ -105,6 +115,29 @@ class ConfigChannel
 
     /** 投递动作并按结果回帧：ok=已投递，busy=槽被占用 */
     u16 post_action_response(u8 cmd, u8 seq, Action action, u8 arg);
+
+    /**
+     * SetUsbConfig（OUT 方向）的处理：SETUP 阶段声明接收缓冲，DATA 阶段解析
+     * TLV 并写入草稿槽。
+     *
+     * @return true=已接管；false=不是本命令或载荷格式非法（调用方 STALL）
+     */
+    bool handle_usb_config_out(u8 rhport, u8 stage, const tusb_control_request_t *request);
+
+    /** 解析 SetUsbConfig 载荷并写入草稿槽（格式非法时不改草稿并返回 false） */
+    bool stage_usb_config_draft(const u8 *data, usize len);
+
+    /** 组装 GetUsbConfig 响应帧到 m_response，返回整帧长度 */
+    u16 build_usb_config_response(u8 cmd, u8 seq);
+
+    /** 草稿状态：0=无草稿 1=合法待应用 2=被拒（GetUsbConfig 的 USB_DRAFT） */
+    u8 usb_draft_state() const;
+
+    /** 被拒草稿的原因（无草稿或被拒时的残留状态由 state 表达） */
+    UsbConfigReject usb_draft_reject() const;
+
+    /** 槽内是否有合法草稿（ApplyUsbConfig 的准入条件） */
+    bool has_valid_usb_draft() const;
 #endif
 
     // 写入端各在自己的任务上下文串行（DAP 任务 / esp_wifi 任务 / 桥任务），
@@ -128,6 +161,19 @@ class ConfigChannel
     Action m_pending_action = Action::None;
     u8 m_pending_arg = 0;
     portMUX_TYPE m_action_lock = portMUX_INITIALIZER_UNLOCKED;
+
+    /**
+     * USB 能力草稿单槽（EP0 上下文写、主循环执行 ApplyUsbConfig 时读走）。
+     * SetUsbConfig 的 OUT 载荷先落到 m_usb_draft_buffer，解析校验后存进本槽。
+     */
+    UsbCapabilitySettings m_usb_draft;
+    bool m_usb_draft_present = false;
+    bool m_usb_draft_rejected = false;
+    UsbConfigReject m_usb_draft_reject = UsbConfigReject::None;
+    mutable portMUX_TYPE m_usb_draft_lock = portMUX_INITIALIZER_UNLOCKED;
+
+    /** OUT 载荷接收缓冲：tud_control_xfer 只保存指针，DATA 阶段仍会回写 */
+    u8 m_usb_draft_buffer[256];
 #endif
 };
 } // namespace mlink

@@ -91,29 +91,44 @@ config MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
     bool "Enable WebUSB capability"
     default y
     help
-        Advertise the WebUSB platform capability in the BOS descriptor and
-        answer the WebUSB GET_URL vendor request with the landing page URL
-        (see below). Lets browsers supporting WebUSB (Chrome/Edge) talk to
-        the device without manual driver setup.
+        Compile the WebUSB platform capability. This is the build-time
+        master switch: when off, the capability never appears in the BOS
+        descriptor, the WebUSB GET_URL vendor request is not answered, and
+        the runtime switch (config channel command 0x16) cannot enable it.
+
+        When on, whether the capability is advertised is a runtime state
+        stored in NVS: enabled by default, flip it over the config channel
+        (GetUsbConfig 0x03 / SetUsbConfig 0x16 / ApplyUsbConfig 0x17), which
+        rebuilds the descriptors and re-enumerates USB.
 
 config MEGUMINLINK_USB_WEBUSB_LANDING_PAGE
     string "WebUSB landing page"
     default "https://example.com"
     depends on MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
     help
-        Landing page URL returned by the WebUSB GET_URL request, exposed as
-        USB string index iLandingPage. A leading "https://" or "http://" is
-        stripped from the URL descriptor body and encoded as its scheme; any
-        other form is embedded verbatim (scheme = full URL).
+        Default landing page URL: used when NVS holds no URL record and when
+        an empty URL is submitted over the config channel. The runtime value
+        lives in NVS and appears both as USB string iLandingPage and in the
+        WebUSB GET_URL response.
+
+        A leading "https://" or "http://" is stripped from the URL descriptor
+        body and encoded as its scheme; any other form is embedded verbatim
+        (scheme = full URL). At most 126 characters (the WebUSB string
+        descriptor limit).
 
 config MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
     bool "Enable WinUSB capability"
     default y
     help
-        Advertise the Microsoft OS 2.0 platform capability in the BOS
-        descriptor and serve the MS OS 2.0 descriptor set via its vendor
-        request, so Windows can bind the WinUSB driver automatically
-        (no manual driver installation needed).
+        Compile the Microsoft OS 2.0 platform capability. This is the
+        build-time master switch: when off, the capability never appears in
+        the BOS descriptor, the MS OS 2.0 descriptor set is not served, and
+        the runtime switch (config channel command 0x16) cannot enable it.
+
+        When on, Windows binds winusb.sys to the CMSIS-DAP vendor interface
+        (no manual driver installation) while the runtime state is enabled;
+        the state lives in NVS, is enabled by default, and is flipped over
+        the config channel.
 
 endmenu
 
