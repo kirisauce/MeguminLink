@@ -26,9 +26,6 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/** 无线发送帧缓冲大小（栈上）：UartData 帧最大（3B 头 + 200B 数据 = 203B，> DAP 帧 67B） */
-constexpr size_t MAX_FRAME_SIZE = UART_FRAME_HEADER_SIZE + MAX_UART_PAYLOAD_SIZE;
-
 /** 无线侧 DAP 执行器：命令队列深度 */
 constexpr size_t DAP_QUEUE_DEPTH = 8;
 
@@ -36,7 +33,7 @@ constexpr size_t DAP_QUEUE_DEPTH = 8;
 struct DapExecuteRequest
 {
     u8 src_mac[ESP_NOW_ETH_ALEN];
-    u8 data[DAP_PACKET_SIZE];
+    u8 data[MAX_DAP_PAYLOAD_SIZE];
     u16 len;
 };
 } // namespace
@@ -50,6 +47,10 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         return;
     }
 
+    // 反序列化存储随无线对象持有：数据段可达 1467B，放栈上会吃掉 ESP-NOW
+    // 回调所在任务的栈。
+    WirelessLink &link = Application::get_instance().wireless_link();
+
     ReceivedPacket rp = {};
     std::memcpy(rp.src_mac, recv_info->src_addr, ESP_NOW_ETH_ALEN);
 
@@ -61,7 +62,7 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
                                                                      recv_info->rx_ctrl->rssi);
     }
 
-    if (rp.packet.deserialize(data, data_len, rp.storage, sizeof(rp.storage)) != ESP_OK)
+    if (rp.packet.deserialize(data, data_len, link.m_rx_storage, sizeof(link.m_rx_storage)) != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to deserialize %d-byte frame from " MACSTR, data_len, MAC2STR(rp.src_mac));
         return;
@@ -128,6 +129,12 @@ esp_err_t WirelessLink::init()
     if (m_initialized)
     {
         return ESP_OK;
+    }
+
+    m_tx_mutex = xSemaphoreCreateMutex();
+    if (m_tx_mutex == nullptr)
+    {
+        return ESP_ERR_NO_MEM;
     }
 
     esp_err_t ret;
@@ -274,21 +281,37 @@ esp_err_t WirelessLink::peer_remove(const u8 *peer_mac)
 
 esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 {
-    // 栈上缓冲（Packet 小巧：数据段 ≤64B，帧 ≤67B）
-    u8 buffer[MAX_FRAME_SIZE];
-    const esp_err_t ret = packet.serialize(buffer, sizeof(buffer));
+    // 发送帧缓冲为对象成员：DAP 帧可达 1470B，放栈上会吃掉发送方任务的栈。
+    // DAP 帧丢失会让主机端命令与响应错位，必须拿到发送权；其余帧尽力而为，
+    // 取不到就直接丢弃，避免在 ESP-NOW 回调里阻塞。
+    const bool reliable = (packet.packet_type == PacketType::DapCommand) ||
+                          (packet.packet_type == PacketType::DapResponse);
+    if (m_tx_mutex == nullptr)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(m_tx_mutex, reliable ? portMAX_DELAY : 0) != pdTRUE)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const esp_err_t ret = packet.serialize(m_tx_frame, sizeof(m_tx_frame));
     if (ret != ESP_OK)
     {
+        xSemaphoreGive(m_tx_mutex);
         ESP_LOGE(TAG, "Failed to serialize packet: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    const esp_err_t send_ret = esp_now_send(dest_mac, buffer, packet.serialized_size());
+    const size_t frame_len = packet.serialized_size();
+    const esp_err_t send_ret = esp_now_send(dest_mac, m_tx_frame, frame_len);
+    xSemaphoreGive(m_tx_mutex);
+
     if (send_ret == ESP_OK)
     {
         // 链路层统计：成功交给 ESP-NOW 的帧（发送结果由 send_cb 另行处理，
         // 这里只反映"已发出"的字节量）
-        Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(packet.serialized_size()));
+        Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(frame_len));
     }
     return send_ret;
 }
@@ -439,7 +462,7 @@ bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
 
     if (req.len > buf_cap)
     {
-        // 防御：命令不得超过执行器请求缓冲（DAP_PACKET_SIZE）
+        // 防御：命令不得超过执行器请求缓冲（DAP_MAX_REQUEST_SIZE）
         ESP_LOGW(TAG, "DAP command too large (%u bytes, cap %u), dropped", static_cast<unsigned>(req.len),
                  static_cast<unsigned>(buf_cap));
         return false;
@@ -475,10 +498,10 @@ esp_err_t WirelessLink::dap_execute(const u8 *src_mac, const u8 *data, size_t le
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (len > DAP_PACKET_SIZE)
+    if (len > MAX_DAP_PAYLOAD_SIZE)
     {
         ESP_LOGW(TAG, "DAP command too large (%u bytes, max %u), dropped", static_cast<unsigned>(len),
-                 static_cast<unsigned>(DAP_PACKET_SIZE));
+                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
         return ESP_ERR_INVALID_SIZE;
     }
 

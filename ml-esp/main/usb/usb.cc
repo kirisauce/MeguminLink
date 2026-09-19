@@ -1,6 +1,7 @@
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
 #include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
+#include "meguminlink/dap_frame.hpp"     // dap_request_size（USB 命令重组）
 #include "meguminlink/usb/usb_capability.hpp"
 #include "meguminlink/wireless_link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
 
@@ -205,12 +206,12 @@ struct DapCommand
 {
     DapSource source;
     u16 len;
-    u8 data[DAP_PACKET_SIZE];
+    u8 data[MAX_DAP_PAYLOAD_SIZE];
 };
 
 // 请求/响应缓冲为 USB 传输层资源（不占任务栈——ESP-IDF 任务栈以字节计，
 // DAP 执行调用链栈需求大，缓冲放栈上会溢出）。
-u8 dap_request[DAP_PACKET_SIZE];
+u8 dap_request[MAX_DAP_PAYLOAD_SIZE];
 // 响应缓冲按 CMSIS-DAP 批量响应上限预留（DAP_MAX_RESPONSE_SIZE，见
 // dap_executor.hpp）：Local 模式单命令响应 ≤ DAP_PACKET_SIZE，0x7F 批量
 // 响应可到 ~2KB（DAP_ExecuteCommand 批量写入不检查边界）；Wireless 模式
@@ -226,11 +227,10 @@ void enqueue_dap_command(DapSource source, const u8 *data, u16 len)
     {
         return;
     }
-    if (len > DAP_PACKET_SIZE)
+    if (len > MAX_DAP_PAYLOAD_SIZE)
     {
-        // EP 64B 下不可能发生；防御性截断
-        ESP_LOGW(TAG, "Oversized DAP command (%u bytes), truncated", static_cast<unsigned>(len));
-        len = DAP_PACKET_SIZE;
+        ESP_LOGW(TAG, "Oversized DAP command (%u bytes), dropped", static_cast<unsigned>(len));
+        return;
     }
 
     DapCommand cmd{};
@@ -242,6 +242,47 @@ void enqueue_dap_command(DapSource source, const u8 *data, u16 len)
     if (xRingbufferSend(usb.m_dap_command_buffer, &cmd, sizeof(cmd), pdMS_TO_TICKS(500)) != pdTRUE)
     {
         ESP_LOGW(TAG, "DAP command queue full, dropped %u bytes", static_cast<unsigned>(len));
+    }
+}
+
+// 跨 USB 包累积一条完整 DAP 命令。命令可能大于单个 USB 包（EP 64B），
+// 接收回调每次只拿到一段，必须按命令自描述长度重组后再入队；一次回调也
+// 可能带回多条命令。仅 TinyUSB 任务上下文读写，缓冲随 USB 对象持有。
+void accumulate_dap_command(const u8 *data, size_t len)
+{
+    auto &usb = mlink::Application::get_instance().usb();
+    u8 *const accum = usb.m_rx_accum;
+    size_t &accum_len = usb.m_rx_accum_len;
+
+    while (len > 0)
+    {
+        if (accum_len == sizeof(usb.m_rx_accum))
+        {
+            // 缓冲已满仍拼不出完整命令：长度非法或超出单帧承载上限
+            ESP_LOGW(TAG, "DAP command exceeds %u bytes, dropped", static_cast<unsigned>(sizeof(usb.m_rx_accum)));
+            accum_len = 0;
+        }
+
+        const size_t space = sizeof(usb.m_rx_accum) - accum_len;
+        const size_t take = (len < space) ? len : space;
+        std::memcpy(accum + accum_len, data, take);
+        accum_len += take;
+        data += take;
+        len -= take;
+
+        const size_t cmd_len = mlink::dap_request_size(accum, accum_len);
+        if (cmd_len == 0)
+        {
+            continue; // 数据不足：等后续包补齐
+        }
+
+        enqueue_dap_command(DapSource::VendorBulk, accum, static_cast<u16>(cmd_len));
+
+        accum_len -= cmd_len;
+        if (accum_len > 0)
+        {
+            std::memmove(accum, accum + cmd_len, accum_len);
+        }
     }
 }
 
@@ -454,13 +495,14 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
 
     // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：回调不携带数据，
     // 必须从内部 RX FIFO 读取。tud_vendor_n_read 仅在该模式下可用。
-    // 每块数据即一条 DAP 命令（EP 64B = DAP_PACKET_SIZE）：入队后由 dap_task
-    // 与 HID 通道的命令一起顺序执行。
-    u8 tmp[CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE]; // 512B，≥ FIFO 64B
+    // 读到的字节流按 DAP 命令自描述长度重组：一条命令可能跨多次回调到达，
+    // 一次回调也可能带回多条命令；重组后由 dap_task 与 HID 通道的命令
+    // 一起顺序执行。
+    u8 tmp[CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE];
     u32 n;
     while ((n = tud_vendor_n_read(idx, tmp, sizeof(tmp))) > 0)
     {
-        enqueue_dap_command(DapSource::VendorBulk, tmp, static_cast<u16>(n));
+        accumulate_dap_command(tmp, static_cast<size_t>(n));
     }
 }
 
@@ -581,9 +623,10 @@ CmsisDapUsb::CmsisDapUsb()
 #endif
     m_usb_descriptors.rebuild(m_usb_capability, LANDING_PAGE_STRING_INDEX);
 
-    // 命令队列按字节容量创建：每条命令占一个 DapCommand（4 + DAP_PACKET_SIZE 字节），
-    // 默认配置下可积压数十条，远大于 DAP_PACKET_COUNT 的流水线深度。
-    constexpr size_t RINGBUF_SIZE = CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE * CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
+    // 命令队列按字节容量创建：每条命令最多占一个 DapCommand（长度字段 +
+    // MAX_DAP_PAYLOAD_SIZE 数据段）。容量必须容得下至少一条完整命令，
+    // 否则 NOSPLIT 环形缓冲会直接拒绝入队。
+    constexpr size_t RINGBUF_SIZE = sizeof(DapCommand) * CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
 
     m_dap_command_buffer = xRingbufferCreate(RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
 }

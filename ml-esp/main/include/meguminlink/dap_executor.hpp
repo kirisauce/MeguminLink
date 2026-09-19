@@ -9,22 +9,24 @@
 namespace mlink
 {
 /**
- * DAP 命令缓冲建议容量：CMSIS-DAP v2 单次请求上限（DAP_PACKET_SIZE=64B，
- * USB EP 64B / 无线帧命令长度检查均以此为限）。
+ * DAP 命令缓冲建议容量：无线帧单帧可承载的请求上限（ESP-NOW v2 单帧
+ * 1470B 减去 3B 帧头 = 1467B）。USB bulk 端点仍按 DAP_PACKET_SIZE 分包
+ * 到达，接收侧由 dap_request_size() 按命令自描述长度重组为完整命令。
  */
-inline constexpr size_t DAP_MAX_REQUEST_SIZE = 64;
+inline constexpr size_t DAP_MAX_REQUEST_SIZE = 1467;
 
 /**
- * DAP 响应缓冲建议容量：请求 ≤ DAP_PACKET_SIZE（64B）时，0x7F 批量命令
- * 的响应理论上限约 31 子命令 × 64B + 2 ≈ 2KB（CMSIS-DAP 的 DAP_ExecuteCommand
- * 批量响应写入不检查边界），此值覆盖该上限防止溢出。
+ * DAP 响应缓冲建议容量：0x7F 批量命令把多条子命令的响应拼接在一起，
+ * 上限由子命令构成决定（CMSIS-DAP 的 DAP_ExecuteCommand 批量响应写入不
+ * 检查边界），此值覆盖常规批量响应。单条命令的响应量级见
+ * DAP_MAX_REQUEST_SIZE。
  */
 inline constexpr size_t DAP_MAX_RESPONSE_SIZE = 2048;
 
 /**
  * 阻塞获取一条 DAP 命令的源。
  * @param buf     命令缓冲区（容量 buf_cap）
- * @param buf_cap 缓冲区容量（≥ DAP_PACKET_SIZE）
+ * @param buf_cap 缓冲区容量（≥ DAP_MAX_REQUEST_SIZE）
  * @param len     输出：命令字节数
  * @param arg     来源自定义上下文
  * @return true=取到命令；false=无命令（继续等待/重试）
@@ -39,9 +41,9 @@ using DapResponseSink = void (*)(const u8 *data, u16 len, void *arg);
 
 /**
  * 单次执行一条 DAP 命令（DAP_ExecuteCommand + 统一日志），返回响应长度。
- * @param request      原样命令字节流（≤ DAP_PACKET_SIZE）
+ * @param request      原样命令字节流（≤ DAP_MAX_REQUEST_SIZE）
  * @param req_len      命令长度（日志用；CMSIS-DAP 命令自描述）
- * @param response     响应缓冲区（容量 response_cap，≥ DAP_PACKET_SIZE）
+ * @param response     响应缓冲区（容量 response_cap，≥ DAP_MAX_RESPONSE_SIZE）
  * @param response_cap 响应缓冲区容量
  * @return 响应字节数；调用方负责按需截断/发送。
  */
@@ -56,7 +58,7 @@ u16 dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t respon
  * - USB 本地执行（命令来自 USB ringbuffer，响应 USB 写回，见 usb.cc）。
  *
  * 调用方负责以高优先级创建承载任务（SWD 位碰撞执行期间不可被抢占），
- * 并提供命令缓冲（容量 request_cap ≥ DAP_PACKET_SIZE）与响应缓冲
+ * 并提供命令缓冲（容量 request_cap ≥ DAP_MAX_REQUEST_SIZE）与响应缓冲
  * （容量 response_cap ≥ DAP_MAX_RESPONSE_SIZE）——缓冲放在调用方存储中
  * 而非本函数栈上（ESP-IDF 任务栈以字节计且有限）。
  *

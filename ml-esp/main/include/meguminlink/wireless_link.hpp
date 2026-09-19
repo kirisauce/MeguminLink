@@ -10,6 +10,7 @@
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
+#include <freertos/semphr.h> // SemaphoreHandle_t
 #include <freertos/task.h>
 
 #include <cstring> // memcpy（ReceivedPacket 拷贝）
@@ -21,13 +22,16 @@ inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xf
 
 /**
  * DapCommand/DapResponse 帧格式：[type:1B][len:2B 大端][data:len B]。
- * 数据段上限 = CMSIS-DAP 单包大小（DAP_PACKET_SIZE=64B，USB EP 64B 单次
- * 传输即一个请求/响应包）。0x7F 批量命令的超大响应由执行器丢弃
- * （见 dap_executor.cc），不走无线帧——因此 Packet 结构保持小巧，
- * 调用方可放心放在任务栈上。
+ * 数据段上限 = 无线单帧可承载的 DAP 命令/响应长度（1467B = ESP-NOW v2
+ * 单帧 1470B 减去帧头）。USB 侧命令按 DAP_PACKET_SIZE 分包到达，接收侧
+ * 由 dap_request_size() 重组为完整命令后再转发。
  */
 inline constexpr size_t DAP_FRAME_HEADER_SIZE = 3;
-inline constexpr size_t MAX_DAP_PAYLOAD_SIZE = DAP_MAX_REQUEST_SIZE; // 64B，见 dap_executor.hpp
+inline constexpr size_t MAX_DAP_PAYLOAD_SIZE = DAP_MAX_REQUEST_SIZE;
+
+/** 无线单帧数据段不得超过 ESP-NOW v2 的单帧上限 */
+static_assert(MAX_DAP_PAYLOAD_SIZE <= ESP_NOW_MAX_DATA_LEN_V2 - DAP_FRAME_HEADER_SIZE,
+              "DAP payload exceeds ESP-NOW v2 single-frame capacity");
 
 /**
  * UartData 帧格式与 DAP 帧一致：[type:1B][len:2B 大端][data:len B]。
@@ -57,9 +61,8 @@ struct PairingAccepted
 /**
  * DAP 命令/响应为"指针视图"：Packet 只是序列化包装层，不内嵌数据。
  * 发送时 data 指向调用方命令/响应缓冲；接收（反序列化）时由调用方提供
- * 存储（见 ReceivedPacket::storage），data 指向该存储。数据段上限
- * MAX_DAP_PAYLOAD_SIZE = DAP_PACKET_SIZE（64B，USB 单包），Packet 因此
- * 保持小巧，可放心放任务栈上。
+ * 存储，data 指向该存储。数据段上限 MAX_DAP_PAYLOAD_SIZE（1467B），
+ * Packet 自身因此保持小巧，可放心放任务栈上。
  */
 struct DapCommand
 {
@@ -172,8 +175,9 @@ struct ReceivedPacket
 {
     Packet packet;
     u8 src_mac[ESP_NOW_ETH_ALEN];
-    // 按最大的 payload 存储预留：UartData（200B）> DapCommand/DapResponse（64B）。
-    // UartData 在 recv_cb 内直通处理（不排队），storage 仅为反序列化中转。
+    // 入队路径的数据段存储：配对控制帧载荷最多 6B（MAC），按 UartData 上限
+    // 预留即可覆盖全部入队类型。DAP 命令/响应与 UartData 由 recv_cb 直通
+    // 处理（不排队），其反序列化落在调用方提供的大容量缓冲上。
     u8 storage[MAX_UART_PAYLOAD_SIZE];
 
     ReceivedPacket() = default;
@@ -281,7 +285,7 @@ class WirelessLink
      * 投递一条无线接收到的 DAP 命令给执行器（异步入队，立即返回）。
      * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
      * @param data    DAP 命令原样字节流
-     * @param len     命令长度（> DAP_PACKET_SIZE 时拒绝，与 USB 路径一致）
+     * @param len     命令长度（> MAX_DAP_PAYLOAD_SIZE 时拒绝）
      */
     esp_err_t dap_execute(const u8 *src_mac, const u8 *data, size_t len);
 
@@ -301,6 +305,11 @@ class WirelessLink
     static constexpr u8 CHANNEL = 10; // ESP-NOW 固定信道
 
     bool m_initialized = false;
+    /** 发送帧缓冲与互斥：DAP 帧可达 1470B，放栈上会超出发送方任务的栈 */
+    SemaphoreHandle_t m_tx_mutex = nullptr;
+    u8 m_tx_frame[DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE];
+    /** 接收帧反序列化存储：数据段可达 1467B，放栈上会吃掉回调任务的栈 */
+    u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE];
     /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
     QueueHandle_t m_dap_queue = nullptr;
     TaskHandle_t m_dap_task = nullptr;

@@ -9,6 +9,7 @@
 #include <array>
 
 #include "meguminlink/common.hpp"
+#include "meguminlink/dap_executor.hpp"
 #include "meguminlink/usb/usb_capability.hpp"
 #include "sdkconfig.h"
 
@@ -87,6 +88,13 @@ class CmsisDapUsb
      * 由 dap_task 顺序消费——DAP 执行器不可重入，命令必须串行执行。
      */
     RingbufHandle_t m_dap_command_buffer;
+
+    /**
+     * 跨 USB 包重组缓冲：一条命令可能大于单个 USB 包，接收回调按命令
+     * 自描述长度累积，攒够一条才入队。仅 TinyUSB 任务上下文读写。
+     */
+    u8 m_rx_accum[DAP_MAX_REQUEST_SIZE];
+    size_t m_rx_accum_len = 0;
 
   private:
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
