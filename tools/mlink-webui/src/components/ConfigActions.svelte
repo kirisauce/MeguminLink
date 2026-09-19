@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { MODE_LOCAL, MODE_NAMES, MODE_WIRELESS } from '../lib/protocol';
 	import type { MlinkSession } from '../lib/session.svelte';
+	import SegmentedControl from './SegmentedControl.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 
@@ -82,19 +83,7 @@
 </script>
 
 <section class="config-actions">
-	<div class="modes" role="group" aria-label="链路模式">
-		{#each modes as option (option.value)}
-			<button
-				type="button"
-				class="segment"
-				aria-pressed={mode === option.value}
-				disabled={busy}
-				onclick={() => setMode(option.value)}
-			>
-				{option.label}
-			</button>
-		{/each}
-	</div>
+	<SegmentedControl options={modes} value={mode} disabled={busy} label="链路模式" onchange={setMode} />
 
 	{#each actions as action (action.key)}
 		{#if confirming === action.key}
@@ -134,37 +123,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--md-sys-space-sm);
-	}
-
-	.modes {
-		display: flex;
-		gap: var(--md-sys-space-xs);
-		padding: var(--md-sys-space-xs);
-		border-radius: var(--md-sys-shape-corner-full);
-		background: var(--md-sys-color-surface-container);
-	}
-
-	.segment {
-		flex: 1;
-		padding: 0.35rem 0.75rem;
-		border: none;
-		border-radius: var(--md-sys-shape-corner-full);
-		background: transparent;
-		color: var(--md-sys-color-on-surface-variant);
-		font: inherit;
-		font-size: var(--md-sys-typescale-body-md);
-		cursor: pointer;
-	}
-
-	.segment[aria-pressed='true'] {
-		background: var(--md-sys-color-primary-container);
-		color: var(--md-sys-color-on-primary-container);
-		font-weight: 600;
-	}
-
-	.segment:disabled {
-		opacity: 0.45;
-		cursor: not-allowed;
 	}
 
 	.button {
