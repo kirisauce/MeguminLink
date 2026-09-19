@@ -77,18 +77,26 @@
 		return [xs, ...columns] as uPlot.AlignedData;
 	}
 
-	const dapData: uPlot.AlignedData = $derived(buildData(['dapReqBytes', 'dapRespBytes']));
-
-	const uartLabels: string[] = $derived(
-		wireless ? ['接收 (CDC)', '发送 (CDC)', '空口发送', '空口接收'] : ['接收', '发送']
-	);
-	const uartData: uPlot.AlignedData = $derived(
+	/**
+	 * 分量图：DAP 与串口桥各自的有效载荷。两条上行（DAP 请求、UART 接收）与
+	 * 两条下行（DAP 响应、UART 发送）方向一致，因此可以和下面那张空口总量图
+	 * 逐方向对照。
+	 */
+	const componentLabels: string[] = ['DAP 请求', 'DAP 响应', 'UART 接收', 'UART 发送'];
+	const componentData: uPlot.AlignedData = $derived(
 		buildData(
 			wireless
-				? ['uartWlRxBytes', 'uartWlTxBytes', 'wlTxBytes', 'wlRxBytes']
-				: ['uartRxBytes', 'uartTxBytes']
+				? ['dapReqBytes', 'dapRespBytes', 'uartWlRxBytes', 'uartWlTxBytes']
+				: ['dapReqBytes', 'dapRespBytes', 'uartRxBytes', 'uartTxBytes']
 		)
 	);
+
+	/**
+	 * 总量图：ESP-NOW 空口全量字节（含帧头与控制帧），逐方向恒 ≥ 上图的
+	 * 分量之和，差额即协议开销。仅无线模式有空口流量。
+	 */
+	const radioLabels: string[] = ['空口发送', '空口接收'];
+	const radioData: uPlot.AlignedData = $derived(buildData(['wlTxBytes', 'wlRxBytes']));
 </script>
 
 <div class="page">
@@ -124,17 +132,19 @@
 
 		<div class="charts">
 			<RateChart
-				title="USB-DAP 速率"
-				subtitle="最近 60 秒，纵轴固定 B/s"
-				labels={['请求', '响应']}
-				data={dapData}
+				title="流量 · 分量"
+				subtitle="DAP 与串口，最近 60 秒"
+				labels={componentLabels}
+				data={componentData}
 			/>
-			<RateChart
-				title={wireless ? 'UART 速率 · Wireless' : 'UART 速率 · Local'}
-				subtitle={wireless ? 'CDC ⇄ 无线桥与空口，最近 60 秒' : 'CDC ↔ 片上 UART，最近 60 秒'}
-				labels={uartLabels}
-				data={uartData}
-			/>
+			{#if wireless}
+				<RateChart
+					title="流量 · 总量（无线空口）"
+					subtitle="含帧头与控制帧，最近 60 秒"
+					labels={radioLabels}
+					data={radioData}
+				/>
+			{/if}
 		</div>
 
 		<section class="raw">

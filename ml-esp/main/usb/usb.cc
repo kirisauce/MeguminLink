@@ -453,6 +453,9 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
         if (ret == ESP_OK)
         {
             dap_send_response(source, dap_response, resp_len);
+            // 统计与本地执行路径同口径（只计已完成的一轮往返）。无线模式下命令
+            // 不在这里执行，响应宿（usb_resp_sink）不会被走过，因此在本分支补记。
+            app.config_channel().add_dap_command(*len, resp_len);
         }
         return false; // 无线路径已处理（或丢弃），无需执行
     }

@@ -31,7 +31,10 @@ namespace mlink
 class ConfigChannel
 {
   public:
-    /** DAP 本地执行路径：一条命令的请求/响应字节（usb.cc 的响应宿调用） */
+    /**
+     * 一条 DAP 命令的请求/响应字节。usb.cc 在两处调用，口径一致（只计已完成
+     * 的一轮往返）：本地执行路径的响应宿，以及无线转发路径转发成功之后。
+     */
     void add_dap_command(u16 request_bytes, u16 response_bytes);
 
     /** ESP-NOW 一帧交给驱动发送（wireless_link.cc 的 send 调用） */
