@@ -51,6 +51,14 @@ void ConfigChannel::add_uart_wireless_tx(u16 bytes)
     m_uart_wireless_tx_bytes = m_uart_wireless_tx_bytes + bytes;
 }
 
+void ConfigChannel::set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    m_uart_baud = baud;
+    m_uart_data_bits = data_bits;
+    m_uart_stop_bits = stop_bits;
+    m_uart_parity = parity;
+}
+
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
 
 static constexpr char TAG[] = "mlink::config_channel";
@@ -141,6 +149,11 @@ enum : u8
     TAG_UART_TX = 0x31,          // u32：Local 模式 UART → CDC 字节数
     TAG_UART_WIRELESS_RX = 0x32, // u32：Wireless 模式 CDC → 无线 字节数
     TAG_UART_WIRELESS_TX = 0x33, // u32：Wireless 模式 无线 → CDC 字节数
+    TAG_UART_HOST_OPEN = 0x34,   // u8：主机是否已打开 CDC 串口（DTR）
+    TAG_UART_BAUD = 0x35,        // u32：主机下发的波特率
+    TAG_UART_DATA_BITS = 0x36,   // u8：数据位 5-8
+    TAG_UART_STOP_BITS = 0x37,   // u8：停止位 0=1 1=1.5 2=2
+    TAG_UART_PARITY = 0x38,      // u8：校验 0=无 1=奇 2=偶 3=Mark 4=Space
     TAG_UPTIME = 0x40,           // u32：上电毫秒数（49.7 天回绕）
     TAG_FW_VERSION = 0x41,       // string：应用版本（esp_app_desc.version）
     TAG_CHIP_TARGET = 0x42,      // string：目标芯片（CONFIG_IDF_TARGET）
@@ -352,6 +365,18 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_UART_TX, m_uart_tx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_WIRELESS_RX, m_uart_wireless_rx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_WIRELESS_TX, m_uart_wireless_tx_bytes);
+
+    // 串口是否被主机打开：实时查 DTR（总线未就绪时为 false），不走缓存
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    const u8 uart_host_open = Application::get_instance().usb().uart_host_open() ? 1 : 0;
+#else
+    const u8 uart_host_open = 0; // 没有 CDC 接口：不存在主机串口
+#endif
+    p += tlv_u8(m_response + p, TAG_UART_HOST_OPEN, uart_host_open);
+    p += tlv_u32(m_response + p, TAG_UART_BAUD, m_uart_baud);
+    p += tlv_u8(m_response + p, TAG_UART_DATA_BITS, m_uart_data_bits);
+    p += tlv_u8(m_response + p, TAG_UART_STOP_BITS, m_uart_stop_bits);
+    p += tlv_u8(m_response + p, TAG_UART_PARITY, m_uart_parity);
     p += tlv_u32(m_response + p, TAG_UPTIME, static_cast<u32>(esp_timer_get_time() / 1000));
 
     return finish_response(cmd, seq, p);

@@ -49,14 +49,25 @@ class ConfigChannel
     /** Wireless 模式 UART 桥：无线 → CDC */
     void add_uart_wireless_tx(u16 bytes);
 
+    /**
+     * 主机下发的线编码（TinyUSB 的 LINE_CODING_CHANGED 回调）。
+     *
+     * 各参数按 CDC 原值记录，不做语义转换：stop_bits 0=1、1=1.5、2=2；
+     * parity 0=无、1=奇、2=偶、3=Mark、4=Space；data_bits 为 5-8。
+     * 串口是否被主机打开不在这里缓存，GetStats 时实时查 TinyUSB 的 DTR
+     * （见 CmsisDapUsb::uart_host_open），避免拔插后留下过期状态。
+     */
+    void set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
+
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     /**
      * EP0 厂商控制请求（bRequest = 0x4D）处理。
      *
      * 返回 true = 本模块接管该请求（协议栈不应再按 vendor 类分派）；
      * false = 不是本模块的请求，交回调用方（未识别的请求最终 STALL）。
-     * 请求一律 IN 方向、无 DATA OUT 阶段：命令码与参数都在 SETUP 包的
-     * wValue 里（低位命令码、高位参数），响应在 DATA IN 阶段回一帧。
+     * 读命令与动作命令为 IN 方向（命令码与参数在 wValue 里，响应在 DATA IN
+     * 阶段回一帧）；SetUsbConfig 是唯一的 OUT 命令（载荷在 DATA OUT 阶段收，
+     * 见 config_channel.cc 顶部协议注释）。
      */
     bool handle_control(u8 rhport, u8 stage, const tusb_control_request_t *request);
 
@@ -152,6 +163,13 @@ class ConfigChannel
     volatile u32 m_uart_tx_bytes = 0;
     volatile u32 m_uart_wireless_rx_bytes = 0;
     volatile u32 m_uart_wireless_tx_bytes = 0;
+
+    // 主机下发的线编码（CDC SET_LINE_CODING）。无回调时是桥接默认值 8N1，
+    // 与 uart_bridge_init 的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
+    volatile u32 m_uart_baud = CONFIG_MEGUMINLINK_UART_BRIDGE_BAUD_RATE;
+    volatile u8 m_uart_data_bits = 8;
+    volatile u8 m_uart_stop_bits = 0; // CDC_LINE_CODING_STOP_BITS_1
+    volatile u8 m_uart_parity = 0;    // CDC_LINE_CODING_PARITY_NONE
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     /** 响应缓冲必须常驻：tud_control_xfer 只保存指针，DATA 阶段仍会回读 */

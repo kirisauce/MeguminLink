@@ -108,6 +108,12 @@ class CmsisDapUsb
      */
     void set_uart_bridge_active(bool active);
 
+    /**
+     * 主机是否已打开 CDC ACM 串口（TinyUSB 的 DTR，且总线就绪）。
+     * 实时查询不缓存：拔插与重新枚举后不会留下过期的"已打开"。
+     */
+    bool uart_host_open() const;
+
   private:
 #endif
 

@@ -95,6 +95,17 @@ CONFIG_FIELDS = [
     (0x51, "peer_mac"),
 ]
 
+# CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
+# 打印顺序在计数器之后，老固件没有这些 tag 时整组跳过
+TAG_UART_HOST_OPEN = 0x34
+TAG_UART_BAUD = 0x35
+TAG_UART_DATA_BITS = 0x36
+TAG_UART_STOP_BITS = 0x37
+TAG_UART_PARITY = 0x38
+
+UART_STOP_BITS = {0: "1", 1: "1.5", 2: "2"}
+UART_PARITY = {0: "N", 1: "O", 2: "E", 3: "M", 4: "S"}
+
 MODE = {0: "local", 1: "wireless"}
 PAIR = {0: "idle", 1: "paired", 2: "pairing"}
 MODE_ARG = {"local": 0, "wireless": 1}
@@ -190,7 +201,27 @@ def render_stats(values):
         else:
             value = int.from_bytes(raw, "big")
         parts.append(f"{name}={value}")
+    parts.extend(render_uart_state(values))
     return " ".join(parts)
+
+
+def render_uart_state(values):
+    """CDC ACM 串口状态：主机是否打开、线编码（老固件不上报时整组跳过）。"""
+    if TAG_UART_HOST_OPEN not in values:
+        return []
+
+    def number(tag, default=0):
+        raw = values.get(tag)
+        return int.from_bytes(raw, "big") if raw else default
+
+    data_bits = number(TAG_UART_DATA_BITS, 8)
+    stop_bits = UART_STOP_BITS.get(number(TAG_UART_STOP_BITS), "?")
+    parity = UART_PARITY.get(number(TAG_UART_PARITY), "?")
+    return [
+        f"uart_open={'yes' if number(TAG_UART_HOST_OPEN) else 'no'}",
+        f"uart_baud={number(TAG_UART_BAUD)}",
+        f"uart_format={data_bits}{parity}{stop_bits}",
+    ]
 
 
 def render_config(values):

@@ -68,6 +68,10 @@ void uart_cdcacm_line_coding_callback(int interface, cdcacm_event_t *event)
     }
 
     auto &app = mlink::Application::get_instance();
+
+    // 线编码先记给状态显示，再按模式分流：Wireless 下主机改参数同样要反映出来
+    app.config_channel().set_uart_line_coding(lc->bit_rate, lc->data_bits, lc->stop_bits, lc->parity);
+
     if (app.mode() == mlink::Mode::Wireless)
     {
         // Wireless：线编码无线同步给目标侧 UART（PC 改参数 → C3 实时跟随）。
@@ -259,6 +263,13 @@ void CmsisDapUsb::uart_data_to_cdc(const u8 *data, size_t len)
         ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
     }
     Application::get_instance().config_channel().add_uart_wireless_tx(static_cast<u16>(queued));
+}
+
+bool CmsisDapUsb::uart_host_open() const
+{
+    // DTR 置位且总线就绪才算"主机打开了串口"：断开后 tud_ready() 为 false，
+    // 显示不会停在过期值上
+    return tud_cdc_n_connected(TINYUSB_CDC_ACM_0);
 }
 
 void CmsisDapUsb::set_uart_bridge_active(bool active)
