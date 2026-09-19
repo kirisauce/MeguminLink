@@ -15,6 +15,7 @@ import {
 	CMD_REBOOT,
 	CMD_RESET,
 	CMD_SET_MODE,
+	CMD_SET_WIFI_RATE,
 	MODE_WIRELESS,
 	PAIR_PAIRED,
 	PID,
@@ -322,6 +323,24 @@ export class MlinkSession {
 
 	async setMode(mode: number): Promise<void> {
 		await this.#sendCommand(CMD_SET_MODE, mode);
+	}
+
+	/**
+	 * 设置 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）。
+	 *
+	 * 设备端把档位应用到本地单播 peer，并把同一条控制请求转发给对端：两端跑
+	 * 同一档位，上行与下行的丢包率才可比；转发是尽力而为的，对端没跟上时
+	 * 重发一次即可。
+	 *
+	 * 回显值就地更新：命令返回 ok 即表示档位已被接受（取值域在设备端校验过、
+	 * 动作槽空闲），实际应用在设备主循环里，立刻重读配置可能读到应用前的旧值。
+	 * 配置快照在抽屉打开时会重新读，因此这里不额外对账。
+	 */
+	async setWifiRate(rate: number): Promise<void> {
+		await this.#sendCommand(CMD_SET_WIFI_RATE, rate);
+		if (this.commandError === null && this.config !== null) {
+			this.config = { ...this.config, wifiRate: rate };
+		}
 	}
 
 	async enterPairing(): Promise<void> {

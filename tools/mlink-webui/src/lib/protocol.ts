@@ -32,6 +32,7 @@ export const CMD_EXIT_PAIRING = 0x15;
 export const CMD_SET_USB_CONFIG = 0x16;
 export const CMD_APPLY_USB_CONFIG = 0x17;
 export const CMD_PING = 0x18;
+export const CMD_SET_WIFI_RATE = 0x19;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -55,12 +56,13 @@ export const MODE_WIRELESS = 1;
 /** Stats.pair 的取值：仅已配对时才有可探测的对端。 */
 export const PAIR_PAIRED = 1;
 
-/** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50/0x51 配置项。 */
+/** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50-0x52 配置项。 */
 const TAG_FW_VERSION = 0x41;
 const TAG_CHIP_TARGET = 0x42;
 const TAG_IDF_VERSION = 0x43;
 const TAG_CONFIG_MODE = 0x50;
 const TAG_CONFIG_PEER_MAC = 0x51;
+const TAG_CONFIG_WIFI_RATE = 0x52;
 
 /** CDC ACM 串口状态的 tag（0x30-0x33 是 UART 字节计数器，这里从 0x34 续编）。 */
 const TAG_UART_HOST_OPEN = 0x34;
@@ -154,10 +156,77 @@ export type StatField = {
 };
 
 /**
+ * ESP-NOW 发送速率档位的取值域（wifi_phy_rate_t 原值）与显示名。
+ *
+ * 档位越高越依赖信噪比，长帧的误帧率随之上升。本链路的实测吞吐与档位无关——
+ * 瓶颈是每条 DAP 命令的往返延迟（~15ms/条）而不是空口时间——所以高档位只
+ * 换来丢帧风险，没有换来速度。分组按调制族划分，组内按标称速率升序。
+ */
+export const WIFI_RATE_GROUPS: { group: string; rates: { value: number; label: string }[] }[] = [
+	{
+		group: '11b（CCK）',
+		rates: [
+			{ value: 0x00, label: '1 Mbps · 长前导' },
+			{ value: 0x01, label: '2 Mbps · 长前导' },
+			{ value: 0x02, label: '5.5 Mbps · 长前导' },
+			{ value: 0x03, label: '11 Mbps · 长前导' },
+			{ value: 0x05, label: '2 Mbps · 短前导' },
+			{ value: 0x06, label: '5.5 Mbps · 短前导' },
+			{ value: 0x07, label: '11 Mbps · 短前导' },
+		],
+	},
+	{
+		group: '11g（OFDM）',
+		rates: [
+			{ value: 0x0b, label: '6 Mbps' },
+			{ value: 0x0f, label: '9 Mbps' },
+			{ value: 0x0a, label: '12 Mbps' },
+			{ value: 0x0e, label: '18 Mbps' },
+			{ value: 0x09, label: '24 Mbps' },
+			{ value: 0x0d, label: '36 Mbps' },
+			{ value: 0x08, label: '48 Mbps' },
+			{ value: 0x0c, label: '54 Mbps' },
+		],
+	},
+	{
+		group: 'HT20 MCS（长保护间隔）',
+		rates: [
+			{ value: 0x10, label: 'MCS0 · 6.5 Mbps' },
+			{ value: 0x11, label: 'MCS1 · 13 Mbps' },
+			{ value: 0x12, label: 'MCS2 · 19.5 Mbps' },
+			{ value: 0x13, label: 'MCS3 · 26 Mbps' },
+			{ value: 0x14, label: 'MCS4 · 39 Mbps' },
+			{ value: 0x15, label: 'MCS5 · 52 Mbps' },
+			{ value: 0x16, label: 'MCS6 · 58.5 Mbps' },
+			{ value: 0x17, label: 'MCS7 · 65 Mbps' },
+		],
+	},
+	{
+		group: 'HT20 MCS（短保护间隔）',
+		rates: [
+			{ value: 0x18, label: 'MCS0 · 7.2 Mbps' },
+			{ value: 0x19, label: 'MCS1 · 14.4 Mbps' },
+			{ value: 0x1a, label: 'MCS2 · 21.7 Mbps' },
+			{ value: 0x1b, label: 'MCS3 · 28.9 Mbps' },
+			{ value: 0x1c, label: 'MCS4 · 43.3 Mbps' },
+			{ value: 0x1d, label: 'MCS5 · 57.8 Mbps' },
+			{ value: 0x1e, label: 'MCS6 · 65 Mbps' },
+			{ value: 0x1f, label: 'MCS7 · 72.2 Mbps（固件默认）' },
+		],
+	},
+];
+
+/** 档位原值 → 显示名；不在取值域内（旧固件或无值）时返回 null。 */
+export const WIFI_RATE_NAMES: ReadonlyMap<number, string> = new Map(
+	WIFI_RATE_GROUPS.flatMap(({ rates }) => rates.map(({ value, label }) => [value, label] as const))
+);
+
+/**
  * 设备身份与配置项快照（GetConfig）。
  *
  * mode 与 Stats.mode 同值域，peerMac 为小写冒号分隔的 6 字节 MAC，
- * 未配对时为 null。
+ * 未配对时为 null。wifiRate 是 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值），
+ * 不支持该配置的旧固件为 null。
  */
 export type DeviceConfig = {
 	fwVersion: string;
@@ -165,6 +234,7 @@ export type DeviceConfig = {
 	idfVersion: string;
 	mode: number;
 	peerMac: string | null;
+	wifiRate: number | null;
 };
 
 /**
@@ -324,6 +394,7 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		idfVersion: readText(tags.get(TAG_IDF_VERSION)),
 		mode: readValue(tags.get(TAG_CONFIG_MODE), false),
 		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
+		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
 	};
 }
 
