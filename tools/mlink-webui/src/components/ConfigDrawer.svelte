@@ -2,14 +2,18 @@
 	import { MODE_NAMES, PAIR_NAMES } from '../lib/protocol';
 	import type { MlinkSession } from '../lib/session.svelte';
 	import ConfigActions from './ConfigActions.svelte';
+	import UsbSettings from './UsbSettings.svelte';
 
 	let { session, open, onclose }: { session: MlinkSession; open: boolean; onclose: () => void } = $props();
 
 	let panel = $state<HTMLElement | null>(null);
 
-	// 身份与配置是低频变化：打开时刷新一次即可，不跟随 200ms 轮询
+	// 身份、配置与 USB 能力都是低频变化：打开时刷新一次即可，不跟随 200ms 轮询
 	$effect(() => {
-		if (open) void session.refreshConfig();
+		if (open) {
+			void session.refreshConfig();
+			void session.refreshUsbConfig();
+		}
 	});
 
 	// 打开后把焦点移进面板，键盘 Tab 从抽屉开始、Esc 随时可关
@@ -62,6 +66,8 @@
 			</div>
 		{/each}
 	</dl>
+
+	<UsbSettings {session} />
 
 	<ConfigActions {session} />
 </aside>

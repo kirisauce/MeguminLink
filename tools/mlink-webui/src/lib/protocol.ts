@@ -22,12 +22,15 @@ export const PID = 0x4020;
 export const VENDOR_CODE = 0x4d;
 export const CMD_GET_STATS = 0x01;
 export const CMD_GET_CONFIG = 0x02;
+export const CMD_GET_USB_CONFIG = 0x03;
 export const CMD_SET_MODE = 0x10;
 export const CMD_ENTER_PAIRING = 0x11;
 export const CMD_CLEAR_PAIR = 0x12;
 export const CMD_RESET = 0x13;
 export const CMD_REBOOT = 0x14;
 export const CMD_EXIT_PAIRING = 0x15;
+export const CMD_SET_USB_CONFIG = 0x16;
+export const CMD_APPLY_USB_CONFIG = 0x17;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -55,6 +58,29 @@ const TAG_CHIP_TARGET = 0x42;
 const TAG_IDF_VERSION = 0x43;
 const TAG_CONFIG_MODE = 0x50;
 const TAG_CONFIG_PEER_MAC = 0x51;
+
+/** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
+const TAG_USB_SUPPORTED = 0x60;
+const TAG_USB_WEBUSB = 0x61;
+const TAG_USB_WINUSB = 0x62;
+const TAG_USB_LANDING_PAGE = 0x63;
+const TAG_USB_DRAFT = 0x64;
+const TAG_USB_DRAFT_REASON = 0x65;
+
+/** 编译期支持的能力位（UsbConfig.supported）。 */
+export const USB_CAPABILITY_WEBUSB = 0x01;
+export const USB_CAPABILITY_WINUSB = 0x02;
+/** landing page 字符上限，与固件 usb_capability.hpp 一致。 */
+export const USB_LANDING_PAGE_MAX_LEN = 126;
+/** 草稿状态（UsbConfig.draft）：0 无草稿、1 合法待应用、2 被拒。 */
+export const USB_DRAFT_PENDING = 1;
+export const USB_DRAFT_REJECTED = 2;
+/** 被拒原因（UsbConfig.draftReason）的中文说明。 */
+export const USB_REJECT_TEXT: Readonly<Record<number, string>> = {
+	1: `URL 超过 ${USB_LANDING_PAGE_MAX_LEN} 字符`,
+	2: 'URL 只能包含可打印 ASCII 字符',
+	3: '该能力在当前固件里未编译进来',
+};
 
 /** 统计快照。计数器一律 u32 累计值，回绕由上层按 (cur - prev) >>> 0 处理。 */
 export type Stats = {
@@ -94,6 +120,29 @@ export type DeviceConfig = {
 	idfVersion: string;
 	mode: number;
 	peerMac: string | null;
+};
+
+/**
+ * USB 能力快照（GetUsbConfig）。
+ *
+ * supported 是编译期支持位（bit0 WebUSB / bit1 WinUSB）：未编译进来的能力在
+ * 界面上置灰。landingPage 为生效值（设备端已把空串解析成默认 URL），draft 为
+ * 草稿状态，draftReason 只在被拒时有值。
+ */
+export type UsbConfig = {
+	supported: number;
+	webusb: number;
+	winusb: number;
+	landingPage: string;
+	draft: number;
+	draftReason: number | null;
+};
+
+/** SetUsbConfig（0x16）提交的完整配置；landingPage 传空串表示回退默认值。 */
+export type UsbCapability = {
+	webusb: number;
+	winusb: number;
+	landingPage: string;
 };
 
 /** 字段顺序即 mlinkctl 的打印顺序。 */
@@ -209,6 +258,19 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 	};
 }
 
+export function decodeUsbConfig(frame: DataView): UsbConfig {
+	const tags = parseFrame(frame);
+	const reason = tags.get(TAG_USB_DRAFT_REASON);
+	return {
+		supported: readValue(tags.get(TAG_USB_SUPPORTED), false),
+		webusb: readValue(tags.get(TAG_USB_WEBUSB), false),
+		winusb: readValue(tags.get(TAG_USB_WINUSB), false),
+		landingPage: readText(tags.get(TAG_USB_LANDING_PAGE)),
+		draft: readValue(tags.get(TAG_USB_DRAFT), false),
+		draftReason: reason === undefined ? null : readValue(reason, false),
+	};
+}
+
 /**
  * 发一次厂商 IN 请求并取回响应帧。
  *
@@ -252,4 +314,77 @@ export async function readConfig(device: USBDevice, seq: number): Promise<Device
  */
 export async function runCommand(device: USBDevice, cmd: number, seq: number, arg = 0): Promise<void> {
 	parseFrame(await transferIn(device, cmd | (arg << 8), seq));
+}
+
+export async function readUsbConfig(device: USBDevice, seq: number): Promise<UsbConfig> {
+	return decodeUsbConfig(await transferIn(device, CMD_GET_USB_CONFIG, seq));
+}
+
+function encodeTlv(tag: number, value: Uint8Array): Uint8Array<ArrayBuffer> {
+	const header =
+		value.byteLength >= 0xff
+			? new Uint8Array([tag, 0xff, value.byteLength >> 8, value.byteLength & 0xff])
+			: new Uint8Array([tag, value.byteLength]);
+	const out = new Uint8Array(header.byteLength + value.byteLength);
+	out.set(header, 0);
+	out.set(value, header.byteLength);
+	return out;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
+	const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const part of parts) {
+		out.set(part, offset);
+		offset += part.byteLength;
+	}
+	return out;
+}
+
+/**
+ * landing page 的本地预校验：与固件同规则（长度 + 可打印 ASCII）。
+ * 返回 null 表示合法；空串合法（设备端会解析成编译期默认值）。
+ */
+export function landingPageError(url: string): string | null {
+	const bytes = new TextEncoder().encode(url);
+	if (bytes.byteLength > USB_LANDING_PAGE_MAX_LEN) return `URL 超过 ${USB_LANDING_PAGE_MAX_LEN} 字符`;
+	for (const byte of bytes) {
+		if (byte < 0x20 || byte > 0x7e) return 'URL 只能包含可打印 ASCII 字符';
+	}
+	return null;
+}
+
+/**
+ * 提交 USB 能力草稿（cmd 0x16，OUT 方向）。
+ *
+ * 载荷是全量三项的 TLV（WebUSB / WinUSB / landing page），设备端只校验并缓存，
+ * 不落盘不生效；结果用随后的 readUsbConfig 读草稿状态确认。
+ */
+export async function writeUsbConfig(device: USBDevice, seq: number, config: UsbCapability): Promise<void> {
+	const encoder = new TextEncoder();
+	const payload = concatBytes([
+		encodeTlv(TAG_USB_WEBUSB, new Uint8Array([config.webusb & 1])),
+		encodeTlv(TAG_USB_WINUSB, new Uint8Array([config.winusb & 1])),
+		encodeTlv(TAG_USB_LANDING_PAGE, encoder.encode(config.landingPage)),
+	]);
+
+	const result = await device.controlTransferOut(
+		{
+			requestType: 'vendor',
+			recipient: 'device',
+			request: VENDOR_CODE,
+			value: CMD_SET_USB_CONFIG,
+			index: seq & 0xff,
+		},
+		payload
+	);
+	if (result.status !== 'ok') {
+		throw new ProtocolError(`transfer ${result.status}`);
+	}
+}
+
+/** 应用草稿（cmd 0x17）：设备落盘、重建描述符并重新枚举 USB。 */
+export async function applyUsbConfig(device: USBDevice, seq: number): Promise<void> {
+	parseFrame(await transferIn(device, CMD_APPLY_USB_CONFIG, seq));
 }

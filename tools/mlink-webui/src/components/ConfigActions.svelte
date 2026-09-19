@@ -69,12 +69,12 @@
 		},
 		{
 			key: 'reset',
-			label: '恢复默认',
+			label: '恢复出厂设置',
 			danger: true,
 			disabled: pairing,
 			confirm: {
-				title: '恢复默认？',
-				message: '设备会清除配对记录与运行模式，重启后回到 local 模式。',
+				title: '恢复出厂设置？',
+				message: '设备会清除配对记录、运行模式与 USB 能力配置，并自动重启设备。',
 				confirmLabel: '恢复',
 			},
 			run: () => session.reset(),

@@ -36,9 +36,23 @@ bun run preview
 
 上半是设备身份与配置项：固件版本、芯片、ESP-IDF 版本、当前链路模式、配对状态、已配对对端 MAC。这些字段来自配置通道的 `GET_CONFIG`（cmd 0x02），打开抽屉时刷新一次——版本与配对是低频信息，不占用 200ms 轮询；设备身份读不到时（老固件没有该命令）显示「—」。
 
-下半是操作区：**链路模式**用分段控件切换 local / wireless（当前模式高亮），另有**触发重新配对**（仅 wireless 可用）、**清除配对记录**、**重启设备**、**恢复默认**。
+下半是操作区：**链路模式**用分段控件切换 local / wireless（当前模式高亮），另有**触发重新配对**（仅 wireless 可用）、**清除配对记录**、**重启设备**、**恢复出厂设置**。
 
-命令返回只代表设备已接受投递，真正的执行在设备主循环（模式与配对状态由 200ms 轮询跟上）；失败（设备忙 / 固件不支持 / 传输错误）在操作区行内提示，命令在途时全部按钮禁用。对应命令行工具是 `mlinkctl set-mode` / `pair` / `unpair` / `reset` / `reboot` / `exit-pair`。
+命令返回只代表设备已接受投递，真正的执行在设备主循环（模式与配对状态由 200ms 轮询跟上）；失败（设备忙 / 固件不支持 / 传输错误）在操作区行内提示，命令在途时全部禁用。对应命令行工具是 `mlinkctl set-mode` / `pair` / `unpair` / `reset` / `reboot` / `exit-pair`。
+
+### USB 接口
+
+配置抽屉中段是 **USB 接口**，对应配置通道的 `GET_USB_CONFIG`（cmd 0x03）/ `SET_USB_CONFIG`（0x16）/ `APPLY_USB_CONFIG`（0x17）：
+
+- **WebUSB 能力**：是否在 BOS 描述符里宣告 WebUSB 平台能力，并提供 landing page 提示
+- **WinUSB 自动识别驱动**：是否宣告 Microsoft OS 2.0 能力，让 Windows 自动给 CMSIS-DAP 接口绑定 winusb.sys（免装驱动）
+- **WebUSB landing page**：BOS 里 `iLandingPage` 与 `GET_URL` 响应的 URL，最多 126 字符、只能是可打印 ASCII；留空表示回退固件里的默认值
+
+三项是 **草稿式** 编辑：点「保存并重新枚举」后设备先接收并校验草稿，页面再读一次校验结果，通过才让设备落盘生效。生效需要重新枚举 USB（BOS 描述符只在枚举时被主机读取），所以设备会软断开再连回来，页面在此期间显示「设备正在重新枚举 USB」并自动接回，正在进行的 OpenOCD / pyOCD 调试会断开。
+
+两项能力的**编译期总开关**在固件的 `MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE` / `MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE`：没编译进来的能力在界面上置灰，设备端也会拒绝启用。Windows 上把 WinUSB 关掉后，已经绑定过 winusb.sys 的设备实例要「卸载设备」再重新插拔才会彻底解除绑定。
+
+对应命令行工具是 `mlinkctl usb`（读）与 `mlinkctl set-usb [--webusb on|off] [--winusb on|off] [--landing-page URL]`。
 
 ## 显示约定
 
