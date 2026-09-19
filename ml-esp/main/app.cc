@@ -368,6 +368,16 @@ void Application::consume_pending_action()
             ESP_LOGI(TAG, "EnterPairing ignored in local mode; switch to wireless first");
         }
         break;
+    case ConfigChannel::Action::ExitPairing:
+        if (m_mode == Mode::Wireless && m_pairing_active)
+        {
+            leave_pairing("config channel");
+        }
+        else
+        {
+            ESP_LOGI(TAG, "ExitPairing ignored: not pairing in wireless mode");
+        }
+        break;
     case ConfigChannel::Action::ClearPair:
         clear_pairing();
         break;

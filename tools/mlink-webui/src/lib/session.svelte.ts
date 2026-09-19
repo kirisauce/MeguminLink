@@ -11,6 +11,7 @@
 import {
 	CMD_CLEAR_PAIR,
 	CMD_ENTER_PAIRING,
+	CMD_EXIT_PAIRING,
 	CMD_REBOOT,
 	CMD_RESET,
 	CMD_SET_MODE,
@@ -217,6 +218,10 @@ export class MlinkSession {
 		await this.#sendCommand(CMD_ENTER_PAIRING);
 	}
 
+	async exitPairing(): Promise<void> {
+		await this.#sendCommand(CMD_EXIT_PAIRING);
+	}
+
 	async clearPair(): Promise<void> {
 		await this.#sendCommand(CMD_CLEAR_PAIR);
 	}
@@ -268,6 +273,11 @@ export class MlinkSession {
 			const previous = this.stats;
 			this.rates = previous === null ? null : computeRates(previous, stats);
 			this.stats = stats;
+			// 配对或模式跃迁说明配置也可能变了（建立/清除配对会改写 peer_mac，切模式
+			// 会改写持久化模式），此时重读一次 GetConfig；config 不跟随每帧轮询。
+			if (previous !== null && (previous.pair !== stats.pair || previous.mode !== stats.mode)) {
+				void this.refreshConfig();
+			}
 			this.error = null;
 			if (this.state !== 'streaming') this.state = 'streaming';
 			this.#appendSample();

@@ -7,6 +7,7 @@
     mlinkctl config              读设备信息与配置项（cmd 0x02 GET_CONFIG）
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl pair                进入配对流程（cmd 0x11）
+    mlinkctl exit-pair           退出配对流程（cmd 0x15）
     mlinkctl unpair              清除配对记录并重新配对（cmd 0x12）
     mlinkctl reset               清除配对与模式记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
@@ -47,6 +48,7 @@ CMD_ENTER_PAIRING = 0x11
 CMD_CLEAR_PAIR = 0x12
 CMD_RESET = 0x13
 CMD_REBOOT = 0x14
+CMD_EXIT_PAIRING = 0x15
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -95,6 +97,7 @@ MODE_ARG = {"local": 0, "wireless": 1}
 # 无参数动作命令：子命令 → (命令码, 帮助文本)
 ACTIONS = {
     "pair": (CMD_ENTER_PAIRING, "进入配对流程"),
+    "exit-pair": (CMD_EXIT_PAIRING, "退出配对流程"),
     "unpair": (CMD_CLEAR_PAIR, "清除配对记录并重新配对"),
     "reset": (CMD_RESET, "清除配对与模式记录后重启"),
     "reboot": (CMD_REBOOT, "重启设备"),

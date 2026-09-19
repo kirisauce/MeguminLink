@@ -9,6 +9,10 @@
 
 	const busy = $derived(session.commandPending || session.device === null);
 	const mode = $derived(session.stats?.mode ?? null);
+	/** 配对流程进行中（stats.pair == 2，见 protocol.ts 的 PAIR_NAMES）。 */
+	const pairing = $derived(session.stats?.pair === 2);
+	/** 无已配对设备：此时退出配对会被设备端立刻重新进入自动配对，置灰更诚实。 */
+	const unpaired = $derived((session.config?.peerMac ?? null) === null);
 
 	const modes = [
 		{ value: MODE_LOCAL, label: MODE_NAMES[MODE_LOCAL] },
@@ -25,22 +29,23 @@
 		run: () => Promise<void>;
 	};
 
-	// 触发配对在 Local 下设备端会忽略，直接置灰；破坏性动作走行内二次确认
+	// 配对中：配对按钮改语义为「退出配对」；清除记录与恢复默认禁用（避免配对
+	// 中途被打断），重启始终可用。触发配对在 Local 下设备端会忽略，直接置灰。
 	const actions: Action[] = $derived([
 		{
 			key: 'pair',
-			label: '触发重新配对',
+			label: pairing ? '退出配对' : '触发重新配对',
 			confirm: '',
 			danger: false,
-			disabled: mode !== MODE_WIRELESS,
-			run: () => session.enterPairing(),
+			disabled: pairing ? unpaired : mode !== MODE_WIRELESS,
+			run: () => (pairing ? session.exitPairing() : session.enterPairing()),
 		},
 		{
 			key: 'clear',
 			label: '清除配对记录',
 			confirm: '确认清除',
 			danger: true,
-			disabled: false,
+			disabled: pairing,
 			run: () => session.clearPair(),
 		},
 		{
@@ -56,7 +61,7 @@
 			label: '恢复默认',
 			confirm: '确认恢复',
 			danger: true,
-			disabled: false,
+			disabled: pairing,
 			run: () => session.reset(),
 		},
 	]);
@@ -76,7 +81,7 @@
 	}
 </script>
 
-<section class="actions">
+<section class="config-actions">
 	<div class="modes" role="group" aria-label="链路模式">
 		{#each modes as option (option.value)}
 			<button
@@ -125,7 +130,7 @@
 </section>
 
 <style>
-	.actions {
+	.config-actions {
 		display: flex;
 		flex-direction: column;
 		gap: var(--md-sys-space-sm);

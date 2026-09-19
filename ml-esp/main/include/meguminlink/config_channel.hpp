@@ -68,6 +68,7 @@ class ConfigChannel
         None,         // 空槽
         SetMode,      // arg: 0=Local 1=Wireless
         EnterPairing, // 进入配对流程（无线模式下有效）
+        ExitPairing,  // 退出配对流程（无线模式且配对进行中有效）
         ClearPair,    // 清除配对记录并进入配对流程
         Reset,        // 清除配对与模式记录后重启
         Reboot,       // 立即重启

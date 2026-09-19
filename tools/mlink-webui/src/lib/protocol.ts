@@ -27,6 +27,7 @@ export const CMD_ENTER_PAIRING = 0x11;
 export const CMD_CLEAR_PAIR = 0x12;
 export const CMD_RESET = 0x13;
 export const CMD_REBOOT = 0x14;
+export const CMD_EXIT_PAIRING = 0x15;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 

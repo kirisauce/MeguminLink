@@ -76,6 +76,7 @@ static constexpr char TAG[] = "mlink::config_channel";
 //   0x12 ClearPair    清除配对记录并进入配对流程
 //   0x13 Reset        清除配对与模式记录后重启
 //   0x14 Reboot       立即重启
+//   0x15 ExitPairing  退出配对流程（无线模式且配对进行中有效）
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
 namespace
@@ -93,6 +94,7 @@ enum class Cmd : u8
     ClearPair = 0x12,
     Reset = 0x13,
     Reboot = 0x14,
+    ExitPairing = 0x15,
 };
 
 enum class Status : u8
@@ -352,6 +354,9 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         break;
     case Cmd::Reboot:
         len = post_action_response(cmd, seq, Action::Reboot, 0);
+        break;
+    case Cmd::ExitPairing:
+        len = post_action_response(cmd, seq, Action::ExitPairing, 0);
         break;
     default:
         // 未定义的命令码：回带 UnknownCommand 状态的空帧（不回 STALL，
