@@ -99,7 +99,14 @@
 		font: inherit;
 		font-size: var(--md-sys-typescale-body-md);
 		cursor: pointer;
-		transition: color var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-enter);
+		transition:
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
+	}
+
+	/* 未选中项 hover 时垫一层 state layer；选中项的底色由指示器负责，不再叠 */
+	.segment:hover:not(:disabled):not([aria-pressed='true']) {
+		background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
 	}
 
 	.segment[aria-pressed='true'] {

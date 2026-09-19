@@ -121,12 +121,25 @@
 		background: transparent;
 		color: var(--md-sys-color-primary);
 		cursor: pointer;
+		transition:
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
+	}
+
+	.button:hover:not(:disabled) {
+		background: var(--md-sys-color-surface-container);
 	}
 
 	.button.filled {
 		border-color: transparent;
 		background: var(--md-sys-color-primary);
 		color: var(--md-sys-color-on-primary);
+	}
+
+	.button.filled:hover:not(:disabled) {
+		/* 填充按钮的 hover 是叠一层 state layer，而不是换成容器色（那会让白字看不清） */
+		background: color-mix(in srgb, var(--md-sys-color-primary) 92%, var(--md-sys-color-on-primary));
 	}
 
 	.button:disabled {

@@ -157,6 +157,14 @@
 		background: transparent;
 		color: var(--md-sys-color-on-surface);
 		cursor: pointer;
+		transition:
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
+	}
+
+	.button:hover:not(:disabled) {
+		background: var(--md-sys-color-surface-container);
 	}
 
 	.button:disabled {
@@ -167,6 +175,10 @@
 	.button.danger {
 		border-color: var(--md-sys-color-error);
 		color: var(--md-sys-color-error);
+	}
+
+	.button.danger:hover:not(:disabled) {
+		background: var(--md-sys-color-error-container);
 	}
 
 	.error {

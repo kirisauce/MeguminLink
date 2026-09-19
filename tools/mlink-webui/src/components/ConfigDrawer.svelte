@@ -146,6 +146,9 @@
 		background: transparent;
 		color: var(--md-sys-color-on-surface-variant);
 		cursor: pointer;
+		transition:
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
 	}
 
 	.close:hover {

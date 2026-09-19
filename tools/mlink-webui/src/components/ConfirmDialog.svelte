@@ -183,9 +183,13 @@
 		background: transparent;
 		color: var(--md-sys-color-primary);
 		cursor: pointer;
+		transition:
+			background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
+			color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
 	}
 
-	.button:hover {
+	.button:hover:not(:disabled) {
 		background: var(--md-sys-color-surface-container);
 	}
 
@@ -194,8 +198,18 @@
 		color: var(--md-sys-color-on-primary);
 	}
 
+	/* 填充按钮的 hover 叠一层 state layer；选择器要压过上面的通用 hover，
+	   否则背景会被换成容器色，白字直接读不出来 */
+	.button.confirm:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--md-sys-color-primary) 92%, var(--md-sys-color-on-primary));
+	}
+
 	.danger .confirm {
 		background: var(--md-sys-color-error);
 		color: var(--md-sys-color-on-error);
+	}
+
+	.danger .button.confirm:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--md-sys-color-error) 92%, var(--md-sys-color-on-error));
 	}
 </style>
