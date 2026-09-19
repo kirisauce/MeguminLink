@@ -1,12 +1,10 @@
 <script lang="ts">
 	import { MODE_LOCAL, MODE_NAMES, MODE_WIRELESS } from '../lib/protocol';
 	import type { MlinkSession } from '../lib/session.svelte';
+	import ConfirmDialog from './ConfirmDialog.svelte';
 	import SegmentedControl from './SegmentedControl.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
-
-	/** 处于行内确认态的破坏性动作；null 表示当前没有待确认项。 */
-	let confirming = $state<string | null>(null);
 
 	const busy = $derived(session.commandPending || session.device === null);
 	const mode = $derived(session.stats?.mode ?? null);
@@ -20,13 +18,17 @@
 		{ value: MODE_WIRELESS, label: MODE_NAMES[MODE_WIRELESS] },
 	];
 
+	type Confirmation = { title: string; message: string; confirmLabel: string };
+	/** 弹窗内容 + 配色：关闭动画期间仍需显示，因此与「待确认哪个动作」分开存。 */
+	type DialogContent = Confirmation & { danger: boolean };
+
 	type Action = {
 		key: string;
 		label: string;
-		/** 确认态下按钮上的文字，只对破坏性动作用得上。 */
-		confirm: string;
 		danger: boolean;
 		disabled: boolean;
+		/** 需要二次确认的动作给出弹窗文案；为 null 表示点了直接下发。 */
+		confirm: Confirmation | null;
 		run: () => Promise<void>;
 	};
 
@@ -36,48 +38,75 @@
 		{
 			key: 'pair',
 			label: pairing ? '退出配对' : '触发重新配对',
-			confirm: '',
 			danger: false,
 			disabled: pairing ? unpaired : mode !== MODE_WIRELESS,
+			confirm: null,
 			run: () => (pairing ? session.exitPairing() : session.enterPairing()),
 		},
 		{
 			key: 'clear',
 			label: '清除配对记录',
-			confirm: '确认清除',
 			danger: true,
 			disabled: pairing,
+			confirm: {
+				title: '清除配对记录？',
+				message: '设备会删掉已保存的对端 MAC，随后重新进入配对流程。',
+				confirmLabel: '清除',
+			},
 			run: () => session.clearPair(),
 		},
 		{
 			key: 'reboot',
 			label: '重启设备',
-			confirm: '确认重启',
 			danger: true,
 			disabled: false,
+			confirm: {
+				title: '重启设备？',
+				message: '设备会立即重启，页面短暂断开后自动接回。',
+				confirmLabel: '重启',
+			},
 			run: () => session.reboot(),
 		},
 		{
 			key: 'reset',
 			label: '恢复默认',
-			confirm: '确认恢复',
 			danger: true,
 			disabled: pairing,
+			confirm: {
+				title: '恢复默认？',
+				message: '设备会清除配对记录与运行模式，重启后回到 local 模式。',
+				confirmLabel: '恢复',
+			},
 			run: () => session.reset(),
 		},
 	]);
 
+	/** 待确认动作的 key（actions 每次重算都会重建对象，只能靠 key 找回）；null = 弹窗关闭。 */
+	let pendingKey = $state<string | null>(null);
+	/** 弹窗内容缓存：关闭时不清空，否则退场动画期间标题正文会是空的；下次打开覆盖。 */
+	let confirmation = $state<DialogContent | null>(null);
+
 	function activate(action: Action): void {
-		if (action.danger && confirming !== action.key) {
-			confirming = action.key; // 破坏性动作先落到确认态，不直接下发
+		if (action.confirm === null) {
+			void action.run();
 			return;
 		}
-		confirming = null;
-		void action.run();
+		confirmation = { ...action.confirm, danger: action.danger };
+		pendingKey = action.key;
+	}
+
+	function confirmPending(): void {
+		const action = actions.find((item) => item.key === pendingKey);
+		pendingKey = null;
+		if (action !== undefined) void action.run();
+	}
+
+	function dismiss(): void {
+		pendingKey = null;
 	}
 
 	function setMode(value: number): void {
-		confirming = null;
+		dismiss();
 		void session.setMode(value);
 	}
 </script>
@@ -86,37 +115,31 @@
 	<SegmentedControl options={modes} value={mode} disabled={busy} label="链路模式" onchange={setMode} />
 
 	{#each actions as action (action.key)}
-		{#if confirming === action.key}
-			<div class="confirm">
-				<button
-					type="button"
-					class="button danger filled"
-					disabled={busy}
-					onclick={() => activate(action)}
-				>
-					{action.confirm}
-				</button>
-				<button type="button" class="button" disabled={busy} onclick={() => (confirming = null)}>
-					取消
-				</button>
-			</div>
-		{:else}
-			<button
-				type="button"
-				class="button"
-				class:danger={action.danger}
-				disabled={busy || action.disabled}
-				onclick={() => activate(action)}
-			>
-				{action.label}
-			</button>
-		{/if}
+		<button
+			type="button"
+			class="button"
+			class:danger={action.danger}
+			disabled={busy || action.disabled}
+			onclick={() => activate(action)}
+		>
+			{action.label}
+		</button>
 	{/each}
 
 	{#if session.commandError !== null}
 		<p class="error">{session.commandError}</p>
 	{/if}
 </section>
+
+<ConfirmDialog
+	open={pendingKey !== null}
+	title={confirmation?.title ?? ''}
+	message={confirmation?.message ?? ''}
+	confirmLabel={confirmation?.confirmLabel ?? '确认'}
+	danger={confirmation?.danger ?? false}
+	onconfirm={confirmPending}
+	ondismiss={dismiss}
+/>
 
 <style>
 	.config-actions {
@@ -144,21 +167,6 @@
 	.button.danger {
 		border-color: var(--md-sys-color-error);
 		color: var(--md-sys-color-error);
-	}
-
-	.button.danger.filled {
-		border-color: transparent;
-		background: var(--md-sys-color-error);
-		color: var(--md-sys-color-on-error);
-	}
-
-	.confirm {
-		display: flex;
-		gap: var(--md-sys-space-sm);
-	}
-
-	.confirm .button:first-child {
-		flex: 1;
 	}
 
 	.error {

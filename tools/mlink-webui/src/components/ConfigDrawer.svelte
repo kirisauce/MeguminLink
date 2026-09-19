@@ -37,7 +37,7 @@
 <svelte:window onkeydown={onkeydown} />
 
 <!-- 常驻 DOM：class 切换驱动进出 transition，关闭态由 visibility + inert 兜住交互 -->
-<button class="scrim" class:open type="button" aria-label="关闭配置面板" onclick={onclose}></button>
+<button class="scrim" class:open type="button" tabindex="-1" aria-label="关闭配置面板" onclick={onclose}></button>
 
 <aside
 	class="drawer"
