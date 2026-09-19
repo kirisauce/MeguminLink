@@ -98,6 +98,21 @@ struct UartLineCoding
     u8 stop_bits; /**< CDC 枚举：0=1, 1=1.5, 2=2 */
     u8 parity;    /**< CDC 枚举：0=None, 1=Odd, 2=Even, 3=Mark, 4=Space */
 };
+
+/**
+ * 对端存活探测帧（Ping 与 Pong 同构）。token 由探测方生成、对端原样回显：
+ * 探测方据此把迟到的回显（上一轮已判超时之后才到达）与本轮区分开，避免把
+ * 陈旧往返算进当前 RTT。
+ */
+struct Ping
+{
+    u32 token;
+};
+
+struct Pong
+{
+    u32 token;
+};
 } // namespace payload
 
 enum class PacketType
@@ -109,6 +124,8 @@ enum class PacketType
     DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
     UartData,        /** 无线转发的串口数据载荷（PC↔目标 UART 双向，尽力而为） */
     UartLineCoding,  /** 无线同步的 UART 线编码载荷（PC 端 SET_LINE_CODING → 目标侧） */
+    Ping,            /** 对端存活探测（定向单播给已配对 peer，对端回 Pong） */
+    Pong,            /** 存活探测回显（token 原样带回，探测方据此结算 RTT） */
 };
 
 union PacketPayload {
@@ -119,6 +136,8 @@ union PacketPayload {
     payload::DapResponse dap_response;
     payload::UartData uart_data;
     payload::UartLineCoding uart_line_coding;
+    payload::Ping ping;
+    payload::Pong pong;
 };
 
 class Packet
@@ -231,6 +250,14 @@ class WirelessLink
      * 参数为 CDC 枚举原值（见 payload::UartLineCoding），目标侧翻译应用。
      */
     esp_err_t send_uart_line_coding(const u8 *dest_mac, u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
+
+    /**
+     * 打包一条存活探测帧并发送给已配对 peer（Ping/Pong 同构，token 由探测方
+     * 生成、对端原样回显）。发送在调用方任务上下文完成（主循环），不在 ESP-NOW
+     * 接收回调里回包——回调要短且不可重入驱动。
+     */
+    esp_err_t send_ping(const u8 *dest_mac, u32 token);
+    esp_err_t send_pong(const u8 *dest_mac, u32 token);
 
     /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。

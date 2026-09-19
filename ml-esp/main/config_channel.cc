@@ -5,6 +5,7 @@
 
 #include <esp_app_desc.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_timer.h>
 #include <sdkconfig.h>
 
@@ -12,6 +13,8 @@
 #include <cstring>
 
 using namespace mlink;
+
+static constexpr char TAG[] = "mlink::config_channel";
 
 void ConfigChannel::add_dap_command(u16 request_bytes, u16 response_bytes)
 {
@@ -59,9 +62,107 @@ void ConfigChannel::set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u
     m_uart_parity = parity;
 }
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
+void ConfigChannel::start_ping()
+{
+    u32 token = 0;
+    portENTER_CRITICAL(&m_ping_lock);
+    if (m_ping_pending)
+    {
+        portEXIT_CRITICAL(&m_ping_lock);
+        return; // 上一轮还没结算：不再叠加请求（迟到回显由 token 校验挡掉）
+    }
+    m_ping_pending = true;
+    token = ++m_ping_token;
+    m_ping_sent_us = esp_timer_get_time();
+    m_ping_deadline_us = m_ping_sent_us + static_cast<i64>(CONFIG_MEGUMINLINK_PING_TIMEOUT_MS) * 1000;
+    portEXIT_CRITICAL(&m_ping_lock);
 
-static constexpr char TAG[] = "mlink::config_channel";
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (!peer_mac_load(peer_mac))
+    {
+        // 无配对记录：没有可探测的对端，直接判离线，不必等满超时窗口
+        finish_ping(false, 0);
+        return;
+    }
+
+    const esp_err_t ret = Application::get_instance().wireless_link().send_ping(peer_mac, token);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to send ping to " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
+        finish_ping(false, 0);
+    }
+}
+
+void ConfigChannel::finish_ping(bool online, u32 rtt_us)
+{
+    portENTER_CRITICAL(&m_ping_lock);
+    m_ping_pending = false;
+    m_ping_online = online ? 1 : 2;
+    if (online)
+    {
+        m_ping_rtt_us = rtt_us;
+        m_ping_ok = m_ping_ok + 1;
+    }
+    else
+    {
+        m_ping_fail = m_ping_fail + 1;
+    }
+    portEXIT_CRITICAL(&m_ping_lock);
+}
+
+void ConfigChannel::on_pong(const u8 *src_mac, u32 token)
+{
+    // 只认已配对对端的回显：广播地址常驻 peer 表，其他设备的帧同样能到达
+    // 本机，来源与 token 双重校验后才算本轮结果
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (!peer_mac_load(peer_mac) || std::memcmp(peer_mac, src_mac, ESP_NOW_ETH_ALEN) != 0)
+    {
+        return;
+    }
+
+    bool matched = false;
+    u32 rtt_us = 0;
+    portENTER_CRITICAL(&m_ping_lock);
+    if (m_ping_pending && token == m_ping_token)
+    {
+        rtt_us = static_cast<u32>(esp_timer_get_time() - m_ping_sent_us);
+        matched = true;
+    }
+    portEXIT_CRITICAL(&m_ping_lock);
+
+    if (matched)
+    {
+        finish_ping(true, rtt_us);
+    }
+}
+
+void ConfigChannel::poll_ping_timeout()
+{
+    // 唯一职责是结算超时：回显没在窗口内到达即判离线（同一轮只结算一次）。
+    // 探测的发起时机由上位机掌握，设备不自主发帧，没有上位机时链路静默。
+    bool expired = false;
+    portENTER_CRITICAL(&m_ping_lock);
+    expired = m_ping_pending && esp_timer_get_time() >= m_ping_deadline_us;
+    portEXIT_CRITICAL(&m_ping_lock);
+    if (expired)
+    {
+        finish_ping(false, 0);
+    }
+}
+
+ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
+{
+    PingSnapshot snapshot = {};
+    portENTER_CRITICAL(&m_ping_lock);
+    snapshot.online = m_ping_online;
+    snapshot.rtt_us = m_ping_rtt_us;
+    snapshot.ok = m_ping_ok;
+    snapshot.fail = m_ping_fail;
+    portEXIT_CRITICAL(&m_ping_lock);
+    return snapshot;
+}
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
 
 // ---- 协议（固件与上位机的唯一契约，上位机见 tools/mlinkctl.py 与
 //      tools/mlink-webui/src/lib/protocol.ts）----
@@ -94,6 +195,7 @@ static constexpr char TAG[] = "mlink::config_channel";
 //   0x15 ExitPairing    退出配对流程（无线模式且配对进行中有效）
 //   0x16 SetUsbConfig   OUT：提交 USB 能力草稿，只校验不落盘不生效
 //   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
+//   0x18 Ping           探测已配对对端（存活与往返时延，结果走 GetStats）
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
 //
@@ -121,6 +223,7 @@ enum class Cmd : u8
     ExitPairing = 0x15,
     SetUsbConfig = 0x16,
     ApplyUsbConfig = 0x17,
+    Ping = 0x18,
 };
 
 enum class Status : u8
@@ -145,6 +248,10 @@ enum : u8
     TAG_DAP_RESPONSE = 0x12,     // u32：DAP 响应字节数
     TAG_WIRELESS_TX = 0x20,      // u32：ESP-NOW 发送帧字节数
     TAG_WIRELESS_RX = 0x21,      // u32：ESP-NOW 接收帧字节数
+    TAG_PEER_ONLINE = 0x22,      // u8：对端存活 0=从未探测 1=在线 2=离线
+    TAG_PING_RTT = 0x23,         // u32：最近一次成功往返（微秒）
+    TAG_PING_OK = 0x24,          // u32：累计探测成功次数
+    TAG_PING_FAIL = 0x25,        // u32：累计探测失败次数
     TAG_UART_RX = 0x30,          // u32：Local 模式 CDC → UART 字节数
     TAG_UART_TX = 0x31,          // u32：Local 模式 UART → CDC 字节数
     TAG_UART_WIRELESS_RX = 0x32, // u32：Wireless 模式 CDC → 无线 字节数
@@ -361,6 +468,14 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, m_dap_response_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_TX, m_wireless_tx_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_RX, m_wireless_rx_bytes);
+
+    // 对端存活探测结果：online 是最近一次的结论，ok/fail 是累计计数（上位机
+    // 对两次快照差分即可知道"刚下发的那次探测"是成功还是失败）
+    const PingSnapshot ping = ping_snapshot();
+    p += tlv_u8(m_response + p, TAG_PEER_ONLINE, ping.online);
+    p += tlv_u32(m_response + p, TAG_PING_RTT, ping.rtt_us);
+    p += tlv_u32(m_response + p, TAG_PING_OK, ping.ok);
+    p += tlv_u32(m_response + p, TAG_PING_FAIL, ping.fail);
     p += tlv_u32(m_response + p, TAG_UART_RX, m_uart_rx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_TX, m_uart_tx_bytes);
     p += tlv_u32(m_response + p, TAG_UART_WIRELESS_RX, m_uart_wireless_rx_bytes);
@@ -622,6 +737,9 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         break;
     case Cmd::ExitPairing:
         len = post_action_response(cmd, seq, Action::ExitPairing, 0);
+        break;
+    case Cmd::Ping:
+        len = post_action_response(cmd, seq, Action::Ping, 0);
         break;
     case Cmd::SetUsbConfig:
         // OUT 命令出现在 IN 方向：命令码有效但方向不对，按未识别命令处理

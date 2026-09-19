@@ -180,6 +180,17 @@ config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
         PC-side debugger (pyOCD/OpenOCD) will see a command timeout and
         retry on its own.
 
+config MEGUMINLINK_PING_TIMEOUT_MS
+    int "Paired peer ping timeout (ms)"
+    default 500
+    range 10 5000
+    help
+        How long the device waits for the pong of a host-initiated probe
+        before reporting the peer offline. Probes are always triggered by
+        the host (WebUI polling or mlinkctl ping), never by the device on
+        its own; a missing pong only marks the link as unreachable, the
+        pairing record is kept and the next probe is judged from scratch.
+
 endmenu
 
 config MEGUMINLINK_MODE_SWITCH_ENABLE

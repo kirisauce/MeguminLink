@@ -359,6 +359,22 @@ esp_err_t WirelessLink::send_uart_line_coding(const u8 *dest_mac, u32 baud, u8 d
     return send(dest_mac, packet);
 }
 
+esp_err_t WirelessLink::send_ping(const u8 *dest_mac, u32 token)
+{
+    Packet packet;
+    packet.packet_type = PacketType::Ping;
+    packet.payload.ping.token = token;
+    return send(dest_mac, packet);
+}
+
+esp_err_t WirelessLink::send_pong(const u8 *dest_mac, u32 token)
+{
+    Packet packet;
+    packet.packet_type = PacketType::Pong;
+    packet.payload.pong.token = token;
+    return send(dest_mac, packet);
+}
+
 esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len)
 {
     u8 peer_mac[ESP_NOW_ETH_ALEN];
@@ -516,6 +532,11 @@ size_t Packet::serialized_size() const
         // 帧头 3B + 数据段 7B（baud 4B + 3 个 1B）
         return UART_FRAME_HEADER_SIZE + 7;
     }
+    case PacketType::Ping:
+    case PacketType::Pong: {
+        // 帧头 3B + 数据段 4B（token）
+        return UART_FRAME_HEADER_SIZE + 4;
+    }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
@@ -602,6 +623,23 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.parity = p.read_u8();
         break;
     }
+    case PacketType::Ping: {
+        // 数据段固定 4B：token
+        auto &content = payload.ping;
+        MLINK_CHECK_SIZE(p, 2);
+        (void)p.read_u16(); // len（防御性读取并忽略，固定 4B）
+        MLINK_CHECK_SIZE(p, 4);
+        content.token = p.read_u32();
+        break;
+    }
+    case PacketType::Pong: {
+        auto &content = payload.pong;
+        MLINK_CHECK_SIZE(p, 2);
+        (void)p.read_u16(); // len（防御性读取并忽略，固定 4B）
+        MLINK_CHECK_SIZE(p, 4);
+        content.token = p.read_u32();
+        break;
+    }
     default: {
         break;
     }
@@ -677,6 +715,20 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_u8(content.data_bits);
         s.write_u8(content.stop_bits);
         s.write_u8(content.parity);
+        break;
+    }
+    case PacketType::Ping: {
+        auto &content = payload.ping;
+        MLINK_CHECK_SIZE(s, 2 + 4);
+        s.write_u16(4);
+        s.write_u32(content.token);
+        break;
+    }
+    case PacketType::Pong: {
+        auto &content = payload.pong;
+        MLINK_CHECK_SIZE(s, 2 + 4);
+        s.write_u16(4);
+        s.write_u32(content.token);
         break;
     }
     default: {

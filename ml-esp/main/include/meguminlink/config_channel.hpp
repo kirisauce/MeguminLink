@@ -5,8 +5,10 @@
 #include "meguminlink/common.hpp"
 #include "sdkconfig.h"
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
+// 存活探测状态用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
 #include "meguminlink/usb/usb_capability.hpp"
 #include <tusb.h> // tusb_control_request_t（EP0 厂商请求处理）
 #endif
@@ -59,6 +61,47 @@ class ConfigChannel
      */
     void set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
+    /**
+     * 对端存活探测（Ping/Pong 空口往返，见 wireless_link.hpp 的 payload::Ping）。
+     *
+     * 探测由上位机定时下发（EP0 命令 0x18；WebUI 在轮询里按固定间隔发、CLI 用
+     * ping 子命令发），设备不自主发起：没有上位机时链路保持静默。设备侧负责
+     * 回应、测量与结论——收到 Ping 回 Pong（主循环分派），本机收到 Pong 时结算
+     * 往返时延，超过超时窗口未收到则判离线。结果由 GetStats 的 peer_online /
+     * ping_rtt_us / ping_ok / ping_fail 上报（上位机见 tools/mlinkctl.py 与
+     * tools/mlink-webui/src/lib/protocol.ts）。
+     *
+     * 收发都在主循环任务上下文：ESP-NOW 接收回调只投递、不回包（回调要短且
+     * 不可重入驱动），代价是往返时延里含一次主循环调度（空闲时 <1ms）。
+     * 探测状态机在两种目标上都编译——USB 侧（S3）是被探测方也是观察者，无 USB
+     * 侧（C3）同样应答，双方行为对称，不为省一帧引入按目标裁剪的分叉。
+     */
+    struct PingSnapshot
+    {
+        u8 online;  /**< 0=从未探测 1=最近一次在线 2=最近一次离线 */
+        u32 rtt_us; /**< 最近一次成功往返（微秒；从未成功时为 0） */
+        u32 ok;     /**< 累计成功次数 */
+        u32 fail;   /**< 累计失败次数（超时 / 未配对 / 发送失败） */
+    };
+
+    /**
+     * 发起一次探测（上位机下发的 0x18 动作调用）。
+     * 已有在途探测时忽略：上一次还没结算就不再叠加请求。
+     */
+    void start_ping();
+
+    /**
+     * 收到 Pong 帧（主循环分派）时的结算：来源 MAC 与回显 token 双重校验，
+     * 只有本轮在途探测的回显才算数（迟到的旧回显直接丢弃）。
+     */
+    void on_pong(const u8 *src_mac, u32 token);
+
+    /**
+     * 主循环每拍调用：结算超过超时窗口的在途探测（判离线并累计 fail）。
+     * 探测的发起不在这里——时机由上位机决定。
+     */
+    void poll_ping_timeout();
+
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     /**
      * EP0 厂商控制请求（bRequest = 0x4D）处理。
@@ -85,6 +128,7 @@ class ConfigChannel
         Reset,          // 恢复出厂设置：清除配对、模式与 USB 能力记录后重启
         Reboot,         // 立即重启
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
+        Ping,           // 立即探测已配对对端（存活与往返时延）
     };
 
     /**
@@ -151,6 +195,12 @@ class ConfigChannel
     bool has_valid_usb_draft() const;
 #endif
 
+    /** 结算一次探测：`m_ping_pending` 复位、结论与累计计数落库 */
+    void finish_ping(bool online, u32 rtt_us);
+
+    /** 读一次探测结果快照（组装 GetStats 响应时调用） */
+    PingSnapshot ping_snapshot() const;
+
     // 写入端各在自己的任务上下文串行（DAP 任务 / esp_wifi 任务 / 桥任务），
     // 读取端只有 EP0 请求处理，无需临界区。
     volatile u32 m_dap_cmds = 0;
@@ -170,6 +220,21 @@ class ConfigChannel
     volatile u8 m_uart_data_bits = 8;
     volatile u8 m_uart_stop_bits = 0; // CDC_LINE_CODING_STOP_BITS_1
     volatile u8 m_uart_parity = 0;    // CDC_LINE_CODING_PARITY_NONE
+
+    /**
+     * 存活探测状态：主循环发起/结算、收到 Pong 时校验，EP0 只读快照，
+     * 三处并发，统一由 m_ping_lock 保护。token 单调递增，回显必须匹配
+     * 当前在途 token，避免把上一轮超时后才到达的回显算成本轮结果。
+     */
+    mutable portMUX_TYPE m_ping_lock = portMUX_INITIALIZER_UNLOCKED;
+    bool m_ping_pending = false;
+    u32 m_ping_token = 0;
+    i64 m_ping_sent_us = 0;     /**< 本轮发送时刻（esp_timer 微秒） */
+    i64 m_ping_deadline_us = 0; /**< 本轮判定离线的截止时刻 */
+    u8 m_ping_online = 0;       /**< PingSnapshot::online */
+    u32 m_ping_rtt_us = 0;
+    u32 m_ping_ok = 0;
+    u32 m_ping_fail = 0;
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     /** 响应缓冲必须常驻：tud_control_xfer 只保存指针，DATA 阶段仍会回读 */

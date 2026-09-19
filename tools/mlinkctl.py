@@ -10,6 +10,7 @@
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl pair                进入配对流程（cmd 0x11）
     mlinkctl exit-pair           退出配对流程（cmd 0x15）
+    mlinkctl ping [-c N]         探测已配对对端：ESP-NOW 往返时延（cmd 0x18）
     mlinkctl unpair              清除配对记录并重新配对（cmd 0x12）
     mlinkctl reset               恢复出厂设置：清除配对、模式与 USB 能力记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
@@ -20,6 +21,9 @@
 
     watch -n 0.2 -d mlinkctl
     while :; do mlinkctl; sleep 0.2; done
+
+ping 是唯一的例外：设备端异步执行探测（主循环发 Ping、等 Pong），命令响应里
+没有结果，因此它会轮询统计快照直到本次探测结算或等待超时。
 
 速率请自行对两次快照的 *_bytes 差分（计数器为 u32 累计值，回绕按
 (cur - prev) & 0xFFFFFFFF 处理）。
@@ -36,6 +40,7 @@ Linux 非 root 访问需要在 /etc/udev/rules.d/99-meguminlink.rules 写一行�
 
 import argparse
 import sys
+import time
 
 import usb.core
 
@@ -54,11 +59,15 @@ CMD_REBOOT = 0x14
 CMD_EXIT_PAIRING = 0x15
 CMD_SET_USB_CONFIG = 0x16
 CMD_APPLY_USB_CONFIG = 0x17
+CMD_PING = 0x18
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
 MAX_RESPONSE = 512
 TIMEOUT_MS = 1000
+# ping 等待设备结算时的轮询间隔：设备端超时窗口（Kconfig 默认 500ms）远大于它，
+# 因此不会明显推迟结果，也不会给 USB 控制端点造成压力
+PING_POLL_S = 0.05
 
 STATUS = {
     0x00: "ok",
@@ -102,6 +111,16 @@ TAG_UART_BAUD = 0x35
 TAG_UART_DATA_BITS = 0x36
 TAG_UART_STOP_BITS = 0x37
 TAG_UART_PARITY = 0x38
+
+# 对端存活探测（GetStats 的 0x22-0x25，与固件 config_channel.cc 一致）：
+# online 0=从未探测 1=在线 2=离线；rtt 是最近一次成功往返的微秒数；ok/fail 是
+# 累计计数——单次探测的结果靠两次快照差分判定，因为设备端是异步执行的
+TAG_PEER_ONLINE = 0x22
+TAG_PING_RTT = 0x23
+TAG_PING_OK = 0x24
+TAG_PING_FAIL = 0x25
+
+PEER = {0: "unknown", 1: "online", 2: "offline"}
 
 UART_STOP_BITS = {0: "1", 1: "1.5", 2: "2"}
 UART_PARITY = {0: "N", 1: "O", 2: "E", 3: "M", 4: "S"}
@@ -202,6 +221,7 @@ def render_stats(values):
             value = int.from_bytes(raw, "big")
         parts.append(f"{name}={value}")
     parts.extend(render_uart_state(values))
+    parts.extend(render_peer_state(values))
     return " ".join(parts)
 
 
@@ -224,6 +244,20 @@ def render_uart_state(values):
     ]
 
 
+def render_peer_state(values):
+    """对端存活探测：online 带最近一次往返，ok/fail 是累计计数（老固件整组跳过）。"""
+    if TAG_PEER_ONLINE not in values:
+        return []
+
+    online = u8_of(values, TAG_PEER_ONLINE)
+    parts = [f"peer={PEER.get(online, '?')}"]
+    if online == 1:
+        parts.append(f"rtt_ms={u32_of(values, TAG_PING_RTT) / 1000:.2f}")
+    parts.append(f"ping_ok={u32_of(values, TAG_PING_OK)}")
+    parts.append(f"ping_fail={u32_of(values, TAG_PING_FAIL)}")
+    return parts
+
+
 def render_config(values):
     parts = []
     for tag, name in CONFIG_FIELDS:
@@ -239,6 +273,11 @@ def render_config(values):
 
 
 def u8_of(values, tag):
+    raw = values.get(tag)
+    return int.from_bytes(raw, "big") if raw else 0
+
+
+def u32_of(values, tag):
     raw = values.get(tag)
     return int.from_bytes(raw, "big") if raw else 0
 
@@ -344,6 +383,60 @@ def cmd_action(args):
         print("mlinkctl: 设备正在重启，稍后需重新枚举", file=sys.stderr)
 
 
+def probe_once(dev, timeout_ms):
+    """发一次对端探测并等设备结算，返回 (online, rtt_us)。
+
+    设备端异步执行（主循环发 ESP-NOW Ping、等 Pong，超时由 Kconfig 决定），命令
+    响应里没有结果：这里先取 ok/fail 计数基线，下发命令后轮询统计快照，谁增加
+    就说明本次探测是成功还是超时。
+    """
+    before = decode(fetch(dev, CMD_GET_STATS))
+    if TAG_PING_OK not in before:
+        die("固件不支持对端探测（GetStats 里没有 peer_online / ping 计数），请更新固件")
+
+    baseline = (u32_of(before, TAG_PING_OK), u32_of(before, TAG_PING_FAIL))
+    decode(fetch(dev, CMD_PING))
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        time.sleep(PING_POLL_S)
+        stats = decode(fetch(dev, CMD_GET_STATS))
+        if (u32_of(stats, TAG_PING_OK), u32_of(stats, TAG_PING_FAIL)) != baseline:
+            if u8_of(stats, TAG_PEER_ONLINE) == 1:
+                return True, u32_of(stats, TAG_PING_RTT)
+            return False, 0
+
+    die(f"探测未在 {timeout_ms} ms 内结算（设备需处于 wireless 模式，见 mlinkctl config）")
+
+
+def cmd_ping(args):
+    if args.count < 1:
+        die("探测次数至少为 1")
+
+    dev = find_device()
+    rtt_ms = []
+    for index in range(args.count):
+        if index > 0:
+            time.sleep(args.interval / 1000)
+        online, rtt_us = probe_once(dev, args.timeout)
+        if online:
+            rtt_ms.append(rtt_us / 1000)
+            print(f"peer=online rtt_ms={rtt_ms[-1]:.2f}")
+        else:
+            print("peer=offline rtt_ms=-")
+
+    if args.count > 1:
+        lost = args.count - len(rtt_ms)
+        if rtt_ms:
+            print(
+                f"--- {args.count} 次探测：ok={len(rtt_ms)} fail={lost} "
+                f"loss={lost * 100 / args.count:.0f}% rtt_min_ms={min(rtt_ms):.2f} "
+                f"rtt_avg_ms={sum(rtt_ms) / len(rtt_ms):.2f} rtt_max_ms={max(rtt_ms):.2f}"
+            )
+        else:
+            print(f"--- {args.count} 次探测：ok=0 fail={lost} loss=100%")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="mlinkctl",
@@ -368,6 +461,19 @@ def build_parser():
     set_mode = subparsers.add_parser("set-mode", help="切换运行模式")
     set_mode.add_argument("mode", choices=sorted(MODE_ARG), help="local 或 wireless")
     set_mode.set_defaults(handler=cmd_set_mode)
+
+    ping = subparsers.add_parser("ping", help="探测已配对对端（ESP-NOW 往返时延）")
+    ping.add_argument("-c", "--count", type=int, default=1, metavar="N", help="探测次数（默认 1）")
+    ping.add_argument("-i", "--interval", type=int, default=500, metavar="MS", help="两次探测之间的间隔毫秒（默认 500）")
+    ping.add_argument(
+        "-w",
+        "--timeout",
+        type=int,
+        default=1000,
+        metavar="MS",
+        help="单次探测等待设备结算的毫秒（默认 1000，需大于设备端探测超时）",
+    )
+    ping.set_defaults(handler=cmd_ping)
 
     for name, (code, help_text) in ACTIONS.items():
         subparsers.add_parser(name, help=help_text).set_defaults(handler=cmd_action, cmd_code=code)

@@ -379,6 +379,18 @@ void Application::consume_pending_action()
             ESP_LOGI(TAG, "ExitPairing ignored: not pairing in wireless mode");
         }
         break;
+    case ConfigChannel::Action::Ping:
+        // 上位机下发的立即探测（WebUI 定时/点击、CLI ping）。Local 模式没有可用
+        // 的无线对端，忽略并记日志（与 EnterPairing 同语义）
+        if (m_mode == Mode::Wireless)
+        {
+            m_config_channel.start_ping();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Ping ignored in local mode; switch to wireless first");
+        }
+        break;
     case ConfigChannel::Action::ClearPair:
         clear_pairing();
         break;
@@ -433,6 +445,9 @@ void Application::run()
         // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
         consume_pending_action();
 #endif
+
+        // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
+        m_config_channel.poll_ping_timeout();
 
 #if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
@@ -517,6 +532,8 @@ void Application::run()
                 //   执行器（DAP_ExecuteCommand + 响应回传，见 wireless_dap.cc）；
                 // - DapResponse：本机是发送端，存入响应通道唤醒 dap_task
                 //   （dap_task 转发命令后正等待该响应并写回 USB）；
+                // - Ping：对端在探测本机，原样回显 token 回一帧 Pong；
+                // - Pong：对端回显本机探测，交给配置通道结算往返时延；
                 // 配对控制帧在已配对状态下不应出现，防御性忽略。
                 auto packets = take_received_packets();
                 for (const auto &rp : packets)
@@ -536,6 +553,21 @@ void Application::run()
                     case PacketType::DapResponse: {
                         const auto &resp = rp.packet.payload.dap_response;
                         push_wireless_response(resp.data, resp.len);
+                        break;
+                    }
+                    case PacketType::Ping: {
+                        // 回包在主循环任务上下文发出：ESP-NOW 接收回调只投递，
+                        // 不在回调里调用发送（见 config_channel.hpp 的探测说明）
+                        const esp_err_t ret = m_wireless_link.send_pong(rp.src_mac, rp.packet.payload.ping.token);
+                        if (ret != ESP_OK)
+                        {
+                            ESP_LOGW(TAG, "Failed to reply pong to " MACSTR ": %s", MAC2STR(rp.src_mac),
+                                     esp_err_to_name(ret));
+                        }
+                        break;
+                    }
+                    case PacketType::Pong: {
+                        m_config_channel.on_pong(rp.src_mac, rp.packet.payload.pong.token);
                         break;
                     }
                     default:
