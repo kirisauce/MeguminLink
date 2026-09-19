@@ -4,12 +4,16 @@
 	import { MlinkSession } from '../lib/session.svelte';
 	import { formatBytes, formatCount, formatRate, type CounterKey } from '../lib/rate';
 	import DeviceBar from './DeviceBar.svelte';
+	import ConfigDrawer from './ConfigDrawer.svelte';
 	import StatusStrip from './StatusStrip.svelte';
 	import StatCard from './StatCard.svelte';
 	import StatTable from './StatTable.svelte';
 	import RateChart from './RateChart.svelte';
 
 	const session = new MlinkSession();
+
+	/** 配置抽屉的开关；面板本身固定在视口右侧，不参与页面流。 */
+	let configOpen = $state(false);
 
 	onMount(() => {
 		void session.restore();
@@ -78,7 +82,7 @@
 </script>
 
 <div class="page">
-	<DeviceBar {session} />
+	<DeviceBar {session} onconfig={() => (configOpen = true)} />
 
 	<main>
 		{#if session.state === 'unsupported'}
@@ -123,6 +127,8 @@
 			<StatTable {stats} />
 		</section>
 	</main>
+
+	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} />
 </div>
 
 <style>

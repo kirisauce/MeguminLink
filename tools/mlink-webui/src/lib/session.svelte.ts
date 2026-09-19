@@ -8,7 +8,16 @@
  * 轮询用「上次请求返回后再排下一次」的方式串行化，天然不会在设备变慢时堆积请求。
  */
 
-import { ProtocolError, STAT_FIELDS, VID, PID, readStats, type Stats } from './protocol';
+import {
+	ProtocolError,
+	STAT_FIELDS,
+	VID,
+	PID,
+	readConfig,
+	readStats,
+	type DeviceConfig,
+	type Stats,
+} from './protocol';
 import { computeRates, type Rates } from './rate';
 
 /** 页面在前台时的采样间隔。 */
@@ -55,6 +64,8 @@ export class MlinkSession {
 	device = $state<USBDevice | null>(null);
 	/** 当前采样间隔，切前后台时会变。 */
 	intervalMs = $state(POLL_INTERVAL_MS);
+	/** 设备身份与配置项；读不到（老固件没有该命令、或未连接）时为 null。 */
+	config = $state<DeviceConfig | null>(null);
 
 	#timer: ReturnType<typeof setTimeout> | null = null;
 	#seq = 0;
@@ -121,6 +132,7 @@ export class MlinkSession {
 		this.rates = null;
 		this.history = [];
 		this.error = null;
+		this.config = null;
 		this.state = this.supported ? 'disconnected' : 'unsupported';
 		if (device?.opened === true) {
 			try {
@@ -149,7 +161,25 @@ export class MlinkSession {
 		this.device = device;
 		this.#seq = 0;
 		this.state = 'streaming';
+		void this.refreshConfig();
 		this.#schedule(0);
+	}
+
+	/**
+	 * 读一次设备身份与配置项（连接后自动读、抽屉打开时刷新）。
+	 *
+	 * 读不到就保持 null、面板显示「—」：设备身份是附加信息，任何失败都
+	 * 不该把会话推进 error 状态——链路问题由轮询统一发现。
+	 */
+	async refreshConfig(): Promise<void> {
+		const device = this.device;
+		if (device === null) return;
+		try {
+			this.config = await readConfig(device, this.#seq);
+			this.#seq = (this.#seq + 1) & 0xff;
+		} catch {
+			this.config = null;
+		}
 	}
 
 	#schedule(delay = this.intervalMs): void {
@@ -213,6 +243,7 @@ export class MlinkSession {
 			this.device = null;
 			this.stats = null;
 			this.rates = null;
+			this.config = null;
 			this.#cancel();
 			this.state = 'disconnected';
 			this.error = '设备已断开';

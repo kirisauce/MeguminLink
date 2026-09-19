@@ -173,6 +173,14 @@ class Application
     /** 按当前模式应用系统行为（USB 启用/禁用）；构造与 set_mode 复用 */
     void apply_mode();
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    /** 消费配置通道投递的动作（主循环调用；NVS/wifi/重启都只在这里做） */
+    void consume_pending_action();
+
+    /** 清除配对记录并重新开始配对流程（ClearPair 动作） */
+    void clear_pairing();
+#endif
+
     SemaphoreHandle_t m_rx_mutex;
     std::vector<ReceivedPacket> m_received_packets;
     PairingState m_pairing;

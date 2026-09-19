@@ -21,6 +21,7 @@ export const PID = 0x4020;
 
 export const VENDOR_CODE = 0x4d;
 export const CMD_GET_STATS = 0x01;
+export const CMD_GET_CONFIG = 0x02;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -33,10 +34,18 @@ export const STATUS_NAMES: Readonly<Record<number, string>> = {
 	0x02: 'malformed',
 	0x03: 'internal',
 	0x04: 'unsupported',
+	0x05: 'busy',
 };
 
 export const MODE_NAMES: Readonly<Record<number, string>> = { 0: 'local', 1: 'wireless' };
 export const PAIR_NAMES: Readonly<Record<number, string>> = { 0: 'idle', 1: 'paired', 2: 'pairing' };
+
+/** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50/0x51 配置项。 */
+const TAG_FW_VERSION = 0x41;
+const TAG_CHIP_TARGET = 0x42;
+const TAG_IDF_VERSION = 0x43;
+const TAG_CONFIG_MODE = 0x50;
+const TAG_CONFIG_PEER_MAC = 0x51;
 
 /** 统计快照。计数器一律 u32 累计值，回绕由上层按 (cur - prev) >>> 0 处理。 */
 export type Stats = {
@@ -62,6 +71,20 @@ export type StatField = {
 	name: string;
 	label: string;
 	signed?: boolean;
+};
+
+/**
+ * 设备身份与配置项快照（GetConfig）。
+ *
+ * mode 与 Stats.mode 同值域，peerMac 为小写冒号分隔的 6 字节 MAC，
+ * 未配对时为 null。
+ */
+export type DeviceConfig = {
+	fwVersion: string;
+	chipTarget: string;
+	idfVersion: string;
+	mode: number;
+	peerMac: string | null;
 };
 
 /** 字段顺序即 mlinkctl 的打印顺序。 */
@@ -125,7 +148,8 @@ function readValue(view: DataView | undefined, signed: boolean): number {
 	}
 }
 
-export function decodeStats(frame: DataView): Stats {
+/** 校验帧头与 status，返回 TLV 区（键为 tag）。 */
+function parseFrame(frame: DataView): Map<number, DataView> {
 	if (frame.byteLength < FRAME_HEADER_SIZE) {
 		throw new ProtocolError(`short response (${frame.byteLength} bytes)`);
 	}
@@ -139,8 +163,25 @@ export function decodeStats(frame: DataView): Stats {
 	}
 	const declared = frame.getUint16(4, false);
 	const end = Math.min(FRAME_HEADER_SIZE + declared, frame.byteLength);
-	const tags = parseTlv(frame, FRAME_HEADER_SIZE, end);
+	return parseTlv(frame, FRAME_HEADER_SIZE, end);
+}
 
+function readText(view: DataView | undefined): string {
+	if (view === undefined || view.byteLength === 0) return '';
+	return new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+}
+
+function readMac(view: DataView | undefined): string | null {
+	if (view === undefined || view.byteLength !== 6) return null;
+	const octets: string[] = [];
+	for (let i = 0; i < 6; i += 1) {
+		octets.push(view.getUint8(i).toString(16).padStart(2, '0'));
+	}
+	return octets.join(':');
+}
+
+export function decodeStats(frame: DataView): Stats {
+	const tags = parseFrame(frame);
 	const stats = {} as Stats;
 	for (const field of STAT_FIELDS) {
 		stats[field.key] = readValue(tags.get(field.tag), field.signed === true);
@@ -148,14 +189,25 @@ export function decodeStats(frame: DataView): Stats {
 	return stats;
 }
 
-/** 读一次 GET_STATS。seq 仅用于诊断请求/响应错位，设备原样回显。 */
-export async function readStats(device: USBDevice, seq: number): Promise<Stats> {
+export function decodeConfig(frame: DataView): DeviceConfig {
+	const tags = parseFrame(frame);
+	return {
+		fwVersion: readText(tags.get(TAG_FW_VERSION)),
+		chipTarget: readText(tags.get(TAG_CHIP_TARGET)),
+		idfVersion: readText(tags.get(TAG_IDF_VERSION)),
+		mode: readValue(tags.get(TAG_CONFIG_MODE), false),
+		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
+	};
+}
+
+/** 发一次厂商 IN 请求并取回响应帧。seq 仅用于诊断请求/响应错位，设备原样回显。 */
+async function transferIn(device: USBDevice, cmd: number, seq: number): Promise<DataView> {
 	const result = await device.controlTransferIn(
 		{
 			requestType: 'vendor',
 			recipient: 'device',
 			request: VENDOR_CODE,
-			value: CMD_GET_STATS,
+			value: cmd,
 			index: seq & 0xff,
 		},
 		MAX_RESPONSE
@@ -166,5 +218,13 @@ export async function readStats(device: USBDevice, seq: number): Promise<Stats> 
 	if (!result.data) {
 		throw new ProtocolError('empty response');
 	}
-	return decodeStats(result.data);
+	return result.data;
+}
+
+export async function readStats(device: USBDevice, seq: number): Promise<Stats> {
+	return decodeStats(await transferIn(device, CMD_GET_STATS, seq));
+}
+
+export async function readConfig(device: USBDevice, seq: number): Promise<DeviceConfig> {
+	return decodeConfig(await transferIn(device, CMD_GET_CONFIG, seq));
 }

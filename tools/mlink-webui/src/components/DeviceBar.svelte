@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { STATE_TEXT, type MlinkSession } from '../lib/session.svelte';
 
-	let { session }: { session: MlinkSession } = $props();
+	let { session, onconfig }: { session: MlinkSession; onconfig: () => void } = $props();
 
 	const tone = $derived(
 		session.state === 'streaming'
@@ -25,17 +25,20 @@
 		<code>{session.deviceLabel}</code>
 	</div>
 
-	{#if session.state === 'streaming'}
-		<button class="button" onclick={() => void session.close()}>断开</button>
-	{:else}
-		<button
-			class="button filled"
-			onclick={() => void session.request()}
-			disabled={session.state === 'unsupported' || session.state === 'connecting'}
-		>
-			连接设备
-		</button>
-	{/if}
+	<div class="actions">
+		{#if session.state === 'streaming'}
+			<button class="button" onclick={onconfig}>配置</button>
+			<button class="button" onclick={() => void session.close()}>断开</button>
+		{:else}
+			<button
+				class="button filled"
+				onclick={() => void session.request()}
+				disabled={session.state === 'unsupported' || session.state === 'connecting'}
+			>
+				连接设备
+			</button>
+		{/if}
+	</div>
 </header>
 
 <style>
@@ -103,8 +106,13 @@
 		color: var(--md-sys-color-on-surface);
 	}
 
-	.button {
+	.actions {
+		display: flex;
+		gap: var(--md-sys-space-sm);
 		margin-left: auto;
+	}
+
+	.button {
 		font: inherit;
 		font-size: var(--md-sys-typescale-body-md);
 		padding: 0.4rem 1.1rem;

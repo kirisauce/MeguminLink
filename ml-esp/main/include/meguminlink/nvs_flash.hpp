@@ -25,11 +25,13 @@ class NvsKey
     NvsKey(const NvsKey &) = delete;
 
   protected:
-    /** 底层原语：无记录/失败返回 false；store 返回错误码（含 commit） */
+    /** 底层原语：无记录/失败返回 false；store/erase 返回错误码（含 commit） */
     bool raw_load_u8(u8 *value) const;
     esp_err_t raw_store_u8(u8 value) const;
     bool raw_load_blob(void *value, size_t len) const;
     esp_err_t raw_store_blob(const void *value, size_t len) const;
+    /** 删除键；键本来就不存在视为成功（删除已达目的） */
+    esp_err_t raw_erase() const;
 
   private:
     const char *m_key;
@@ -46,6 +48,9 @@ class NvsKeyU8 : public NvsKey
 
     /** 更新缓存并写回 NVS；与缓存相同则跳过落盘（返回 ESP_OK） */
     esp_err_t set(u8 value);
+
+    /** 删除记录并让缓存回到构造时的默认值（返回 ESP_OK 表示下次 get() 即默认值） */
+    esp_err_t erase();
 
   private:
     const u8 m_default_value;
@@ -92,6 +97,18 @@ template <size_t N> class NvsKeyBlob : public NvsKey
         return raw_store_blob(m_data, N);
     }
 
+    /** 删除记录并清空缓存（返回 ESP_OK 表示下次 get() 返回 false） */
+    esp_err_t erase()
+    {
+        const esp_err_t ret = raw_erase();
+        if (ret == ESP_OK)
+        {
+            memset(m_data, 0, N);
+            m_loaded = false;
+        }
+        return ret;
+    }
+
   private:
     mutable u8 m_data[N] = {};
     mutable bool m_loaded = false;
@@ -102,6 +119,9 @@ bool peer_mac_load(u8 mac[ESP_NOW_ETH_ALEN]);
 
 /** 持久化对端 MAC 地址（配对完成时调用） */
 esp_err_t peer_mac_store(const u8 mac[ESP_NOW_ETH_ALEN]);
+
+/** 删除已配对对端的 MAC 记录（清除配对 / 恢复默认时调用） */
+esp_err_t peer_mac_erase();
 } // namespace mlink
 
 #endif

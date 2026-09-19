@@ -5,6 +5,7 @@
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
 #include <esp_mac.h> // MACSTR/MAC2STR（接收端 DAP 命令日志）
+#include <esp_system.h>
 #include <sdkconfig.h>
 
 #include <freertos/FreeRTOS.h>
@@ -17,6 +18,13 @@ static constexpr char TAG[] = "mlink::app";
 
 namespace
 {
+/**
+ * Reset/Reboot 重启前的等待。响应帧已交给 EP0（DATA IN 阶段），但主循环
+ * 可能先于传输完成执行到这里；直接重启会让主机看到传输中断。留出一个
+ * USB 帧级的余量（全速帧 1ms）确保响应送达。
+ */
+constexpr u32 RESTART_DELAY_MS = 100;
+
 const char *mode_to_string(Mode mode)
 {
     switch (mode)
@@ -307,11 +315,89 @@ void Application::pairing_completed()
     leave_pairing("completed");
 }
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+void Application::clear_pairing()
+{
+    // 先取旧记录（擦除后就取不到了）：NVS 记录与 ESP-NOW peer 表一起清，
+    // 后者在重启后本来就是空的，但运行期残留会让旧 peer 仍可发帧过来。
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (peer_mac_load(peer_mac))
+    {
+        const esp_err_t ret = m_wireless_link.peer_remove(peer_mac);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to remove peer " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
+        }
+    }
+    (void)peer_mac_erase();
+
+    // 无条件重开一轮配对：配对流程进行中时先退出，让状态机从头开始
+    if (m_pairing_active)
+    {
+        leave_pairing("clear pairing");
+    }
+    if (m_mode == Mode::Wireless)
+    {
+        enter_pairing(false); // 无旧记录可恢复：以配对成功为唯一出口
+    }
+}
+
+void Application::consume_pending_action()
+{
+    ConfigChannel::Action action = ConfigChannel::Action::None;
+    u8 arg = 0;
+    if (!m_config_channel.take_action(&action, &arg))
+    {
+        return;
+    }
+
+    switch (action)
+    {
+    case ConfigChannel::Action::None:
+        break;
+    case ConfigChannel::Action::SetMode:
+        set_mode(arg == static_cast<u8>(Mode::Wireless) ? Mode::Wireless : Mode::Local);
+        break;
+    case ConfigChannel::Action::EnterPairing:
+        if (m_mode == Mode::Wireless)
+        {
+            enter_pairing(false);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "EnterPairing ignored in local mode; switch to wireless first");
+        }
+        break;
+    case ConfigChannel::Action::ClearPair:
+        clear_pairing();
+        break;
+    case ConfigChannel::Action::Reset:
+        // 删除失败不回滚：重启后的构造逻辑会按残留记录自愈
+        ESP_LOGI(TAG, "Reset: erasing pairing and mode records, rebooting");
+        (void)peer_mac_erase();
+        (void)m_mode_key.erase();
+        vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
+        esp_restart();
+        break;
+    case ConfigChannel::Action::Reboot:
+        ESP_LOGI(TAG, "Reboot requested");
+        vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
+        esp_restart();
+        break;
+    }
+}
+#endif
+
 void Application::run()
 {
     while (true)
     {
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+        // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
+        consume_pending_action();
+#endif
 
 #if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
