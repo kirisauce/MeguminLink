@@ -1,4 +1,5 @@
 #include "meguminlink/dap_executor.hpp"
+#include "meguminlink/dap_frame.hpp"
 #include "esp_log.h"
 #include "meguminlink/wireless_link.hpp" // MAX_DAP_PAYLOAD_SIZE（响应缓冲）
 
@@ -99,6 +100,18 @@ const char *dap_command_name(u8 id)
 
 u16 mlink::dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t response_cap)
 {
+    // DAP 层写响应不检查缓冲区边界，先确认该请求的响应上界装得下：超限时
+    // 按未定义命令的语义回单字节 ID_DAP_Invalid（与 DAP_ProcessCommand 的
+    // 默认分支一致），避免写坏相邻内存。
+    const size_t bound = dap_response_bound(request, req_len);
+    if (bound == 0U || bound > response_cap)
+    {
+        ESP_LOGW(TAG, "DAP cmd 0x%02X rejected: response bound %u exceeds buffer %u", request[0],
+                 static_cast<unsigned>(bound), static_cast<unsigned>(response_cap));
+        response[0] = ID_DAP_Invalid;
+        return 1;
+    }
+
     // 每命令两行日志降为 DEBUG（默认不打印）：A/B 实测（2026-08-15）日志
     // 降级单独贡献 ~0.2s（UART FIFO 异步排空，非阻塞路径）。
     ESP_LOGD(TAG, "Executing DAP cmd: id=0x%02X (%s) len=%u", request[0], dap_command_name(request[0]),
