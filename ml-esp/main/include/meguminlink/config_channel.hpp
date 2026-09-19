@@ -3,6 +3,7 @@
 #define __MEGUMINLINK_CONFIG_CHANNEL_HPP__
 
 #include "meguminlink/common.hpp"
+#include "meguminlink/wireless_link.hpp" // payload::RelayedUsbControl（转发控制请求）
 #include "sdkconfig.h"
 
 // 存活探测状态用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
@@ -113,10 +114,14 @@ class ConfigChannel
      * 见 config_channel.cc 顶部协议注释）。
      */
     bool handle_control(u8 rhport, u8 stage, const tusb_control_request_t *request);
+#endif
 
     /**
      * 待执行动作。控制命令只投递不执行：NVS 提交、esp_wifi 操作与重启
      * 都不能占用 tinyusb 任务，统一由主循环消费执行。
+     *
+     * 两端共用：无 USB 侧通过 RelayedUsbControl 收到同样的命令，投递的也是
+     * 这些动作，因此动作集的语义在两端一致。
      */
     enum class Action : u8
     {
@@ -129,10 +134,11 @@ class ConfigChannel
         Reboot,         // 立即重启
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
         Ping,           // 立即探测已配对对端（存活与往返时延）
+        SetWifiRate,    // arg: wifi_phy_rate_t 原值（ESP-NOW 发送速率档位）
     };
 
     /**
-     * 投递待执行动作（EP0 请求上下文调用）。
+     * 投递待执行动作（EP0 请求或无线转发请求的上下文调用）。
      * @return true=已接受；false=槽内已有未取走的动作（调用方回 busy）
      */
     bool post_action(Action action, u8 arg = 0);
@@ -146,19 +152,52 @@ class ConfigChannel
     bool take_action(Action *action, u8 *arg = nullptr);
 
     /**
+     * 收到对端转发的 USB 控制请求（无线接收回调调用）。
+     *
+     * 无 USB 侧的设置只能这样下发：本函数用与本机 USB 侧完全相同的命令表
+     * 解释请求，因此两端语义不会漂移。只做解释与投递，不执行——命令可能
+     * 操作 WiFi 驱动，而接收回调不可重入驱动，实际执行留给主循环。
+     *
+     * 响应在本目标被丢弃：转发是尽力而为的单向下发，发起端不等回执。
+     */
+    void on_relayed_control(const payload::RelayedUsbControl &req);
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    /**
      * 取走待应用的 USB 能力草稿并清空槽（主循环执行 ApplyUsbConfig 时调用）。
      *
      * SetUsbConfig 只写草稿不落盘：校验失败的草稿在此处按"无草稿"处理
      * （取走后槽一律清空），主机已通过 GetUsbConfig 读到被拒原因。
      */
     bool take_usb_config_draft(UsbCapabilitySettings *settings);
+
+    /**
+     * 把一条本机刚接受的配置命令原样转发给对端执行（无 USB 侧的设置下发
+     * 通路）。尽力而为：未配对或发送失败只记日志——本机设置已经生效，
+     * 重新下发一次即可补偿。
+     */
+    void relay_to_peer(u8 cmd, u8 arg);
 #endif
 
   private:
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
     /** 空 TLV 区的响应帧（动作命令与错误状态都用它） */
     u16 build_empty_response(u8 cmd, u8 seq, u8 status);
 
+    /** 投递动作并按结果回帧：ok=已投递，busy=槽被占用 */
+    u16 post_action_response(u8 cmd, u8 seq, Action action, u8 arg);
+
+    /**
+     * 执行一条配置通道命令，响应帧写入 m_response（命令表见 config_channel.cc）。
+     *
+     * 本机 USB 侧（EP0）与转发到对端的控制请求共用本函数，两端因此跑同一张
+     * 命令表，不会出现"一端认识、另一端不认识"的分叉。只解释与投递动作，
+     * 不做实际操作（执行在主循环）。
+     *
+     * @return 响应帧长度（容量不足时退化为 internal 状态的空帧）
+     */
+    u16 dispatch_control(u8 cmd, u8 arg, u8 seq);
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
     /** TLV 区填到 end 后收尾：写帧头、回整帧长度 */
     u16 finish_response(u8 cmd, u8 seq, usize end);
 
@@ -167,9 +206,6 @@ class ConfigChannel
 
     /** 组装 GetConfig 响应帧到 m_response，返回整帧长度 */
     u16 build_config_response(u8 cmd, u8 seq);
-
-    /** 投递动作并按结果回帧：ok=已投递，busy=槽被占用 */
-    u16 post_action_response(u8 cmd, u8 seq, Action action, u8 arg);
 
     /**
      * SetUsbConfig（OUT 方向）的处理：SETUP 阶段声明接收缓冲，DATA 阶段解析
@@ -236,15 +272,20 @@ class ConfigChannel
     u32 m_ping_ok = 0;
     u32 m_ping_fail = 0;
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-    /** 响应缓冲必须常驻：tud_control_xfer 只保存指针，DATA 阶段仍会回读 */
+    /**
+     * 响应缓冲：dispatch_control 统一写在这里。
+     * USB 侧必须常驻（tud_control_xfer 只保存指针，DATA 阶段仍会回读）；
+     * 无 USB 侧只被转发的控制请求写到，内容随即丢弃，但两端共用同一份
+     * 组装代码，不留分叉。
+     */
     u8 m_response[256];
 
-    /** 待执行动作单槽（EP0 上下文写、主循环读，portMUX 保护） */
+    /** 待执行动作单槽（请求上下文写、主循环读，portMUX 保护） */
     Action m_pending_action = Action::None;
     u8 m_pending_arg = 0;
     portMUX_TYPE m_action_lock = portMUX_INITIALIZER_UNLOCKED;
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
     /**
      * USB 能力草稿单槽（EP0 上下文写、主循环执行 ApplyUsbConfig 时读走）。
      * SetUsbConfig 的 OUT 载荷先落到 m_usb_draft_buffer，解析校验后存进本槽。

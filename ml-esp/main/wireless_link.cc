@@ -36,7 +36,44 @@ struct DapExecuteRequest
     u8 data[MAX_DAP_PAYLOAD_SIZE];
     u16 len;
 };
+
+/**
+ * 由速率枚举值推导 PHY 模式。ESP-NOW 的速率配置要求 phymode 与 rate 一致，
+ * 而 phymode 完全由档位所在段决定（CCK 属 11b、OFDM 属 11g、MCS 属 HT20），
+ * 因此按段推导而不是维护一张与枚举同步的手写表。
+ * @return false = 该档位不在 ESP-NOW 可配置的范围内
+ */
+bool phymode_for_rate(u8 rate, wifi_phy_mode_t *mode)
+{
+    if (rate <= WIFI_PHY_RATE_11M_S)
+    {
+        // 0x00-0x07：CCK（短/长前导）。0x04 是 wifi_phy_rate_t 里的空洞
+        if (rate == 0x04)
+        {
+            return false;
+        }
+        *mode = WIFI_PHY_MODE_11B;
+        return true;
+    }
+    if (rate <= WIFI_PHY_RATE_9M)
+    {
+        *mode = WIFI_PHY_MODE_11G; // 0x08-0x0F：OFDM 6-54M
+        return true;
+    }
+    if (rate <= WIFI_PHY_RATE_MCS7_SGI)
+    {
+        *mode = WIFI_PHY_MODE_HT20; // 0x10-0x1F：HT20 MCS0-7（LGI/SGI）
+        return true;
+    }
+    return false; // 超出 11b/11g/HT20：本链路不做支持
+}
 } // namespace
+
+bool mlink::wifi_rate_supported(u8 rate)
+{
+    wifi_phy_mode_t mode;
+    return phymode_for_rate(rate, &mode);
+}
 
 // ---- ESP-NOW 回调（esp_now 要求 C 函数指针，无 arg 参数；经 Application 访问） ----
 
@@ -105,6 +142,14 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         // 线编码同步直通投递：PC 端改串口参数 → 目标侧 UART 实时跟随
         const auto &lc = rp.packet.payload.uart_line_coding;
         app.on_uart_line_coding(lc);
+        return;
+    }
+    case PacketType::RelayedUsbControl: {
+        // 对端转发的 USB 控制请求（无 USB 侧的设置下发通路）。与 USB 侧同一张
+        // 命令表：本模块只解包投递，执行在主循环——回调不可重入 WiFi 驱动，
+        // 速率一类会操作驱动，必须留给主循环。
+        const auto &relay = rp.packet.payload.relayed_usb_control;
+        app.config_channel().on_relayed_control(relay);
         return;
     }
     default:
@@ -249,19 +294,79 @@ esp_err_t WirelessLink::set_peer_rate(const u8 *peer_mac)
         return ESP_OK;
     }
 
-    // 对端级固定 HT20/MCS7(SGI) 高速率。ESP-NOW 的速率以 peer rate config 为准，
-    // 仅设全局接口速率不一定生效；小包场景下可降低空中耗时。
+    // 对端级固定速率由 m_rate 决定。ESP-NOW 的速率以 peer rate config 为准，
+    // 仅设全局接口速率不一定生效；档位越低越稳，长帧尤其明显。
+    wifi_phy_mode_t phymode = WIFI_PHY_MODE_HT20;
+    if (!phymode_for_rate(m_rate, &phymode))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     esp_now_rate_config_t rate_cfg = {};
-    rate_cfg.phymode = WIFI_PHY_MODE_HT20;
-    rate_cfg.rate = WIFI_PHY_RATE_MCS7_SGI;
+    rate_cfg.phymode = phymode;
+    rate_cfg.rate = static_cast<wifi_phy_rate_t>(m_rate);
     rate_cfg.ersu = false;
     rate_cfg.dcm = false;
     const esp_err_t ret = esp_now_set_peer_rate_config(peer_mac, &rate_cfg);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(MCS7_SGI) failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(0x%02X) failed: %s", m_rate, esp_err_to_name(ret));
     }
     return ret;
+}
+
+u8 WirelessLink::wifi_rate() const
+{
+    return m_rate;
+}
+
+esp_err_t WirelessLink::set_wifi_rate(u8 rate)
+{
+    wifi_phy_mode_t phymode = WIFI_PHY_MODE_HT20;
+    if (!phymode_for_rate(rate, &phymode))
+    {
+        ESP_LOGW(TAG, "Unsupported WiFi rate 0x%02X", rate);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    m_rate = rate;
+
+    // 广播 peer 不支持速率配置；已配对单播 peer 直接改配置，无需重建。
+    // 对端侧的同一档位由配置通道经 RelayedUsbControl 下发（见 config_channel）。
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (peer_mac_load(peer_mac))
+    {
+        const esp_err_t ret = set_peer_rate(peer_mac);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
+    }
+
+    ESP_LOGI(TAG, "WiFi rate set to 0x%02X (phymode %d)", rate, static_cast<int>(phymode));
+    return ESP_OK;
+}
+
+void WirelessLink::poll()
+{
+    portENTER_CRITICAL(&m_rate_lock);
+    const u32 pending = m_pending_rate;
+    m_pending_rate = 0;
+    portEXIT_CRITICAL(&m_rate_lock);
+
+    if (pending == 0)
+    {
+        return;
+    }
+
+    const u8 rate = static_cast<u8>(pending & 0xFF);
+    if (rate == m_rate)
+    {
+        return;
+    }
+
+    // 只应用不回传：回传会让两端互相触发
+    (void)set_wifi_rate(rate);
 }
 
 esp_err_t WirelessLink::peer_remove(const u8 *peer_mac)
@@ -395,6 +500,22 @@ esp_err_t WirelessLink::send_pong(const u8 *dest_mac, u32 token)
     Packet packet;
     packet.packet_type = PacketType::Pong;
     packet.payload.pong.token = token;
+    return send(dest_mac, packet);
+}
+
+esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const payload::RelayedUsbControl &req)
+{
+    if (req.len > payload::MAX_RELAYED_CONTROL_PAYLOAD || (req.len > 0 && req.data == nullptr))
+    {
+        ESP_LOGE(TAG, "Relayed control payload invalid (len %u, max %u)", static_cast<unsigned>(req.len),
+                 static_cast<unsigned>(payload::MAX_RELAYED_CONTROL_PAYLOAD));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Packet 为指针视图：载荷指向调用方缓冲，零拷贝
+    Packet packet;
+    packet.packet_type = PacketType::RelayedUsbControl;
+    packet.payload.relayed_usb_control = req;
     return send(dest_mac, packet);
 }
 
@@ -564,6 +685,11 @@ size_t Packet::serialized_size() const
         // 帧头 3B + 数据段 4B（token）
         return UART_FRAME_HEADER_SIZE + 4;
     }
+    case PacketType::RelayedUsbControl: {
+        // 帧头 3B + len 2B + SETUP 包 8B + 载荷
+        return UART_FRAME_HEADER_SIZE + 2 + payload::RELAYED_CONTROL_HEADER_SIZE +
+               payload.relayed_usb_control.len;
+    }
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
@@ -667,6 +793,27 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.token = p.read_u32();
         break;
     }
+    case PacketType::RelayedUsbControl: {
+        // 数据段：[len:2][SETUP 8B][载荷:len]；载荷拷入调用方存储，data 指向该存储
+        auto &content = payload.relayed_usb_control;
+        MLINK_CHECK_SIZE(p, 2);
+        const u16 n = p.read_u16();
+        if (n > storage_cap || n > payload::MAX_RELAYED_CONTROL_PAYLOAD)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        MLINK_CHECK_SIZE(p, payload::RELAYED_CONTROL_HEADER_SIZE);
+        content.bm_request_type = p.read_u8();
+        content.b_request = p.read_u8();
+        content.w_value = p.read_u16();
+        content.w_index = p.read_u16();
+        content.w_length = p.read_u16();
+        MLINK_CHECK_SIZE(p, n);
+        p.read_bytes(storage, n);
+        content.len = n;
+        content.data = storage;
+        break;
+    }
     default: {
         break;
     }
@@ -756,6 +903,24 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         MLINK_CHECK_SIZE(s, 2 + 4);
         s.write_u16(4);
         s.write_u32(content.token);
+        break;
+    }
+    case PacketType::RelayedUsbControl: {
+        auto &content = payload.relayed_usb_control;
+        if (content.len > payload::MAX_RELAYED_CONTROL_PAYLOAD ||
+            (content.len > 0 && content.data == nullptr))
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        MLINK_CHECK_SIZE(s, 2 + payload::RELAYED_CONTROL_HEADER_SIZE);
+        s.write_u16(content.len);
+        s.write_u8(content.bm_request_type);
+        s.write_u8(content.b_request);
+        s.write_u16(content.w_value);
+        s.write_u16(content.w_index);
+        s.write_u16(content.w_length);
+        MLINK_CHECK_SIZE(s, content.len);
+        s.write_bytes(content.data, content.len);
         break;
     }
     default: {

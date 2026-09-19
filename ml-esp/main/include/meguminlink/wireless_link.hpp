@@ -21,6 +21,20 @@ namespace mlink
 inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 /**
+ * ESP-NOW 发送速率默认档位（HT20 MCS7 + SGI，速率表最高档）。
+ * 高 MCS 的长帧误帧率明显高于短帧，档位因此做成可调（配置通道 0x19），
+ * 默认值保持既有行为不变。
+ */
+inline constexpr u8 DEFAULT_WIFI_RATE = WIFI_PHY_RATE_MCS7_SGI;
+
+/**
+ * 档位是否可用：限 ESP-NOW 可配置的 11b / 11g / HT20 MCS0-7 段
+ * （wifi_phy_rate_t 的 0x00-0x1F，其中 0x04 是枚举里的空洞）。
+ * 供配置通道在投递动作前校验，避免把非法值送进主循环。
+ */
+bool wifi_rate_supported(u8 rate);
+
+/**
  * DapCommand/DapResponse 帧格式：[type:1B][len:2B 大端][data:len B]。
  * 数据段上限 = 无线单帧可承载的 DAP 命令/响应长度（1467B = ESP-NOW v2
  * 单帧 1470B 减去帧头）。USB 侧命令按 DAP_PACKET_SIZE 分包到达，接收侧
@@ -116,6 +130,35 @@ struct Pong
 {
     u32 token;
 };
+
+/**
+ * 转发到对端执行的 USB 控制请求（USB SETUP 包原样 + DATA OUT 载荷）。
+ *
+ * 主机只能直连 USB 侧，无 USB 侧（接收端）的设置只能靠这条通路下发：发送端
+ * 把控制请求原样打包给对端，对端用同一张命令表执行，两端语义因此不会漂移，
+ * 新增设置项也不需要新开一个 PacketType。
+ *
+ * 数据段：[len:2 大端][bmRequestType:1][bRequest:1][wValue:2 大端]
+ * [wIndex:2 大端][wLength:2 大端][载荷:len B]。len 是载荷字节数，wLength
+ * 保持 USB 语义原样透传（OUT 请求为载荷长度、IN 请求为期望响应长度，
+ * 两者的区别由对端的命令表决定）。载荷为指针视图：data 指向调用方缓冲，
+ * 零拷贝。
+ */
+struct RelayedUsbControl
+{
+    u16 len; /**< 载荷字节数（data[0..len-1]） */
+    u8 bm_request_type;
+    u8 b_request;
+    u16 w_value;
+    u16 w_index;
+    u16 w_length;
+    const u8 *data;
+};
+
+/** RelayedUsbControl 的固定部分长度（SETUP 包 8B） */
+inline constexpr size_t RELAYED_CONTROL_HEADER_SIZE = 8;
+/** RelayedUsbControl 可携带的载荷上限（覆盖配置通道现有 OUT 命令的载荷） */
+inline constexpr size_t MAX_RELAYED_CONTROL_PAYLOAD = 256;
 } // namespace payload
 
 enum class PacketType
@@ -127,8 +170,9 @@ enum class PacketType
     DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
     UartData,        /** 无线转发的串口数据载荷（PC↔目标 UART 双向，尽力而为） */
     UartLineCoding,  /** 无线同步的 UART 线编码载荷（PC 端 SET_LINE_CODING → 目标侧） */
-    Ping,            /** 对端存活探测（定向单播给已配对 peer，对端回 Pong） */
-    Pong,            /** 存活探测回显（token 原样带回，探测方据此结算 RTT） */
+    Ping,               /** 对端存活探测（定向单播给已配对 peer，对端回 Pong） */
+    Pong,               /** 存活探测回显（token 原样带回，探测方据此结算 RTT） */
+    RelayedUsbControl,  /** 转发到对端执行的 USB 控制请求（无 USB 侧的设置下发通路） */
 };
 
 union PacketPayload {
@@ -141,6 +185,7 @@ union PacketPayload {
     payload::UartLineCoding uart_line_coding;
     payload::Ping ping;
     payload::Pong pong;
+    payload::RelayedUsbControl relayed_usb_control;
 };
 
 class Packet
@@ -176,8 +221,9 @@ struct ReceivedPacket
     Packet packet;
     u8 src_mac[ESP_NOW_ETH_ALEN];
     // 入队路径的数据段存储：配对控制帧载荷最多 6B（MAC），按 UartData 上限
-    // 预留即可覆盖全部入队类型。DAP 命令/响应与 UartData 由 recv_cb 直通
-    // 处理（不排队），其反序列化落在调用方提供的大容量缓冲上。
+    // 预留即可覆盖全部入队类型。DAP 命令/响应、UartData 与
+    // RelayedUsbControl 由 recv_cb 直通处理（不排队），其反序列化落在
+    // 调用方提供的大容量缓冲上。
     u8 storage[MAX_UART_PAYLOAD_SIZE];
 
     ReceivedPacket() = default;
@@ -216,6 +262,9 @@ struct ReceivedPacket
             break;
         case PacketType::UartData:
             packet.payload.uart_data.data = storage;
+            break;
+        case PacketType::RelayedUsbControl:
+            packet.payload.relayed_usb_control.data = storage;
             break;
         default:
             break;
@@ -264,6 +313,40 @@ class WirelessLink
     esp_err_t send_pong(const u8 *dest_mac, u32 token);
 
     /**
+     * 把一条 USB 控制请求原样转发给对端执行（无 USB 侧的设置下发通路）。
+     * 纯载体：本函数不解释命令内容，对端用自己的配置通道命令表执行。
+     * @param req 控制请求（载荷为指针视图，调用期间须保持有效）
+     * @return 载荷超过 MAX_RELAYED_CONTROL_PAYLOAD 时返回 ESP_ERR_INVALID_SIZE
+     */
+    esp_err_t send_relayed_usb_control(const u8 *dest_mac, const payload::RelayedUsbControl &req);
+
+    /** 当前 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值） */
+    u8 wifi_rate() const;
+
+    /**
+     * 设置 ESP-NOW 发送速率档位（主机经配置通道 0x19 下发）。
+     *
+     * 档位应用到本地单播 peer，并同步给已配对对端：只改一边会让上行与下行跑在
+     * 不同档位，测出的丢包率反映不了任何一个方向的真实情况。同步帧先发、本地
+     * 后切，让它走当前（仍然可用的）档位。
+     *
+     * 档位不做持久化：它是射频环境相关的链路参数而非用户偏好，掉电回默认档可
+     * 避免"一端持久化了实验档位、另一端恢复默认"的静默不对称。
+     *
+     * @param rate wifi_phy_rate_t 原值（wifi_rate_supported() 认可的取值）
+     * @return ESP_OK=已应用本地；ESP_ERR_INVALID_ARG=档位不支持
+     */
+    esp_err_t set_wifi_rate(u8 rate);
+
+    /**
+     * 主循环每拍调用：应用对端经 RelayedUsbControl 下发的速率档位。
+     *
+     * 速率变更会操作 WiFi 驱动，不能在 ESP-NOW 接收回调里执行（回调不可重入
+     * 驱动），因此接收路径只登记待生效值，实际应用在这里。
+     */
+    void poll();
+
+    /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
      * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
      * resp 缓冲（容量 resp_cap，需 ≥ MAX_DAP_PAYLOAD_SIZE）。
@@ -310,6 +393,18 @@ class WirelessLink
     u8 m_tx_frame[DAP_FRAME_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE];
     /** 接收帧反序列化存储：数据段可达 1467B，放栈上会吃掉回调任务的栈 */
     u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE];
+    /**
+     * 当前 ESP-NOW 发送速率档位。只由主循环写（set_wifi_rate / poll），
+     * 读取方（配置通道 GetConfig）在 EP0 上下文。
+     */
+    volatile u8 m_rate = DEFAULT_WIFI_RATE;
+    /**
+     * 对端下发的待应用档位：0 = 无待办，否则为 (0x100 | rate)。
+     * 打包成单个 u32 并在 m_rate_lock 下读写，使接收回调与主循环之间
+     * 既无撕裂也无丢失（新值不会被正在清理旧值的 poll 吞掉）。
+     */
+    volatile u32 m_pending_rate = 0;
+    portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
     /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
     QueueHandle_t m_dap_queue = nullptr;
     TaskHandle_t m_dap_task = nullptr;

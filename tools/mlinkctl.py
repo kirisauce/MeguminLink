@@ -60,6 +60,7 @@ CMD_EXIT_PAIRING = 0x15
 CMD_SET_USB_CONFIG = 0x16
 CMD_APPLY_USB_CONFIG = 0x17
 CMD_PING = 0x18
+CMD_SET_WIFI_RATE = 0x19
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -95,13 +96,15 @@ STATS_FIELDS = [
     (0x40, "uptime_ms"),
 ]
 
-# 配置快照输出字段与 tag 一一对应：0x41-0x43 是设备身份，0x50/0x51 是配置项
+# 配置快照输出字段与 tag 一一对应：0x41-0x43 是设备身份，0x50-0x52 是配置项
+TAG_CONFIG_WIFI_RATE = 0x52
 CONFIG_FIELDS = [
     (0x41, "fw_version"),
     (0x42, "chip"),
     (0x43, "idf_version"),
     (0x50, "mode"),
     (0x51, "peer_mac"),
+    (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
 ]
 
 # CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
@@ -128,6 +131,46 @@ UART_PARITY = {0: "N", 1: "O", 2: "E", 3: "M", 4: "S"}
 MODE = {0: "local", 1: "wireless"}
 PAIR = {0: "idle", 1: "paired", 2: "pairing"}
 MODE_ARG = {"local": 0, "wireless": 1}
+
+# ESP-NOW 发送速率档位：名字 → wifi_phy_rate_t 原值（与固件 wireless_link.cc
+# 的 phymode_for_rate 认可的范围一致，即 CCK / OFDM / HT20 MCS0-7）。
+# 名字按"调制族 + 标称速率"取，便于在实验里直接对照：档位越高越脆，长帧尤其明显。
+WIFI_RATES = {
+    "cck1-l": 0x00,   # 11b 1 Mbps 长前导
+    "cck2-l": 0x01,
+    "cck5-l": 0x02,
+    "cck11-l": 0x03,
+    "cck2-s": 0x05,
+    "cck5-s": 0x06,
+    "cck11-s": 0x07,
+    "ofdm48": 0x08,
+    "ofdm24": 0x09,
+    "ofdm12": 0x0A,
+    "ofdm6": 0x0B,
+    "ofdm54": 0x0C,
+    "ofdm36": 0x0D,
+    "ofdm18": 0x0E,
+    "ofdm9": 0x0F,
+    "mcs0-lgi": 0x10,
+    "mcs1-lgi": 0x11,
+    "mcs2-lgi": 0x12,
+    "mcs3-lgi": 0x13,
+    "mcs4-lgi": 0x14,
+    "mcs5-lgi": 0x15,
+    "mcs6-lgi": 0x16,
+    "mcs7-lgi": 0x17,
+    "mcs0-sgi": 0x18,
+    "mcs1-sgi": 0x19,
+    "mcs2-sgi": 0x1A,
+    "mcs3-sgi": 0x1B,
+    "mcs4-sgi": 0x1C,
+    "mcs5-sgi": 0x1D,
+    "mcs6-sgi": 0x1E,
+    "mcs7-sgi": 0x1F,
+}
+WIFI_RATE_NAMES = {value: name for name, value in WIFI_RATES.items()}
+# 固件默认档（wireless_link.hpp 的 DEFAULT_WIFI_RATE）
+WIFI_RATE_DEFAULT = 0x1F
 
 # USB 能力（GetUsbConfig）的 tag 与取值域，与固件 usb_capability.hpp 一致
 TAG_USB_SUPPORTED = 0x60
@@ -266,6 +309,14 @@ def render_config(values):
             value = MODE.get(int.from_bytes(raw, "big"), "?") if raw is not None else "?"
         elif name == "peer_mac":
             value = ":".join(f"{byte:02x}" for byte in raw) if raw else "unpaired"
+        elif name == "wifi_rate":
+            # 未知档位（固件比本文件新）按原始值显示，不猜名字
+            code = int.from_bytes(raw, "big") if raw else None
+            value = (
+                "?"
+                if code is None
+                else f"{WIFI_RATE_NAMES.get(code, 'unknown')}(0x{code:02x})"
+            )
         else:
             value = raw.decode("utf-8", "replace") if raw is not None else ""
         parts.append(f"{name}={value}")
@@ -376,6 +427,32 @@ def cmd_set_mode(args):
     print("status=ok")
 
 
+def cmd_set_rate(args):
+    if args.list:
+        for name, value in sorted(WIFI_RATES.items(), key=lambda item: item[1]):
+            mark = " (默认)" if value == WIFI_RATE_DEFAULT else ""
+            print(f"0x{value:02x}  {name}{mark}")
+        return
+
+    if args.rate is None:
+        die("需要给出速率档位（--list 可列出全部）")
+    if args.rate in WIFI_RATES:
+        value = WIFI_RATES[args.rate]
+    else:
+        try:
+            value = int(args.rate, 0)
+        except ValueError:
+            die(f"未知档位 {args.rate!r}；--list 可列出全部")
+        if value not in WIFI_RATE_NAMES:
+            die(f"档位 0x{value:02x} 不在固件支持范围内（--list 可列出全部）")
+
+    # 设备端应用到本地单播 peer，并把同一条控制请求转发给对端：两端跑同一档位，
+    # 上行与下行的丢包率才可比。转发是尽力而为的，对端没跟上时重发一次即可。
+    decode(fetch(find_device(), CMD_SET_WIFI_RATE, value))
+    print(f"status=ok rate={WIFI_RATE_NAMES.get(value, 'unknown')}(0x{value:02x})")
+    print("mlinkctl: 档位已下发本机并转发对端（对端未跟随时重发一次）", file=sys.stderr)
+
+
 def cmd_action(args):
     decode(fetch(find_device(), args.cmd_code))
     print("status=ok")
@@ -461,6 +538,11 @@ def build_parser():
     set_mode = subparsers.add_parser("set-mode", help="切换运行模式")
     set_mode.add_argument("mode", choices=sorted(MODE_ARG), help="local 或 wireless")
     set_mode.set_defaults(handler=cmd_set_mode)
+
+    set_rate = subparsers.add_parser("set-rate", help="设置 ESP-NOW 发送速率档位（两端同时应用）")
+    set_rate.add_argument("rate", nargs="?", help="档位名（如 mcs7-sgi）或数值（如 0x1F）")
+    set_rate.add_argument("--list", action="store_true", help="列出全部档位后退出")
+    set_rate.set_defaults(handler=cmd_set_rate)
 
     ping = subparsers.add_parser("ping", help="探测已配对对端（ESP-NOW 往返时延）")
     ping.add_argument("-c", "--count", type=int, default=1, metavar="N", help="探测次数（默认 1）")

@@ -316,7 +316,6 @@ void Application::pairing_completed()
     leave_pairing("completed");
 }
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
 void Application::clear_pairing()
 {
     // 先取旧记录（擦除后就取不到了）：NVS 记录与 ESP-NOW peer 表一起清，
@@ -396,10 +395,14 @@ void Application::consume_pending_action()
         break;
     case ConfigChannel::Action::Reset:
         // 删除失败不回滚：重启后的构造逻辑会按残留记录自愈
-        ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and USB capability records, rebooting");
+        ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and WiFi rate, rebooting");
         (void)peer_mac_erase();
         (void)m_mode_key.erase();
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
         (void)usb_capability_erase();
+#endif
+        // 速率档位不做持久化，这里显式回默认档：恢复出厂设置后射频参数也应回到默认
+        (void)m_wireless_link.set_wifi_rate(DEFAULT_WIFI_RATE);
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
@@ -408,6 +411,7 @@ void Application::consume_pending_action()
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
     case ConfigChannel::Action::ApplyUsbConfig: {
         UsbCapabilitySettings draft;
         if (!m_config_channel.take_usb_config_draft(&draft))
@@ -431,9 +435,20 @@ void Application::consume_pending_action()
         m_usb.apply_usb_capability(draft);
         break;
     }
+#else
+    case ConfigChannel::Action::ApplyUsbConfig:
+        // 无 USB 侧不存在 USB 能力（既没有可重建的描述符，也没有草稿槽）：
+        // 只有对端转发来的控制请求可能投递到这个动作，记日志忽略
+        ESP_LOGW(TAG, "ApplyUsbConfig ignored: no USB on this target");
+        break;
+#endif
+    case ConfigChannel::Action::SetWifiRate:
+        // ESP-NOW 发送速率档位。应用会操作 WiFi 驱动，因此只能在这里（主循环）
+        // 做——命令的接受方既可能是本机 EP0，也可能是转发的对端请求。
+        (void)m_wireless_link.set_wifi_rate(arg);
+        break;
     }
 }
-#endif
 
 void Application::run()
 {
@@ -441,10 +456,12 @@ void Application::run()
     {
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
         // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
         consume_pending_action();
-#endif
+
+        // 无线侧与对端的档位同步：接收回调只登记待生效值（不可在回调里操作
+        // WiFi 驱动），实际应用在这里
+        m_wireless_link.poll();
 
         // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
         m_config_channel.poll_ping_timeout();

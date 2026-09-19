@@ -162,8 +162,6 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
     return snapshot;
 }
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-
 // ---- 协议（固件与上位机的唯一契约，上位机见 tools/mlinkctl.py 与
 //      tools/mlink-webui/src/lib/protocol.ts）----
 //
@@ -196,8 +194,16 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //   0x16 SetUsbConfig   OUT：提交 USB 能力草稿，只校验不落盘不生效
 //   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
 //   0x18 Ping           探测已配对对端（存活与往返时延，结果走 GetStats）
+//   0x19 SetWifiRate    参数 = wifi_phy_rate_t 原值，ESP-NOW 发送速率档位
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
+//
+// 无 USB 侧（接收端）没有 EP0，它的设置由 USB 侧把整条控制请求经
+// RelayedUsbControl 转发过来，在这里用同一张命令表执行（见
+// ConfigChannel::on_relayed_control）。因此命令表在两端完全一致：标了
+// "两端" 的命令由 USB 侧在接受的当下转发一次，只读命令（GetStats /
+// GetConfig / GetUsbConfig）在无 USB 侧按 Unsupported 应答，因为那里没有
+// 宿主可读的状态。
 //
 // USB 能力三阶段（0x16 → 0x03 → 0x17）：0x16 是 OUT 请求、回不了状态帧，
 // 因此只做接收与校验；主机用 0x03 读出草稿状态（合法待应用 / 被拒 + 原因），
@@ -224,6 +230,7 @@ enum class Cmd : u8
     SetUsbConfig = 0x16,
     ApplyUsbConfig = 0x17,
     Ping = 0x18,
+    SetWifiRate = 0x19,
 };
 
 enum class Status : u8
@@ -236,6 +243,151 @@ enum class Status : u8
     Busy = 0x05,        // 上一个动作尚未被主循环取走
 };
 
+/** 控制请求 bmRequestType 的方向位（TUSB_DIR_IN_MASK；无 USB 侧不能引 tusb.h） */
+constexpr u8 CONTROL_DIR_IN = 0x80;
+} // namespace
+
+/** 空 TLV 区的响应帧：长度、状态与命令回显都由调用方给定 */
+u16 ConfigChannel::build_empty_response(u8 cmd, u8 seq, u8 status)
+{
+    m_response[0] = static_cast<u8>(FRAME_MAGIC >> 8);
+    m_response[1] = static_cast<u8>(FRAME_MAGIC);
+    m_response[2] = cmd;
+    m_response[3] = seq;
+    m_response[4] = 0;
+    m_response[5] = 0;
+    m_response[6] = status;
+    m_response[7] = 0;
+    return FRAME_HEADER_SIZE;
+}
+
+bool ConfigChannel::post_action(Action action, u8 arg)
+{
+    portENTER_CRITICAL(&m_action_lock);
+    const bool free_slot = m_pending_action == Action::None;
+    if (free_slot)
+    {
+        m_pending_arg = arg;
+        m_pending_action = action;
+    }
+    portEXIT_CRITICAL(&m_action_lock);
+    return free_slot;
+}
+
+bool ConfigChannel::take_action(Action *action, u8 *arg)
+{
+    portENTER_CRITICAL(&m_action_lock);
+    const Action pending = m_pending_action;
+    if (pending != Action::None)
+    {
+        if (arg != nullptr)
+        {
+            *arg = m_pending_arg;
+        }
+        m_pending_action = Action::None;
+    }
+    portEXIT_CRITICAL(&m_action_lock);
+
+    *action = pending;
+    return pending != Action::None;
+}
+
+u16 ConfigChannel::post_action_response(u8 cmd, u8 seq, Action action, u8 arg)
+{
+    if (!post_action(action, arg))
+    {
+        return build_empty_response(cmd, seq, static_cast<u8>(Status::Busy));
+    }
+    // 投递成功即唤醒主循环：动作不必等满一个主循环节拍
+    xSemaphoreGive(Application::get_instance().main_task_wake());
+    return build_empty_response(cmd, seq, static_cast<u8>(Status::Ok));
+}
+
+u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
+{
+    switch (static_cast<Cmd>(cmd))
+    {
+    case Cmd::SetMode:
+        // 参数只有 local/wireless 两个取值，其余按 malformed 拒绝且不占动作槽
+        return arg <= static_cast<u8>(Mode::Wireless)
+                   ? post_action_response(cmd, seq, Action::SetMode, arg)
+                   : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+    case Cmd::EnterPairing:
+        return post_action_response(cmd, seq, Action::EnterPairing, 0);
+    case Cmd::ClearPair:
+        return post_action_response(cmd, seq, Action::ClearPair, 0);
+    case Cmd::Reset:
+        return post_action_response(cmd, seq, Action::Reset, 0);
+    case Cmd::Reboot:
+        return post_action_response(cmd, seq, Action::Reboot, 0);
+    case Cmd::ExitPairing:
+        return post_action_response(cmd, seq, Action::ExitPairing, 0);
+    case Cmd::Ping:
+        return post_action_response(cmd, seq, Action::Ping, 0);
+    case Cmd::SetWifiRate:
+        // 档位取值域由无线链路定义（PHY 模式由档位推导）；非法值不占动作槽
+        return mlink::wifi_rate_supported(arg)
+                   ? post_action_response(cmd, seq, Action::SetWifiRate, arg)
+                   : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    case Cmd::GetStats:
+        return build_stats_response(cmd, seq);
+    case Cmd::GetConfig:
+        return build_config_response(cmd, seq);
+    case Cmd::GetUsbConfig:
+        return build_usb_config_response(cmd, seq);
+    case Cmd::SetUsbConfig:
+        // OUT 命令出现在 IN 方向：命令码有效但方向不对，按未识别命令处理
+        return build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
+    case Cmd::ApplyUsbConfig:
+        // 没有合法草稿就没什么可应用的（被拒的草稿不算，原因由 GetUsbConfig 报出）
+        return has_valid_usb_draft() ? post_action_response(cmd, seq, Action::ApplyUsbConfig, 0)
+                                     : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+#else
+    case Cmd::GetStats:
+    case Cmd::GetConfig:
+    case Cmd::GetUsbConfig:
+    case Cmd::SetUsbConfig:
+    case Cmd::ApplyUsbConfig:
+        // 只读命令与 USB 能力：本目标（无 USB 侧）没有宿主可读的状态可回
+        return build_empty_response(cmd, seq, static_cast<u8>(Status::Unsupported));
+#endif
+    default:
+        // 未定义的命令码：回带 UnknownCommand 状态的空帧（不回 STALL，
+        // 让上位机能明确区分"设备不支持该命令"与"传输层失败"）
+        return build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
+    }
+}
+
+void ConfigChannel::on_relayed_control(const payload::RelayedUsbControl &req)
+{
+    if (req.b_request != VENDOR_CODE)
+    {
+        return; // 不是配置通道的请求：对端版本不符时静默忽略
+    }
+
+    // 只处理 IN 方向：命令码与参数在 wValue 里，一次往返即可完成。OUT 方向
+    // 需要 USB 侧的 DATA 阶段状态机与草稿槽，本目标没有。
+    if ((req.bm_request_type & CONTROL_DIR_IN) == 0)
+    {
+        ESP_LOGW(TAG, "Relayed OUT control 0x%02X ignored on this target", req.b_request);
+        return;
+    }
+
+    const u8 cmd = static_cast<u8>(req.w_value & 0xFF);
+    const u8 arg = static_cast<u8>(req.w_value >> 8);
+    const u8 seq = static_cast<u8>(req.w_index & 0xFF);
+
+    // 只解释与投递：命令可能操作 WiFi 驱动，而本函数的调用方是无线接收回调，
+    // 不能在那里重入驱动。响应丢弃——转发是尽力而为的单向下发，发起端不等回执。
+    const u16 len = dispatch_control(cmd, arg, seq);
+    ESP_LOGI(TAG, "Relayed control 0x%02X (arg 0x%02X) dispatched, %u-byte response discarded", cmd, arg, len);
+}
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+
+namespace
+{
 // tag 段位：0x01-0x0F 设备状态、0x10-0x1F DAP、0x20-0x2F 无线、0x30-0x3F UART、
 // 0x40-0x4F 系统、0x50-0x5F 配置项、0x60-0x6F USB 能力。
 enum : u8
@@ -267,6 +419,7 @@ enum : u8
     TAG_IDF_VERSION = 0x43,      // string：ESP-IDF 版本（esp_app_desc.idf_ver）
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
+    TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
     TAG_USB_SUPPORTED = 0x60,    // u8：编译期支持的能力位（bit0 WebUSB / bit1 WinUSB）
     TAG_USB_WEBUSB = 0x61,       // u8：WebUSB 生效值 0/1
     TAG_USB_WINUSB = 0x62,       // u8：WinUSB 生效值 0/1
@@ -419,20 +572,6 @@ bool parse_usb_config(const u8 *data, usize len, ParsedUsbConfig *out)
 }
 } // namespace
 
-/** 空 TLV 区的响应帧：长度、状态与命令回显都由调用方给定 */
-u16 ConfigChannel::build_empty_response(u8 cmd, u8 seq, u8 status)
-{
-    m_response[0] = static_cast<u8>(FRAME_MAGIC >> 8);
-    m_response[1] = static_cast<u8>(FRAME_MAGIC);
-    m_response[2] = cmd;
-    m_response[3] = seq;
-    m_response[4] = 0;
-    m_response[5] = 0;
-    m_response[6] = status;
-    m_response[7] = 0;
-    return FRAME_HEADER_SIZE;
-}
-
 /** TLV 区填到 end 之后收尾：写帧头并回整帧长度（容量不足则退化为 internal） */
 u16 ConfigChannel::finish_response(u8 cmd, u8 seq, usize end)
 {
@@ -512,6 +651,8 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     {
         p += tlv_blob(m_response + p, TAG_CFG_PEER_MAC, peer_mac, sizeof(peer_mac));
     }
+
+    p += tlv_u8(m_response + p, TAG_CFG_WIFI_RATE, Application::get_instance().wireless_link().wifi_rate());
 
     return finish_response(cmd, seq, p);
 }
@@ -640,48 +781,6 @@ bool ConfigChannel::handle_usb_config_out(u8 rhport, u8 stage, const tusb_contro
     return true; // ACK 阶段：载荷已在 DATA 阶段处理完
 }
 
-bool ConfigChannel::post_action(Action action, u8 arg)
-{
-    portENTER_CRITICAL(&m_action_lock);
-    const bool free_slot = m_pending_action == Action::None;
-    if (free_slot)
-    {
-        m_pending_arg = arg;
-        m_pending_action = action;
-    }
-    portEXIT_CRITICAL(&m_action_lock);
-    return free_slot;
-}
-
-bool ConfigChannel::take_action(Action *action, u8 *arg)
-{
-    portENTER_CRITICAL(&m_action_lock);
-    const Action pending = m_pending_action;
-    if (pending != Action::None)
-    {
-        if (arg != nullptr)
-        {
-            *arg = m_pending_arg;
-        }
-        m_pending_action = Action::None;
-    }
-    portEXIT_CRITICAL(&m_action_lock);
-
-    *action = pending;
-    return pending != Action::None;
-}
-
-u16 ConfigChannel::post_action_response(u8 cmd, u8 seq, Action action, u8 arg)
-{
-    if (!post_action(action, arg))
-    {
-        return build_empty_response(cmd, seq, static_cast<u8>(Status::Busy));
-    }
-    // 投递成功即唤醒主循环：动作不必等满一个主循环节拍
-    xSemaphoreGive(Application::get_instance().main_task_wake());
-    return build_empty_response(cmd, seq, static_cast<u8>(Status::Ok));
-}
-
 bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_request_t *request)
 {
     if (request->bRequest != VENDOR_CODE)
@@ -705,64 +804,48 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
     const u8 cmd = static_cast<u8>(request->wValue & 0xFF);
     const u8 arg = static_cast<u8>(request->wValue >> 8);
     const u8 seq = static_cast<u8>(request->wIndex & 0xFF);
-    u16 len = FRAME_HEADER_SIZE;
-    switch (static_cast<Cmd>(cmd))
+
+    // 需要两端一致的命令先转发给对端，再走本机：转发帧因此走当前（仍然可用的）
+    // 链路参数，不会出现"本机已切到问题档位、转发帧随即丢失"的两端不一致
+    if (cmd == static_cast<u8>(Cmd::SetWifiRate) && mlink::wifi_rate_supported(arg))
     {
-    case Cmd::GetStats:
-        len = build_stats_response(cmd, seq);
-        break;
-    case Cmd::GetConfig:
-        len = build_config_response(cmd, seq);
-        break;
-    case Cmd::GetUsbConfig:
-        len = build_usb_config_response(cmd, seq);
-        break;
-    case Cmd::SetMode:
-        // 参数只有 local/wireless 两个取值，其余按 malformed 拒绝且不占动作槽
-        len = arg <= static_cast<u8>(Mode::Wireless)
-                  ? post_action_response(cmd, seq, Action::SetMode, arg)
-                  : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
-        break;
-    case Cmd::EnterPairing:
-        len = post_action_response(cmd, seq, Action::EnterPairing, 0);
-        break;
-    case Cmd::ClearPair:
-        len = post_action_response(cmd, seq, Action::ClearPair, 0);
-        break;
-    case Cmd::Reset:
-        len = post_action_response(cmd, seq, Action::Reset, 0);
-        break;
-    case Cmd::Reboot:
-        len = post_action_response(cmd, seq, Action::Reboot, 0);
-        break;
-    case Cmd::ExitPairing:
-        len = post_action_response(cmd, seq, Action::ExitPairing, 0);
-        break;
-    case Cmd::Ping:
-        len = post_action_response(cmd, seq, Action::Ping, 0);
-        break;
-    case Cmd::SetUsbConfig:
-        // OUT 命令出现在 IN 方向：命令码有效但方向不对，按未识别命令处理
-        len = build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
-        break;
-    case Cmd::ApplyUsbConfig:
-        // 没有合法草稿就没什么可应用的（被拒的草稿不算，原因由 GetUsbConfig 报出）
-        len = has_valid_usb_draft() ? post_action_response(cmd, seq, Action::ApplyUsbConfig, 0)
-                                    : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
-        break;
-    default:
-        // 未定义的命令码：回带 UnknownCommand 状态的空帧（不回 STALL，
-        // 让上位机能明确区分"设备不支持该命令"与"传输层失败"）
-        len = build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
-        break;
+        relay_to_peer(cmd, arg);
     }
 
+    u16 len = dispatch_control(cmd, arg, seq);
     if (len > request->wLength)
     {
         len = static_cast<u16>(request->wLength); // 主机要得更少：按 wLength 截断
     }
     tud_control_xfer(rhport, request, m_response, len);
     return true;
+}
+
+void ConfigChannel::relay_to_peer(u8 cmd, u8 arg)
+{
+    u8 peer_mac[ESP_NOW_ETH_ALEN];
+    if (!peer_mac_load(peer_mac))
+    {
+        ESP_LOGW(TAG, "No paired peer: command 0x%02X applied locally only", cmd);
+        return;
+    }
+
+    // 原样复刻主机那条控制请求：命令码与参数在 wValue、seq 在 wIndex，没有载荷
+    payload::RelayedUsbControl relay = {};
+    relay.len = 0;
+    relay.bm_request_type = CONTROL_DIR_IN;
+    relay.b_request = VENDOR_CODE;
+    relay.w_value = static_cast<u16>(cmd) | (static_cast<u16>(arg) << 8);
+    relay.w_index = 0;
+    relay.w_length = 0;
+    relay.data = nullptr;
+
+    const esp_err_t ret = Application::get_instance().wireless_link().send_relayed_usb_control(peer_mac, relay);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to relay command 0x%02X to " MACSTR ": %s", cmd, MAC2STR(peer_mac),
+                 esp_err_to_name(ret));
+    }
 }
 
 #endif // CONFIG_MEGUMINLINK_USB_SUPPORT
