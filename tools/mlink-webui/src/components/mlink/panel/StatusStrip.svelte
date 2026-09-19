@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { MODE_NAMES, PAIR_NAMES, type Stats } from '../../../lib/protocol';
-	import { formatUptime } from '../../../lib/rate';
+	import { formatUartOpen, formatUptime } from '../../../lib/rate';
 
 	let { stats }: { stats: Stats | null } = $props();
 
@@ -8,10 +8,17 @@
 
 	const pairTone: Tone = $derived(stats === null ? 'idle' : stats.pair === 1 ? 'ok' : stats.pair === 2 ? 'busy' : 'idle');
 
+	/** 串口状态三项：null = 设备不上报（老固件），此时不给配色 */
+	const uartHostOpen = $derived(stats?.uartHostOpen ?? null);
+	const uartTone: Tone | undefined = $derived(
+		uartHostOpen === null ? undefined : uartHostOpen !== 0 ? 'ok' : 'idle'
+	);
+
 	const items: { label: string; value: string; tone?: Tone }[] = $derived([
 		{ label: '链路模式', value: stats === null ? '—' : (MODE_NAMES[stats.mode] ?? '?') },
 		{ label: '配对状态', value: stats === null ? '—' : (PAIR_NAMES[stats.pair] ?? '?'), tone: pairTone },
 		{ label: 'RSSI', value: stats === null || stats.mode !== 1 ? '—' : `${stats.rssi} dBm` },
+		{ label: '串口', value: formatUartOpen(stats), tone: uartTone },
 		{ label: '开机时长', value: stats === null ? '—' : formatUptime(stats.uptimeMs) },
 	]);
 </script>

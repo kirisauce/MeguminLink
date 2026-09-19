@@ -59,6 +59,13 @@ const TAG_IDF_VERSION = 0x43;
 const TAG_CONFIG_MODE = 0x50;
 const TAG_CONFIG_PEER_MAC = 0x51;
 
+/** CDC ACM 串口状态的 tag（0x30-0x33 是 UART 字节计数器，这里从 0x34 续编）。 */
+const TAG_UART_HOST_OPEN = 0x34;
+const TAG_UART_BAUD = 0x35;
+const TAG_UART_DATA_BITS = 0x36;
+const TAG_UART_STOP_BITS = 0x37;
+const TAG_UART_PARITY = 0x38;
+
 /** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
 const TAG_USB_SUPPORTED = 0x60;
 const TAG_USB_WEBUSB = 0x61;
@@ -82,7 +89,12 @@ export const USB_REJECT_TEXT: Readonly<Record<number, string>> = {
 	3: '该能力在当前固件里未编译进来',
 };
 
-/** 统计快照。计数器一律 u32 累计值，回绕由上层按 (cur - prev) >>> 0 处理。 */
+/**
+ * 统计快照。计数器一律 u32 累计值，回绕由上层按 (cur - prev) >>> 0 处理。
+ *
+ * uart* 五项是 CDC ACM 串口状态（不在 STAT_FIELDS 里，因而也不参与速率差分）：
+ * 老固件不上报这些 tag，此时为 null，界面显示「—」而不是把它们当成 0。
+ */
 export type Stats = {
 	mode: number;
 	pair: number;
@@ -97,6 +109,11 @@ export type Stats = {
 	uartWlRxBytes: number;
 	uartWlTxBytes: number;
 	uptimeMs: number;
+	uartHostOpen: number | null;
+	uartBaud: number | null;
+	uartDataBits: number | null;
+	uartStopBits: number | null;
+	uartParity: number | null;
 };
 
 export type StatField = {
@@ -192,6 +209,18 @@ function parseTlv(frame: DataView, start: number, end: number): Map<number, Data
 	return tags;
 }
 
+/**
+ * CDC ACM 串口状态字段：它们是状态而不是计数器，既不进 STAT_FIELDS，
+ * 也不参与 rate.ts 的速率差分（CounterKey 显式把它们排除在外）。
+ */
+export type UartStateKey = 'uartHostOpen' | 'uartBaud' | 'uartDataBits' | 'uartStopBits' | 'uartParity';
+
+/** 缺失的 tag 一律为 null：区分"设备上报 0"与"设备根本没上报这个字段"。 */
+function readOptional(view: DataView | undefined): number | null {
+	if (view === undefined || view.byteLength === 0) return null;
+	return readValue(view, false);
+}
+
 function readValue(view: DataView | undefined, signed: boolean): number {
 	if (view === undefined || view.byteLength === 0) return 0;
 	switch (view.byteLength) {
@@ -244,6 +273,11 @@ export function decodeStats(frame: DataView): Stats {
 	for (const field of STAT_FIELDS) {
 		stats[field.key] = readValue(tags.get(field.tag), field.signed === true);
 	}
+	stats.uartHostOpen = readOptional(tags.get(TAG_UART_HOST_OPEN));
+	stats.uartBaud = readOptional(tags.get(TAG_UART_BAUD));
+	stats.uartDataBits = readOptional(tags.get(TAG_UART_DATA_BITS));
+	stats.uartStopBits = readOptional(tags.get(TAG_UART_STOP_BITS));
+	stats.uartParity = readOptional(tags.get(TAG_UART_PARITY));
 	return stats;
 }
 

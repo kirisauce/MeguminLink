@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import type uPlot from 'uplot';
 	import { MlinkSession } from '../../../lib/session.svelte';
-	import { formatBytes, formatCount, formatRate, type CounterKey } from '../../../lib/rate';
+	import { formatBytes, formatCount, formatLineCoding, formatRate, type CounterKey } from '../../../lib/rate';
 	import DeviceBar from './DeviceBar.svelte';
 	import ConfigDrawer from '../drawer/ConfigDrawer.svelte';
 	import StatusStrip from '../panel/StatusStrip.svelte';
@@ -54,6 +54,9 @@
 		{ label: '接收', rate: byteRate('wlRxBytes'), total: byteTotal('wlRxBytes') },
 	]);
 
+	/** UART 卡片副标题：桥接形态 + 主机下发的线编码（设备不上报时为「—」）。 */
+	const uartSubtitle = $derived(`${wireless ? 'CDC ⇄ 无线桥' : 'CDC ↔ 片上 UART'} · ${formatLineCoding(stats)}`);
+
 	/** 把滚动窗口内的采样点抽成 uPlot 的列式数据；无效点保持 null，曲线在该处断开。 */
 	function buildData(keys: CounterKey[]): uPlot.AlignedData {
 		const xs: number[] = [];
@@ -99,7 +102,7 @@
 			<StatCard title="USB-DAP" subtitle="CMSIS-DAP 调试链路" rows={dapRows} />
 			<StatCard
 				title={wireless ? 'UART · Wireless' : 'UART · Local'}
-				subtitle={wireless ? 'CDC ⇄ 无线桥' : 'CDC ↔ 片上 UART'}
+				subtitle={uartSubtitle}
 				rows={uartRows}
 			/>
 			{#if wireless}

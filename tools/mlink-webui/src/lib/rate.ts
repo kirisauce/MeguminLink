@@ -7,17 +7,20 @@
  * Δt 为 0 或超过 MAX_GAP_MS 时（设备重启、长时间挂起）本次速率判为无效。
  */
 
-import { STAT_FIELDS, type Stats } from './protocol';
+import { STAT_FIELDS, type Stats, type UartStateKey } from './protocol';
 
 /** 一次采样跨越这么久就认为数据不再连续（设备重启或页面长时间挂起）。 */
 export const MAX_GAP_MS = 2000;
 
-/** 参与速率计算的字段（即所有计数器，排除状态与 uptime）。 */
+/**
+ * 参与速率计算的字段：STAT_FIELDS 里除状态位与 uptime 之外的全部计数器。
+ * 串口状态（UartStateKey）不在 STAT_FIELDS 里，这里再从类型上排除一次。
+ */
+export type CounterKey = Exclude<keyof Stats, 'mode' | 'pair' | 'rssi' | 'uptimeMs' | UartStateKey>;
+
 export const COUNTER_KEYS = STAT_FIELDS.filter(
 	(field) => field.key !== 'mode' && field.key !== 'pair' && field.key !== 'rssi' && field.key !== 'uptimeMs'
-).map((field) => field.key);
-
-export type CounterKey = (typeof COUNTER_KEYS)[number];
+).map((field) => field.key as CounterKey);
 
 /** 各计数器的每秒增量。 */
 export type Rates = Record<CounterKey, number>;
@@ -75,6 +78,26 @@ export function formatCompact(value: number): string {
 /** 命令数按整数显示，速率按每秒次数。 */
 export function formatCount(value: number): string {
 	return Number.isFinite(value) ? String(Math.round(value)) : '—';
+}
+
+/** CDC 停止位枚举（0=1、1=1.5、2=2）。 */
+const STOP_BITS_TEXT: Readonly<Record<number, string>> = { 0: '1', 1: '1.5', 2: '2' };
+
+/** CDC 校验枚举（0=无、1=奇、2=偶、3=Mark、4=Space）。 */
+const PARITY_TEXT: Readonly<Record<number, string>> = { 0: 'N', 1: 'O', 2: 'E', 3: 'M', 4: 'S' };
+
+/** CDC 线编码显示（如 115200 8N1）；设备不上报（老固件）时返回「—」。 */
+export function formatLineCoding(stats: Stats | null): string {
+	if (stats === null || stats.uartBaud === null || stats.uartDataBits === null) return '—';
+	const stop = STOP_BITS_TEXT[stats.uartStopBits ?? 0] ?? '?';
+	const parity = PARITY_TEXT[stats.uartParity ?? 0] ?? '?';
+	return `${stats.uartBaud} ${stats.uartDataBits}${parity}${stop}`;
+}
+
+/** 串口是否被主机打开（TinyUSB 的 DTR）；设备不上报时返回「—」。 */
+export function formatUartOpen(stats: Stats | null): string {
+	if (stats === null || stats.uartHostOpen === null) return '—';
+	return stats.uartHostOpen !== 0 ? '已打开' : '未打开';
 }
 
 export function formatUptime(ms: number): string {
