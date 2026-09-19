@@ -22,6 +22,11 @@ export const PID = 0x4020;
 export const VENDOR_CODE = 0x4d;
 export const CMD_GET_STATS = 0x01;
 export const CMD_GET_CONFIG = 0x02;
+export const CMD_SET_MODE = 0x10;
+export const CMD_ENTER_PAIRING = 0x11;
+export const CMD_CLEAR_PAIR = 0x12;
+export const CMD_RESET = 0x13;
+export const CMD_REBOOT = 0x14;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -39,6 +44,9 @@ export const STATUS_NAMES: Readonly<Record<number, string>> = {
 
 export const MODE_NAMES: Readonly<Record<number, string>> = { 0: 'local', 1: 'wireless' };
 export const PAIR_NAMES: Readonly<Record<number, string>> = { 0: 'idle', 1: 'paired', 2: 'pairing' };
+/** SetMode 的参数取值，与固件 Mode 枚举一致。 */
+export const MODE_LOCAL = 0;
+export const MODE_WIRELESS = 1;
 
 /** GetConfig 响应的 tag：0x41-0x43 设备身份，0x50/0x51 配置项。 */
 const TAG_FW_VERSION = 0x41;
@@ -200,14 +208,19 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 	};
 }
 
-/** 发一次厂商 IN 请求并取回响应帧。seq 仅用于诊断请求/响应错位，设备原样回显。 */
-async function transferIn(device: USBDevice, cmd: number, seq: number): Promise<DataView> {
+/**
+ * 发一次厂商 IN 请求并取回响应帧。
+ *
+ * wValue 低字节是命令码、高字节是命令参数（与固件同一约定）；seq 仅用于
+ * 诊断请求/响应错位，设备原样回显。
+ */
+async function transferIn(device: USBDevice, wValue: number, seq: number): Promise<DataView> {
 	const result = await device.controlTransferIn(
 		{
 			requestType: 'vendor',
 			recipient: 'device',
 			request: VENDOR_CODE,
-			value: cmd,
+			value: wValue,
 			index: seq & 0xff,
 		},
 		MAX_RESPONSE
@@ -227,4 +240,15 @@ export async function readStats(device: USBDevice, seq: number): Promise<Stats> 
 
 export async function readConfig(device: USBDevice, seq: number): Promise<DeviceConfig> {
 	return decodeConfig(await transferIn(device, CMD_GET_CONFIG, seq));
+}
+
+/**
+ * 下发一条控制命令。
+ *
+ * 动作命令的响应帧 TLV 区为空：status == ok 只表示设备已接受投递，动作由
+ * 设备主循环执行（结果看后续轮询的模式/配对状态）；busy 表示设备端还有
+ * 未取走的动作。status != ok 与传输失败都由 parseFrame 抛 ProtocolError。
+ */
+export async function runCommand(device: USBDevice, cmd: number, seq: number, arg = 0): Promise<void> {
+	parseFrame(await transferIn(device, cmd | (arg << 8), seq));
 }

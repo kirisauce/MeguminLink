@@ -9,12 +9,19 @@
  */
 
 import {
+	CMD_CLEAR_PAIR,
+	CMD_ENTER_PAIRING,
+	CMD_REBOOT,
+	CMD_RESET,
+	CMD_SET_MODE,
+	PID,
 	ProtocolError,
+	STATUS_NAMES,
 	STAT_FIELDS,
 	VID,
-	PID,
 	readConfig,
 	readStats,
+	runCommand,
 	type DeviceConfig,
 	type Stats,
 } from './protocol';
@@ -52,6 +59,21 @@ function describeError(error: unknown): string {
 	return String(error);
 }
 
+/** 控制命令失败的行内文案：设备返回的错误状态优先于传输层描述。 */
+function describeCommandError(error: unknown): string {
+	if (error instanceof ProtocolError && error.status !== null) {
+		switch (error.status) {
+			case 0x01:
+				return '固件不支持该命令';
+			case 0x05:
+				return '设备忙，请稍后重试';
+			default:
+				return `设备返回 ${STATUS_NAMES[error.status] ?? `0x${error.status.toString(16)}`}`;
+		}
+	}
+	return `传输失败：${describeError(error)}`;
+}
+
 export class MlinkSession {
 	state = $state<ConnectionState>('disconnected');
 	stats = $state<Stats | null>(null);
@@ -66,6 +88,10 @@ export class MlinkSession {
 	intervalMs = $state(POLL_INTERVAL_MS);
 	/** 设备身份与配置项；读不到（老固件没有该命令、或未连接）时为 null。 */
 	config = $state<DeviceConfig | null>(null);
+	/** 控制命令在途：期间界面禁用全部操作按钮，避免重复提交。 */
+	commandPending = $state(false);
+	/** 最近一次控制命令的失败说明；下一条命令开始时清空。 */
+	commandError = $state<string | null>(null);
 
 	#timer: ReturnType<typeof setTimeout> | null = null;
 	#seq = 0;
@@ -133,6 +159,7 @@ export class MlinkSession {
 		this.history = [];
 		this.error = null;
 		this.config = null;
+		this.commandError = null;
 		this.state = this.supported ? 'disconnected' : 'unsupported';
 		if (device?.opened === true) {
 			try {
@@ -179,6 +206,48 @@ export class MlinkSession {
 			this.#seq = (this.#seq + 1) & 0xff;
 		} catch {
 			this.config = null;
+		}
+	}
+
+	async setMode(mode: number): Promise<void> {
+		await this.#sendCommand(CMD_SET_MODE, mode);
+	}
+
+	async enterPairing(): Promise<void> {
+		await this.#sendCommand(CMD_ENTER_PAIRING);
+	}
+
+	async clearPair(): Promise<void> {
+		await this.#sendCommand(CMD_CLEAR_PAIR);
+	}
+
+	async reset(): Promise<void> {
+		await this.#sendCommand(CMD_RESET);
+	}
+
+	async reboot(): Promise<void> {
+		await this.#sendCommand(CMD_REBOOT);
+	}
+
+	/**
+	 * 下发一条控制命令。
+	 *
+	 * ok 只代表设备已接受投递：动作由设备主循环执行，结果通过轮询的模式与
+	 * 配对状态体现；失败一律转成 commandError 交给界面行内显示。未连接或
+	 * 已有命令在途时直接返回（按钮同时是禁用的，这里是兜底）。
+	 */
+	async #sendCommand(cmd: number, arg = 0): Promise<void> {
+		const device = this.device;
+		if (device === null || this.commandPending) return;
+		this.commandPending = true;
+		this.commandError = null;
+		try {
+			await runCommand(device, cmd, this.#seq, arg);
+			this.#seq = (this.#seq + 1) & 0xff;
+		} catch (error) {
+			this.commandError = describeCommandError(error);
+		} finally {
+			this.commandPending = false;
 		}
 	}
 
@@ -244,6 +313,7 @@ export class MlinkSession {
 			this.stats = null;
 			this.rates = null;
 			this.config = null;
+			this.commandError = null;
 			this.#cancel();
 			this.state = 'disconnected';
 			this.error = '设备已断开';

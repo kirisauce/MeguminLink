@@ -30,11 +30,15 @@ bun run preview
 
 **监控与烧录可以并存**：页面只发送 EP0 的 device recipient 控制传输，不 claim 任何接口，所以 OpenOCD / pyOCD 可以同时使用同一台设备。
 
-## 设备配置（只读）
+## 设备配置
 
-「配置」按钮（连接后出现在右上角）打开右侧抽屉，显示设备身份与配置项：固件版本、芯片、ESP-IDF 版本、当前链路模式、配对状态、已配对对端 MAC。这些字段来自配置通道的 `GET_CONFIG`（cmd 0x02），打开抽屉时刷新一次——版本与配对是低频信息，不占用 200ms 轮询。
+「配置」按钮（连接后出现在右上角）打开右侧抽屉。
 
-配置的**修改**不在本页面：改模式、配对、重启等动作由命令行工具 `tools/mlinkctl.py` 完成（`mlinkctl set-mode` / `pair` / `unpair` / `reset` / `reboot`）。设备身份读不到时（老固件没有该命令）字段显示「—」，监控本身不受影响。
+上半是设备身份与配置项：固件版本、芯片、ESP-IDF 版本、当前链路模式、配对状态、已配对对端 MAC。这些字段来自配置通道的 `GET_CONFIG`（cmd 0x02），打开抽屉时刷新一次——版本与配对是低频信息，不占用 200ms 轮询；设备身份读不到时（老固件没有该命令）显示「—」。
+
+下半是操作区：**链路模式**用分段控件切换 local / wireless（当前模式高亮），另有**触发重新配对**（仅 wireless 可用）、**清除配对记录**、**重启设备**、**恢复默认**。三个破坏性动作在按钮上就地二次确认后才下发。
+
+命令返回只代表设备已接受投递，真正的执行在设备主循环（模式与配对状态由 200ms 轮询跟上）；失败（设备忙 / 固件不支持 / 传输错误）在操作区行内提示，命令在途时全部按钮禁用。对应命令行工具是 `mlinkctl set-mode` / `pair` / `unpair` / `reset` / `reboot`。
 
 ## 显示约定
 
@@ -58,7 +62,7 @@ src/lib/protocol.ts        EP0 请求构造与 8B 帧头 + TLV 解析（与固�
 src/lib/session.svelte.ts  WebUSB 会话：授权、轮询、拔插、可见性降频、60 秒采样窗口
 src/lib/rate.ts            速率差分、u32 回绕、数值与时长格式化
 src/styles/tokens.css      M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
-src/components/            DeviceBar / StatusStrip / StatCard / StatTable / RateChart / Dashboard
+src/components/            DeviceBar / StatusStrip / StatCard / StatTable / RateChart / Dashboard / ConfigDrawer + ConfigActions
 src/pages/index.astro      唯一页面，挂载 Dashboard island
 ```
 
