@@ -11,7 +11,7 @@ namespace mlink
 /**
  * DAP 命令缓冲建议容量：必须不小于传输层能送进来的最大命令。无线链路的单帧
  * 载荷上限由 ESP-NOW v2 的单帧容量扣掉公共帧头与可靠传输扩展头得出（见
- * wireless_link.hpp 的 MAX_DAP_PAYLOAD_SIZE），取整留一点余量即为本值。USB
+ * wireless/frame.hpp 的 MAX_DAP_PAYLOAD_SIZE），取整留一点余量即为本值。USB
  * bulk 端点仍按 DAP_PACKET_SIZE 分包到达，接收侧由 dap_request_size() 按命令
  * 自描述长度重组为完整命令。
  */
@@ -56,7 +56,7 @@ u16 dap_execute_once(const u8 *request, u16 req_len, u8 *response, size_t respon
  * （取命令 → dap_execute_once → 响应回传），本函数不返回。
  *
  * 供所有输入源复用：
- * - 无线接收端（命令来自无线队列，响应无线回发，见 wireless_link.cc）；
+ * - 无线接收端（命令来自无线队列，响应无线回发，见 wireless/link.cc）；
  * - USB 本地执行（命令来自 USB ringbuffer，响应 USB 写回，见 usb.cc）。
  *
  * 调用方负责以高优先级创建承载任务（SWD 位碰撞执行期间不可被抢占），

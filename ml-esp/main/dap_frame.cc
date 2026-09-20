@@ -1,6 +1,6 @@
 #include "meguminlink/dap_frame.hpp"
 
-// 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc / wireless_link.cc
+// 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc / wireless/link.cc
 // 一致）。DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
 // DAP.h 仅在未定义时提供默认值（#ifndef 保护）；顺序反了会触发宏重定义。
 // clang-format off

@@ -3,7 +3,7 @@
 #define __MEGUMINLINK_ARQ_LINK_HPP__
 
 #include "esp_err.h"
-#include "meguminlink/arq.hpp"
+#include "meguminlink/wireless/arq.hpp"
 #include "meguminlink/common.hpp"
 
 #include "freertos/FreeRTOS.h"
@@ -55,7 +55,7 @@ esp_err_t arq_settings_store(const ArqSettings &settings);
  * 并管理会话握手、待发确认与重复帧重放的排队。
  *
  * 它与帧的编解码无关——只认"载荷 + 序号 + 标志"，帧封成什么样、扩展头怎么排由
- * wireless_link 决定。因此它既不需要认识 Packet，也不会和 wireless_link.hpp 互相
+ * wireless_link 决定。因此它既不需要认识 Packet，也不会和 wireless/link.hpp 互相
  * 包含。
  *
  * 上下文约定是本层最要紧的一条：

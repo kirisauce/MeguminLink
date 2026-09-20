@@ -3,7 +3,8 @@
 #include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
 #include "meguminlink/dap_frame.hpp"     // dap_request_size（USB 命令重组）
 #include "meguminlink/usb/usb_capability.hpp"
-#include "meguminlink/wireless_link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
+#include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/link.hpp" // WirelessLink::forward_dap_command（Wireless 转发）
 
 #include <esp_check.h>
 #include <esp_log.h>

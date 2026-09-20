@@ -1,7 +1,7 @@
 #include "meguminlink/dap_executor.hpp"
 #include "meguminlink/dap_frame.hpp"
 #include "esp_log.h"
-#include "meguminlink/wireless_link.hpp" // MAX_DAP_PAYLOAD_SIZE（响应缓冲）
+#include "meguminlink/wireless/link.hpp" // MAX_DAP_PAYLOAD_SIZE（响应缓冲）
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc 一致）。
 // DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，

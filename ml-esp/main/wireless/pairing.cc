@@ -1,10 +1,11 @@
-#include "meguminlink/pairing.hpp"
+#include "meguminlink/wireless/pairing.hpp"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
-#include "meguminlink/wireless_link.hpp"
+#include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/link.hpp"
 #include <cstring>
 
 using namespace mlink;

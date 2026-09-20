@@ -1,4 +1,4 @@
-# ARQ 控制算法（main/arq.cc）的宿主机单元测试：把算法核心放在假时钟与假空口上跑，
+# ARQ 控制算法（main/wireless/arq.cc）的宿主机单元测试：把算法核心放在假时钟与假空口上跑，
 # 覆盖丢帧、MAC 失败、重复、乱序、序号回绕、熔断与流控，不需要烧板。
 #
 #   make        编译
@@ -14,8 +14,8 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++23 -Wall -Wextra -Werror -O1
 CPPFLAGS ?= -I ../main/include
 
-SOURCES = arq_host_test.cc ../main/arq.cc
-HEADERS = ../main/include/meguminlink/arq.hpp ../main/include/meguminlink/common.hpp
+SOURCES = arq_host_test.cc ../main/wireless/arq.cc
+HEADERS = ../main/include/meguminlink/wireless/arq.hpp ../main/include/meguminlink/common.hpp
 TARGET = build/arq_host_test
 
 all: $(TARGET)

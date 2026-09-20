@@ -1,7 +1,9 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
 #include "meguminlink/usb/usb_capability.hpp"
-#include "meguminlink/wireless_link.hpp" // WirelessDapExecutor（DapCommand 投递）
+#include "meguminlink/wireless/arq_link.hpp"
+#include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/link.hpp" // WirelessDapExecutor（DapCommand 投递）
 
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>

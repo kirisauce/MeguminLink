@@ -3,8 +3,12 @@
 #define __MEGUMINLINK_CONFIG_CHANNEL_HPP__
 
 #include "meguminlink/common.hpp"
-#include "meguminlink/wireless_link.hpp"
+#include "meguminlink/wireless/frame.hpp"
 #include "sdkconfig.h"
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+#include "meguminlink/wireless/arq_link.hpp"
+#endif
 
 // 存活探测状态用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
@@ -23,7 +27,7 @@ namespace mlink
  * 快照差分时处理（(cur - prev) & 0xFFFFFFFF）。计数器在所有目标上都累加
  * （无线接收端没有读取者，代价是几十字节 RAM），因此本模块在非 USB 目标
  * （如 ESP32-C3 接收端）上也参与构建，只有 EP0 协议部分按
- * CONFIG_MEGUMINLINK_USB_SUPPORT 裁剪——wireless_link.cc 的挂点因此无需 #if。
+ * CONFIG_MEGUMINLINK_USB_SUPPORT 裁剪——wireless/link.cc 的挂点因此无需 #if。
  *
  * 实例由 Application 持有（见 Application::config_channel）。
  * 协议细节见 config_channel.cc 顶部；上位机见 tools/mlinkctl.py。
@@ -37,10 +41,10 @@ class ConfigChannel
      */
     void add_dap_command(u16 request_bytes, u16 response_bytes);
 
-    /** ESP-NOW 一帧交给驱动发送（wireless_link.cc 的 send 调用） */
+    /** ESP-NOW 一帧交给驱动发送（wireless/link.cc 的 send 调用） */
     void add_wireless_tx(u16 bytes);
 
-    /** ESP-NOW 一帧接收（wireless_link.cc 的 recv_cb 调用，rssi 取自 rx_ctrl） */
+    /** ESP-NOW 一帧接收（wireless/link.cc 的 recv_cb 调用，rssi 取自 rx_ctrl） */
     void add_wireless_rx(u16 bytes, i8 rssi);
 
     /** Local 模式 UART 桥：CDC → UART */
@@ -57,7 +61,7 @@ class ConfigChannel
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     /**
-     * 一次丢包注入判定（wireless_link.cc 的 send 调用）：每个过白名单的 DAP /
+     * 一次丢包注入判定（wireless/link.cc 的 send 调用）：每个过白名单的 DAP /
      * 串口数据出向帧都记一次，dropped 另计。
      *
      * 两者之比即实际注入比例。注入是概率性的，"没注入"与"注入了但被协议掩盖"
@@ -77,7 +81,7 @@ class ConfigChannel
     void set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     /**
-     * 对端存活探测（Ping/Pong 空口往返，见 wireless_link.hpp 的 payload::Ping）。
+     * 对端存活探测（Ping/Pong 空口往返，见 wireless/frame.hpp 的 payload::Ping）。
      *
      * 探测由上位机定时下发（EP0 命令 0x18；WebUI 在轮询里按固定间隔发、CLI 用
      * ping 子命令发），设备不自主发起：没有上位机时链路保持静默。设备侧负责
@@ -153,7 +157,7 @@ class ConfigChannel
         SetLinkConfig,  // 落盘并应用可靠传输参数（草稿槽已由 SetLinkConfig 命令填好）
 #endif
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-        SetLoss,        // arg: 千分比（DAP/UART 出向帧的注入丢包率，见 wireless_link.hpp）
+        SetLoss,        // arg: 千分比（DAP/UART 出向帧的注入丢包率，见 wireless/link.hpp）
 #endif
     };
 

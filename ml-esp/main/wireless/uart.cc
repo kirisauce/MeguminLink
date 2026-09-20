@@ -1,4 +1,4 @@
-#include "meguminlink/wireless_uart.hpp"
+#include "meguminlink/wireless/uart.hpp"
 #include "meguminlink/app.hpp" // Application::send_uart_data（UART RX → 无线帧）
 #include "meguminlink/common.hpp"
 

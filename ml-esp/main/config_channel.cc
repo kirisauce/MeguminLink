@@ -2,6 +2,8 @@
 
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp" // peer_mac_load + esp_now.h（ESP_NOW_ETH_ALEN）
+#include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/link.hpp"
 
 #include <esp_app_desc.h>
 #include <esp_log.h>

@@ -153,7 +153,7 @@ MODE = {0: "local", 1: "wireless"}
 PAIR = {0: "idle", 1: "paired", 2: "pairing"}
 MODE_ARG = {"local": 0, "wireless": 1}
 
-# ESP-NOW 发送速率档位：名字 → wifi_phy_rate_t 原值（与固件 wireless_link.cc
+# ESP-NOW 发送速率档位：名字 → wifi_phy_rate_t 原值（与固件 wireless/link.cc
 # 的 phymode_for_rate 认可的范围一致，即 CCK / OFDM / HT20 MCS0-7）。
 # 名字按"调制族 + 标称速率"取，便于在实验里直接对照：档位越高越脆，长帧尤其明显。
 WIFI_RATES = {
@@ -190,10 +190,10 @@ WIFI_RATES = {
     "mcs7-sgi": 0x1F,
 }
 WIFI_RATE_NAMES = {value: name for name, value in WIFI_RATES.items()}
-# 固件默认档（wireless_link.hpp 的 DEFAULT_WIFI_RATE）
+# 固件默认档（wireless/link.hpp 的 DEFAULT_WIFI_RATE）
 WIFI_RATE_DEFAULT = 0x09
 
-# 注入丢包率上限（百分比）：固件按千分比存放，wireless_link.hpp 的
+# 注入丢包率上限（百分比）：固件按千分比存放，wireless/link.hpp 的
 # MAX_LOSS_PERMILLE = 255 即 25.5%。设备端只在发送端丢 DAP 与串口数据帧，
 # 配置通道的控制帧永远放行，因此丢包率开满也改得回来。
 LOSS_PERCENT_MAX = 25.5

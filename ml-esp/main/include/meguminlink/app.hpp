@@ -4,8 +4,9 @@
 
 #include "meguminlink/config_channel.hpp"
 #include "meguminlink/nvs_flash.hpp"
-#include "meguminlink/pairing.hpp"
-#include "meguminlink/wireless_link.hpp"
+#include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/pairing.hpp"
+#include "meguminlink/wireless/link.hpp"
 #include "sdkconfig.h"
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
@@ -17,7 +18,7 @@
 #endif
 
 #if !CONFIG_MEGUMINLINK_USB_SUPPORT
-#include "meguminlink/wireless_uart.hpp"
+#include "meguminlink/wireless/uart.hpp"
 #endif
 
 #if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
@@ -218,7 +219,7 @@ class Application
     WirelessUartBridge m_wireless_uart;
 #endif
 
-    /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless_link.hpp） */
+    /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless/link.hpp） */
     WirelessLink m_wireless_link;
 
     /** 配置/遥测通道（统计计数器 + EP0 厂商请求处理，见 config_channel.hpp） */

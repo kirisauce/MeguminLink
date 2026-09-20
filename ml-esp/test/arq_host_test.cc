@@ -1,4 +1,4 @@
-// ARQ 控制算法（meguminlink/arq.hpp）的宿主机单元测试：把算法核心放在假时钟与
+// ARQ 控制算法（meguminlink/wireless/arq.hpp）的宿主机单元测试：把算法核心放在假时钟与
 // 假空口上跑，覆盖丢帧、MAC 失败、重复、乱序、序号回绕、熔断与流控，不需要烧板。
 // 用法见同目录 Makefile：cd ml-esp/test && make run
 //
@@ -9,7 +9,7 @@
 // 这条单向模型覆盖了收发两个方向共用的全部算法；重复帧触发"重放缓存响应"那一步
 // 属于宿主侧（命令序号到响应序号的映射在链路适配层），这里只直接测 Sender::resend。
 
-#include "meguminlink/arq.hpp"
+#include "meguminlink/wireless/arq.hpp"
 
 #include <cstring>
 #include <deque>
