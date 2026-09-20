@@ -185,8 +185,9 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         return;
     }
     case PacketType::ArqReset: {
-        // 对端开了新会话：把本端序号基准拉回去对齐（迟到帧携带旧 epoch，会被挡掉）
-        link.m_arq.on_reset(rp.packet.payload.arq_reset.epoch, arq_now);
+        // 对端开了新会话：把本端序号基准拉回去对齐，并按代数决定是否采纳它的参数
+        // （迟到帧携带旧 epoch，会被挡住）
+        link.m_arq.on_reset(rp.packet.payload.arq_reset.epoch, rp.packet.payload.arq_reset.settings, arq_now);
         return;
     }
 #endif
@@ -226,11 +227,9 @@ esp_err_t WirelessLink::init()
         // 之前就绪（回调一注册就可能进帧）。重排缓冲本步不启用——窗口还是 1，
         // 乱序帧一律拒绝并由对端重传，无需额外的载荷存储。
         static_assert(MAX_DAP_PAYLOAD_SIZE <= ArqLink::MAX_PAYLOAD, "wire payload exceeds ARQ buffer");
-        arq::Config arq_config;
-        arq_config.window = CONFIG_MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW;
-        arq_config.reorder = false;
 
-        const esp_err_t arq_ret = m_arq.init(arq_config, MAX_DAP_PAYLOAD_SIZE);
+        // 参数从 NVS 读回（无记录即默认值）；窗口上限另由 Kconfig 约束，见 arq_link
+        const esp_err_t arq_ret = m_arq.init(arq_settings_load(), MAX_DAP_PAYLOAD_SIZE);
         ESP_RETURN_ON_ERROR(arq_ret, TAG, "m_arq.init() failed");
 
         const ArqLink::Callbacks arq_callbacks = {this, &WirelessLink::arq_transmit, &WirelessLink::arq_send_ack,
@@ -940,6 +939,21 @@ ArqLink::Snapshot WirelessLink::arq_snapshot() const
     return m_arq.snapshot();
 }
 
+ArqSettings WirelessLink::arq_settings() const
+{
+    return m_arq.settings();
+}
+
+esp_err_t WirelessLink::arq_apply_settings(const ArqSettings &settings, u32 now)
+{
+    return m_arq.apply_settings(settings, now);
+}
+
+bool WirelessLink::arq_take_settings_dirty()
+{
+    return m_arq.take_settings_dirty();
+}
+
 void WirelessLink::arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
                                 u16 ack, u16 sack, u8 window)
 {
@@ -1009,7 +1023,7 @@ void WirelessLink::arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window)
     }
 }
 
-void WirelessLink::arq_send_reset(void *ctx, u32 epoch, u16 ack, u16 sack, u8 window)
+void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window)
 {
     auto *self = static_cast<WirelessLink *>(ctx);
 
@@ -1027,6 +1041,7 @@ void WirelessLink::arq_send_reset(void *ctx, u32 epoch, u16 ack, u16 sack, u8 wi
     packet.arq.window = window;
     packet.arq.flags = 0;
     packet.payload.arq_reset.epoch = epoch;
+    packet.payload.arq_reset.settings = settings;
     const esp_err_t reset_ret = self->send_raw(peer_mac, packet);
     if (reset_ret != ESP_OK)
     {
@@ -1125,7 +1140,8 @@ size_t Packet::serialized_size() const
         break;
     }
     case PacketType::ArqReset: {
-        body = 1 + 4; // 类型 1B + 数据段 4B（epoch）；与 Probe 一样不带 len 字段
+        // 类型 1B + 数据段；与 Probe 一样不带 len 字段
+        body = 1 + ARQ_RESET_PAYLOAD_SIZE;
         break;
     }
 #endif
@@ -1273,8 +1289,18 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
     }
     case PacketType::ArqReset: {
         auto &content = payload.arq_reset;
-        MLINK_CHECK_SIZE(p, 4);
+        MLINK_CHECK_SIZE(p, ARQ_RESET_PAYLOAD_SIZE);
         content.epoch = p.read_u32();
+        content.settings.generation = p.read_u32();
+        content.settings.enable = p.read_u8();
+        content.settings.window = p.read_u8();
+        content.settings.max_retx = p.read_u8();
+        content.settings.breaker_failures = p.read_u8();
+        content.settings.rto_min_ms = p.read_u16();
+        content.settings.initial_rto_ms = p.read_u16();
+        content.settings.rto_max_ms = p.read_u16();
+        content.settings.delayed_ack_ms = p.read_u16();
+        content.settings.breaker_probe_ms = p.read_u16();
         break;
     }
 #endif
@@ -1403,9 +1429,21 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         break;
     }
     case PacketType::ArqReset: {
+        // 会话重置帧同时携带参数：这类帧周期性重发直到握手完成，参数因此自带
+        // 重传保证，不用再借那条尽力而为的中继通道
         auto &content = payload.arq_reset;
-        MLINK_CHECK_SIZE(s, 4);
+        MLINK_CHECK_SIZE(s, ARQ_RESET_PAYLOAD_SIZE);
         s.write_u32(content.epoch);
+        s.write_u32(content.settings.generation);
+        s.write_u8(content.settings.enable);
+        s.write_u8(content.settings.window);
+        s.write_u8(content.settings.max_retx);
+        s.write_u8(content.settings.breaker_failures);
+        s.write_u16(content.settings.rto_min_ms);
+        s.write_u16(content.settings.initial_rto_ms);
+        s.write_u16(content.settings.rto_max_ms);
+        s.write_u16(content.settings.delayed_ack_ms);
+        s.write_u16(content.settings.breaker_probe_ms);
         break;
     }
 #endif

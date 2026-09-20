@@ -206,6 +206,8 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
 //   0x18 Ping           探测已配对对端（存活与往返时延，结果走 GetStats）
 //   0x19 SetWifiRate    参数 = wifi_phy_rate_t 原值，ESP-NOW 发送速率档位
+//   0x1B SetLinkConfig  OUT：可靠传输参数（TLV 载荷，tag 见 payload 注释）；参数
+//                        由主机下发本机，本机再经会话重置帧同步给对端
 //   0x1A SetLoss        参数 = 注入丢包率千分比 0-255（0.1% 步进），0 = 关闭；
 //                        仅在 CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE 下存在
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
@@ -244,6 +246,7 @@ enum class Cmd : u8
     ApplyUsbConfig = 0x17,
     Ping = 0x18,
     SetWifiRate = 0x19,
+    SetLinkConfig = 0x1B,
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     SetLoss = 0x1A,
 #endif
@@ -361,6 +364,7 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
     case Cmd::GetUsbConfig:
         return build_usb_config_response(cmd, seq);
     case Cmd::SetUsbConfig:
+    case Cmd::SetLinkConfig:
         // OUT 命令出现在 IN 方向：命令码有效但方向不对，按未识别命令处理
         return build_empty_response(cmd, seq, static_cast<u8>(Status::UnknownCommand));
     case Cmd::ApplyUsbConfig:
@@ -373,6 +377,7 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
     case Cmd::GetUsbConfig:
     case Cmd::SetUsbConfig:
     case Cmd::ApplyUsbConfig:
+    case Cmd::SetLinkConfig:
         // 只读命令与 USB 能力：本目标（无 USB 侧）没有宿主可读的状态可回
         return build_empty_response(cmd, seq, static_cast<u8>(Status::Unsupported));
 #endif
@@ -441,6 +446,22 @@ enum : u8
     TAG_UART_DATA_BITS = 0x36,   // u8：数据位 5-8
     TAG_UART_STOP_BITS = 0x37,   // u8：停止位 0=1 1=1.5 2=2
     TAG_UART_PARITY = 0x38,      // u8：校验 0=无 1=奇 2=偶 3=Mark 4=Space
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    // 可靠传输统计：无线段（0x20-0x2F）已排满，单开 0x70-0x7F 一段
+    TAG_ARQ_STATE = 0x70,         // u8：bit0-3 生效窗口、bit7 熔断中
+    TAG_ARQ_TX = 0x71,            // u32：首次发出的可靠消息数
+    TAG_ARQ_RETX = 0x72,          // u32：重传次数
+    TAG_ARQ_ACKED = 0x73,         // u32：被确认的消息数
+    TAG_ARQ_FAILED = 0x74,        // u32：重传耗尽被丢弃的消息数
+    TAG_ARQ_DUP = 0x75,           // u32：收到的重复帧数
+    TAG_ARQ_OOO = 0x76,           // u32：超窗被拒的帧数
+    TAG_ARQ_SKIPPED = 0x77,       // u32：因对端放弃空洞而跳过的序号数
+    TAG_ARQ_REPLAYED = 0x78,      // u32：因重复命令重放响应的次数
+    TAG_ARQ_REPLAY_MISS = 0x79,   // u32：重放未命中的次数
+    TAG_ARQ_SRTT_MS = 0x7A,       // u32：平滑往返时延（毫秒）
+    TAG_ARQ_RTO_MS = 0x7B,        // u32：当前基础 RTO（毫秒）
+    TAG_ARQ_BREAKER_TRIPS = 0x7C, // u32：熔断触发次数
+#endif
     TAG_UPTIME = 0x40,           // u32：上电毫秒数（49.7 天回绕）
     TAG_FW_VERSION = 0x41,       // string：应用版本（esp_app_desc.version）
     TAG_CHIP_TARGET = 0x42,      // string：目标芯片（CONFIG_IDF_TARGET）
@@ -448,6 +469,18 @@ enum : u8
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
     TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    TAG_CFG_ARQ_GENERATION = 0x54,  // u32：参数代数（每次下发 +1）
+    TAG_CFG_ARQ_ENABLE = 0x55,      // u8：运行时开关 0=绕过核心 1=可靠传输
+    TAG_CFG_ARQ_WINDOW = 0x56,      // u8：发送窗口
+    TAG_CFG_ARQ_MAX_RETX = 0x57,    // u8：单条消息重传次数上限
+    TAG_CFG_ARQ_BREAKER = 0x58,     // u8：熔断阈值（连续失败条数）
+    TAG_CFG_ARQ_RTO_MIN = 0x59,     // u16：RTO 下限（毫秒）
+    TAG_CFG_ARQ_RTO_INIT = 0x5A,    // u16：初始 RTO（毫秒）
+    TAG_CFG_ARQ_RTO_MAX = 0x5B,     // u16：RTO 上限（毫秒）
+    TAG_CFG_ARQ_DELAYED_ACK = 0x5C, // u16：延迟确认（毫秒）
+    TAG_CFG_ARQ_PROBE = 0x5D,       // u16：熔断试探间隔（毫秒）
+#endif
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     TAG_CFG_LOSS_PERMILLE = 0x53, // u8：注入丢包率千分比 0-255
 #endif
@@ -465,6 +498,15 @@ usize tlv_u8(u8 *out, u8 tag, u8 value)
     out[1] = 1;
     out[2] = value;
     return 3;
+}
+
+usize tlv_u16(u8 *out, u8 tag, u16 value)
+{
+    out[0] = tag;
+    out[1] = 2;
+    out[2] = static_cast<u8>(value >> 8);
+    out[3] = static_cast<u8>(value);
+    return 4;
 }
 
 usize tlv_i8(u8 *out, u8 tag, i8 value)
@@ -638,6 +680,32 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, m_dap_response_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_TX, m_wireless_tx_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_RX, m_wireless_rx_bytes);
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    {
+        // 可靠传输的运行状态：丢帧是否被吸收、恢复得多快，全看这几个数
+        const ArqLink::Snapshot arq = Application::get_instance().wireless_link().arq_snapshot();
+        u8 state = static_cast<u8>(Application::get_instance().wireless_link().arq_settings().window & 0x0F);
+        const u8 in_flight = arq.in_flight < 0x07 ? arq.in_flight : 0x07;
+        state |= static_cast<u8>(in_flight << 4);
+        if (arq.breaker_open)
+        {
+            state |= 0x80;
+        }
+        p += tlv_u8(m_response + p, TAG_ARQ_STATE, state);
+        p += tlv_u32(m_response + p, TAG_ARQ_TX, arq.tx);
+        p += tlv_u32(m_response + p, TAG_ARQ_RETX, arq.retx);
+        p += tlv_u32(m_response + p, TAG_ARQ_ACKED, arq.acked);
+        p += tlv_u32(m_response + p, TAG_ARQ_FAILED, arq.failed);
+        p += tlv_u32(m_response + p, TAG_ARQ_DUP, arq.rx_duplicate);
+        p += tlv_u32(m_response + p, TAG_ARQ_OOO, arq.rx_out_of_window);
+        p += tlv_u32(m_response + p, TAG_ARQ_SKIPPED, arq.rx_skipped);
+        p += tlv_u32(m_response + p, TAG_ARQ_REPLAYED, arq.replayed);
+        p += tlv_u32(m_response + p, TAG_ARQ_REPLAY_MISS, arq.replay_missed);
+        p += tlv_u32(m_response + p, TAG_ARQ_SRTT_MS, arq.srtt_ms);
+        p += tlv_u32(m_response + p, TAG_ARQ_RTO_MS, arq.rto_ms);
+        p += tlv_u32(m_response + p, TAG_ARQ_BREAKER_TRIPS, arq.breaker_trips);
+    }
+#endif
 
     // 对端存活探测结果：online 是最近一次的结论，ok/fail 是累计计数（上位机
     // 对两次快照差分即可知道"刚下发的那次探测"是成功还是失败）
@@ -690,6 +758,21 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_CFG_WIFI_RATE, Application::get_instance().wireless_link().wifi_rate());
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     p += tlv_u8(m_response + p, TAG_CFG_LOSS_PERMILLE, Application::get_instance().wireless_link().loss_permille());
+#endif
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    {
+        const ArqSettings settings = Application::get_instance().wireless_link().arq_settings();
+        p += tlv_u32(m_response + p, TAG_CFG_ARQ_GENERATION, settings.generation);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_ENABLE, settings.enable);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_WINDOW, settings.window);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_MAX_RETX, settings.max_retx);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_BREAKER, settings.breaker_failures);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MIN, settings.rto_min_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_INIT, settings.initial_rto_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MAX, settings.rto_max_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_DELAYED_ACK, settings.delayed_ack_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_PROBE, settings.breaker_probe_ms);
+    }
 #endif
 
     return finish_response(cmd, seq, p);
@@ -761,6 +844,182 @@ bool ConfigChannel::take_usb_config_draft(UsbCapabilitySettings *settings)
     return valid;
 }
 
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+namespace
+{
+/**
+ * SetLinkConfig OUT 载荷的 tag。载荷自成一套 TLV 空间，与响应帧的 tag 无关；
+ * 只列出的字段被覆盖，没列出的保持本机当前值，因此主机可以只改一项。
+ */
+enum : u8
+{
+    LINK_TAG_ENABLE = 0x01,      // u8：运行时开关
+    LINK_TAG_WINDOW = 0x02,      // u8：发送窗口
+    LINK_TAG_MAX_RETX = 0x03,    // u8：重传次数上限
+    LINK_TAG_BREAKER = 0x04,     // u8：熔断阈值
+    LINK_TAG_RTO_MIN = 0x05,     // u16：RTO 下限（毫秒）
+    LINK_TAG_RTO_INIT = 0x06,    // u16：初始 RTO（毫秒）
+    LINK_TAG_RTO_MAX = 0x07,     // u16：RTO 上限（毫秒）
+    LINK_TAG_DELAYED_ACK = 0x08, // u16：延迟确认（毫秒）
+    LINK_TAG_PROBE = 0x09,       // u16：熔断试探间隔（毫秒）
+};
+
+u16 read_u16_be(const u8 *value)
+{
+    return static_cast<u16>((static_cast<u16>(value[0]) << 8) | value[1]);
+}
+
+/**
+ * 解析 SetLinkConfig 载荷，把出现的字段覆盖到 io 指向的参数上。
+ * @return true=格式合法；false=TLV 越界或取值长度不对（调用方在 DATA 阶段返回
+ *         false，由 TinyUSB 在状态阶段 STALL）
+ */
+bool parse_link_config(const u8 *data, usize len, ArqSettings *io)
+{
+    usize pos = 0;
+    while (pos + 2 <= len)
+    {
+        const u8 tag = data[pos];
+        usize value_len = data[pos + 1];
+        pos += 2;
+        if (value_len == 0xFF)
+        {
+            if (pos + 2 > len)
+            {
+                return false;
+            }
+            value_len = (static_cast<usize>(data[pos]) << 8) | data[pos + 1];
+            pos += 2;
+        }
+        if (pos + value_len > len)
+        {
+            return false;
+        }
+
+        const u8 *value = data + pos;
+        pos += value_len;
+
+        switch (tag)
+        {
+        case LINK_TAG_ENABLE:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            io->enable = (value[0] != 0) ? 1 : 0;
+            break;
+        case LINK_TAG_WINDOW:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            io->window = value[0];
+            break;
+        case LINK_TAG_MAX_RETX:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            io->max_retx = value[0];
+            break;
+        case LINK_TAG_BREAKER:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            io->breaker_failures = value[0];
+            break;
+        case LINK_TAG_RTO_MIN:
+        case LINK_TAG_RTO_INIT:
+        case LINK_TAG_RTO_MAX:
+        case LINK_TAG_DELAYED_ACK:
+        case LINK_TAG_PROBE: {
+            if (value_len != 2)
+            {
+                return false;
+            }
+            const u16 parsed = read_u16_be(value);
+            switch (tag)
+            {
+            case LINK_TAG_RTO_MIN:
+                io->rto_min_ms = parsed;
+                break;
+            case LINK_TAG_RTO_INIT:
+                io->initial_rto_ms = parsed;
+                break;
+            case LINK_TAG_RTO_MAX:
+                io->rto_max_ms = parsed;
+                break;
+            case LINK_TAG_DELAYED_ACK:
+                io->delayed_ack_ms = parsed;
+                break;
+            default:
+                io->breaker_probe_ms = parsed;
+                break;
+            }
+            break;
+        }
+        default:
+            return false; // 未知 tag：版本不符，宁可拒掉也不猜着执行
+        }
+    }
+    return true;
+}
+} // namespace
+
+bool ConfigChannel::stage_link_config_draft(const u8 *data, usize len)
+{
+    // 以本机当前参数为底：载荷只覆盖出现的字段
+    ArqSettings draft = Application::get_instance().wireless_link().arq_settings();
+    if (!parse_link_config(data, len, &draft))
+    {
+        return false;
+    }
+
+    // 代数由设备自己推进：主机只说"要什么参数"，不掺和版本管理；对端据此判断
+    // 该听谁的
+    draft.generation += 1;
+    if (!mlink::arq_settings_valid(draft))
+    {
+        return false;
+    }
+
+    portENTER_CRITICAL(&m_link_draft_lock);
+    m_link_draft = draft;
+    m_link_draft_present = true;
+    portEXIT_CRITICAL(&m_link_draft_lock);
+
+    // 参数下发即应用，因此这里直接投递动作；槽被占用时按 STALL 让主机重试
+    return post_action(Action::SetLinkConfig);
+}
+
+bool ConfigChannel::handle_link_config_out(u8 rhport, u8 stage, const tusb_control_request_t *request)
+{
+    if (static_cast<u8>(request->wValue & 0xFF) != static_cast<u8>(Cmd::SetLinkConfig))
+    {
+        return false; // 其余 OUT 厂商请求不属于本通道
+    }
+
+    if (stage == CONTROL_STAGE_SETUP)
+    {
+        if (request->wLength == 0 || request->wLength > sizeof(m_link_draft_buffer))
+        {
+            return false; // STALL
+        }
+        tud_control_xfer(rhport, request, m_link_draft_buffer, request->wLength);
+        return true;
+    }
+
+    if (stage == CONTROL_STAGE_DATA)
+    {
+        // 格式非法时返回 false：TinyUSB 在状态阶段 STALL，主机端直接拿到失败
+        return stage_link_config_draft(m_link_draft_buffer, request->wLength);
+    }
+
+    return true; // ACK 阶段：载荷已在 DATA 阶段处理完
+}
+#endif // CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+
 bool ConfigChannel::stage_usb_config_draft(const u8 *data, usize len)
 {
     ParsedUsbConfig parsed;
@@ -826,11 +1085,19 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         return false;
     }
 
-    // 唯一的 OUT 命令 SetUsbConfig 走独立分支：SETUP 声明接收、DATA 收载荷，
-    // 没有 DATA IN 阶段，所以它自己那一套阶段处理在 handle_usb_config_out 里
+    // OUT 命令走独立分支：SETUP 声明接收、DATA 收载荷，没有 DATA IN 阶段，因此
+    // 各自那套阶段处理在自己的 handle_*_out 里。两个命令都不认才交回调用方。
     if (request->bmRequestType_bit.direction != TUSB_DIR_IN)
     {
-        return handle_usb_config_out(rhport, stage, request);
+        if (handle_usb_config_out(rhport, stage, request))
+        {
+            return true;
+        }
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+        return handle_link_config_out(rhport, stage, request);
+#else
+        return false;
+#endif
     }
 
     if (stage != CONTROL_STAGE_SETUP)
@@ -896,3 +1163,16 @@ void ConfigChannel::relay_to_peer(u8 cmd, u8 arg)
 }
 
 #endif // CONFIG_MEGUMINLINK_USB_SUPPORT
+
+bool ConfigChannel::take_link_config_draft(ArqSettings *settings)
+{
+    portENTER_CRITICAL(&m_link_draft_lock);
+    const bool present = m_link_draft_present;
+    if (present && settings != nullptr)
+    {
+        *settings = m_link_draft;
+    }
+    m_link_draft_present = false;
+    portEXIT_CRITICAL(&m_link_draft_lock);
+    return present;
+}

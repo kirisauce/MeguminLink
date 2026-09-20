@@ -236,9 +236,19 @@ inline constexpr size_t MAX_RELAYED_CONTROL_PAYLOAD = 256;
 struct ArqReset
 {
     u32 epoch;
+    ArqSettings settings; /**< 本端参数：对端 epoch 变化时一并评估采纳 */
 };
 #endif
 } // namespace payload
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+/**
+ * ArqReset 数据段长度：epoch 4B + 代数 4B + enable/window/max_retx/breaker 4B
+ * + 五个 u16 参数 10B。会话重置帧不带 len 字段（与 Probe 同形），长度由本常量
+ * 与收发两侧共同保证。
+ */
+inline constexpr size_t ARQ_RESET_PAYLOAD_SIZE = 4 + 4 + 4 + 10;
+#endif
 
 enum class PacketType
 {
@@ -474,6 +484,15 @@ class WirelessLink
 
     /** 可靠传输累计计数（统计与日志用） */
     ArqLink::Snapshot arq_snapshot() const;
+
+    /** 当前可靠传输参数（配置读取与落盘用） */
+    ArqSettings arq_settings() const;
+
+    /** 主机下发的可靠传输参数：立即生效并置脏，落盘由主循环做 */
+    esp_err_t arq_apply_settings(const ArqSettings &settings, u32 now_ms);
+
+    /** 参数被改动过（含采纳对端参数）：主循环取走并落盘 */
+    bool arq_take_settings_dirty();
 #endif
 
     /**
@@ -533,7 +552,7 @@ class WirelessLink
     static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u16 ack,
                              u16 sack, u8 window);
     static void arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window);
-    static void arq_send_reset(void *ctx, u32 epoch, u16 ack, u16 sack, u8 window);
+    static void arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window);
     static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
 
     /** 本端可靠传输发送的消息类型：USB 侧发命令，无 USB 侧发响应 */

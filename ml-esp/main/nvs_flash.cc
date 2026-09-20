@@ -7,7 +7,6 @@ static constexpr char TAG[] = "mlink::nvs_flash";
 
 namespace
 {
-constexpr char NVS_NAMESPACE[] = "mlink";
 constexpr char KEY_PEER_MAC[] = "peer_mac";
 
 // 模块级常驻的 peer MAC 键：缓存跨 peer_mac_load/store 调用共享
@@ -187,6 +186,55 @@ esp_err_t mlink::NvsKeyU8::erase()
         m_loaded = false;
     }
     return ret;
+}
+
+mlink::NvsWriteBatch::NvsWriteBatch(const char *nvs_namespace)
+{
+    const esp_err_t ret = nvs_open(nvs_namespace, NVS_READWRITE, &m_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to open NVS namespace '%s': %s", nvs_namespace, esp_err_to_name(ret));
+        return;
+    }
+    m_open = true;
+}
+
+mlink::NvsWriteBatch::~NvsWriteBatch()
+{
+    // 没显式 commit 就析构：本批的写入不落盘（nvs_close 不会提交未提交的更改）
+    if (m_open)
+    {
+        nvs_close(m_handle);
+    }
+}
+
+bool mlink::NvsWriteBatch::ready() const
+{
+    return m_open;
+}
+
+esp_err_t mlink::NvsWriteBatch::set_u8(const char *key, u8 value)
+{
+    return m_open ? nvs_set_u8(m_handle, key, value) : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t mlink::NvsWriteBatch::set_u16(const char *key, u16 value)
+{
+    return m_open ? nvs_set_u16(m_handle, key, value) : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t mlink::NvsWriteBatch::set_u32(const char *key, u32 value)
+{
+    return m_open ? nvs_set_u32(m_handle, key, value) : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t mlink::NvsWriteBatch::commit()
+{
+    if (!m_open)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return nvs_commit(m_handle);
 }
 
 bool mlink::peer_mac_load(u8 mac[ESP_NOW_ETH_ALEN])

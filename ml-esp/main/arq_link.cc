@@ -1,24 +1,227 @@
 #include "meguminlink/arq_link.hpp"
+#include "meguminlink/nvs_flash.hpp"
 
 #include <cstring>
 
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_random.h>
+#include <sdkconfig.h>
 
 using namespace mlink;
 
 static constexpr char TAG[] = "mlink::arq_link";
 
+namespace
+{
+// NVS 键名上限 15 字符
+constexpr char KEY_ARQ_GENERATION[] = "arq_gen";
+constexpr char KEY_ARQ_ENABLE[] = "arq_enable";
+constexpr char KEY_ARQ_WINDOW[] = "arq_window";
+constexpr char KEY_ARQ_MAX_RETX[] = "arq_max_retx";
+constexpr char KEY_ARQ_BREAKER[] = "arq_breaker";
+constexpr char KEY_ARQ_RTO_MIN[] = "arq_rto_min";
+constexpr char KEY_ARQ_RTO_INIT[] = "arq_rto_init";
+constexpr char KEY_ARQ_RTO_MAX[] = "arq_rto_max";
+constexpr char KEY_ARQ_DELAYED_ACK[] = "arq_delayed_ack";
+constexpr char KEY_ARQ_BREAKER_PROBE[] = "arq_probe";
+} // namespace
+
+// ---- 参数：默认值、校验、NVS 存取 ----
+
+ArqSettings mlink::arq_default_settings()
+{
+    ArqSettings out = {};
+    out.generation = 0;
+    out.enable = 1;
+    out.window = 1;
+    out.max_retx = 6;
+    out.breaker_failures = 3;
+    out.rto_min_ms = 60;
+    out.initial_rto_ms = 60;
+    out.rto_max_ms = 250;
+    out.delayed_ack_ms = 2;
+    out.breaker_probe_ms = 1000;
+    return out;
+}
+
+arq::Config mlink::arq_config_from(const ArqSettings &settings)
+{
+    arq::Config config;
+    config.window = settings.window;
+    config.reorder = false; // 窗口为 1，乱序帧一律拒绝并由对端重传，不需要重排缓冲
+    config.rto_min_ms = settings.rto_min_ms;
+    config.initial_rto_ms = settings.initial_rto_ms;
+    config.rto_max_ms = settings.rto_max_ms;
+    config.max_retx = settings.max_retx;
+    config.breaker_failures = settings.breaker_failures;
+    config.delayed_ack_ms = settings.delayed_ack_ms;
+    config.breaker_probe_ms = settings.breaker_probe_ms;
+    return config; // 越界值由核心自己收敛
+}
+
+namespace
+{
+/**
+ * 把窗口收敛到本固件编译期允许的上限（Kconfig 的 ARQ_MAX_WINDOW）。
+ *
+ * 主机下发的值与对端传来的值都可能是更大窗口那份固件给的；本固件没有按窗口
+ * 准备重排缓冲，因此只认自己的上限——收敛后再存，上报与转发出去的也就是这个值，
+ * 不会出现"声称支持 8、实际只按 1 跑"。
+ */
+ArqSettings clamp_window(ArqSettings settings)
+{
+    const u8 cap = static_cast<u8>(CONFIG_MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW);
+    if (settings.window > cap)
+    {
+        settings.window = cap;
+    }
+    return settings;
+}
+} // namespace
+
+bool mlink::arq_settings_valid(const ArqSettings &settings)
+{
+    return settings.window >= 1 && settings.window <= arq::MAX_WINDOW && settings.max_retx >= 1 &&
+           settings.rto_min_ms >= 1 && settings.rto_max_ms >= settings.rto_min_ms &&
+           settings.initial_rto_ms >= 1 && settings.delayed_ack_ms >= 1 && settings.breaker_probe_ms >= 1;
+}
+
+ArqSettings mlink::arq_settings_load()
+{
+    ArqSettings out = arq_default_settings();
+
+    nvs_handle_t handle = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+    {
+        return out; // 无记录：用默认值
+    }
+
+    u32 u32_value = 0;
+    u16 u16_value = 0;
+    u8 u8_value = 0;
+
+    if (nvs_get_u32(handle, KEY_ARQ_GENERATION, &u32_value) == ESP_OK)
+    {
+        out.generation = u32_value;
+    }
+    if (nvs_get_u8(handle, KEY_ARQ_ENABLE, &u8_value) == ESP_OK)
+    {
+        out.enable = (u8_value != 0) ? 1 : 0;
+    }
+    if (nvs_get_u8(handle, KEY_ARQ_WINDOW, &u8_value) == ESP_OK)
+    {
+        out.window = u8_value;
+    }
+    if (nvs_get_u8(handle, KEY_ARQ_MAX_RETX, &u8_value) == ESP_OK)
+    {
+        out.max_retx = u8_value;
+    }
+    if (nvs_get_u8(handle, KEY_ARQ_BREAKER, &u8_value) == ESP_OK)
+    {
+        out.breaker_failures = u8_value;
+    }
+    if (nvs_get_u16(handle, KEY_ARQ_RTO_MIN, &u16_value) == ESP_OK)
+    {
+        out.rto_min_ms = u16_value;
+    }
+    if (nvs_get_u16(handle, KEY_ARQ_RTO_INIT, &u16_value) == ESP_OK)
+    {
+        out.initial_rto_ms = u16_value;
+    }
+    if (nvs_get_u16(handle, KEY_ARQ_RTO_MAX, &u16_value) == ESP_OK)
+    {
+        out.rto_max_ms = u16_value;
+    }
+    if (nvs_get_u16(handle, KEY_ARQ_DELAYED_ACK, &u16_value) == ESP_OK)
+    {
+        out.delayed_ack_ms = u16_value;
+    }
+    if (nvs_get_u16(handle, KEY_ARQ_BREAKER_PROBE, &u16_value) == ESP_OK)
+    {
+        out.breaker_probe_ms = u16_value;
+    }
+
+    nvs_close(handle);
+
+    if (!arq_settings_valid(out))
+    {
+        // 落盘的值越界（旧固件写过、flash 损坏）：回默认，免得带着非法参数运行
+        ESP_LOGW(TAG, "stored ARQ settings invalid, falling back to defaults");
+        return arq_default_settings();
+    }
+    return out;
+}
+
+esp_err_t mlink::arq_settings_store(const ArqSettings &settings)
+{
+    NvsWriteBatch batch(NVS_NAMESPACE);
+    if (!batch.ready())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 整份参数走同一个 commit：NVS 保证要么全生效、要么全不生效
+    esp_err_t ret = batch.set_u32(KEY_ARQ_GENERATION, settings.generation);
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u8(KEY_ARQ_ENABLE, settings.enable ? 1 : 0);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u8(KEY_ARQ_WINDOW, settings.window);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u8(KEY_ARQ_MAX_RETX, settings.max_retx);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u8(KEY_ARQ_BREAKER, settings.breaker_failures);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u16(KEY_ARQ_RTO_MIN, settings.rto_min_ms);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u16(KEY_ARQ_RTO_INIT, settings.initial_rto_ms);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u16(KEY_ARQ_RTO_MAX, settings.rto_max_ms);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u16(KEY_ARQ_DELAYED_ACK, settings.delayed_ack_ms);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.set_u16(KEY_ARQ_BREAKER_PROBE, settings.breaker_probe_ms);
+    }
+    if (ret == ESP_OK)
+    {
+        ret = batch.commit();
+    }
+
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "failed to store ARQ settings: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 // ---- 构造与配置 ----
 
-esp_err_t ArqLink::init(const arq::Config &config, size_t payload_cap)
+esp_err_t ArqLink::init(const ArqSettings &settings, size_t payload_cap)
 {
-    if (payload_cap == 0 || payload_cap > MAX_PAYLOAD)
+    if (payload_cap == 0 || payload_cap > MAX_PAYLOAD || !arq_settings_valid(settings))
     {
         return ESP_ERR_INVALID_ARG;
     }
 
-    m_config = config;
+    m_settings = clamp_window(settings);
+    m_config = arq_config_from(m_settings);
     m_payload_cap = payload_cap;
 
     m_mutex = xSemaphoreCreateMutex();
@@ -27,13 +230,80 @@ esp_err_t ArqLink::init(const arq::Config &config, size_t payload_cap)
         return ESP_ERR_NO_MEM;
     }
 
+    // 本机 MAC：参数平局时用它做确定性判断
+    esp_read_mac(m_own_mac, ESP_MAC_WIFI_STA);
+
+    reconfigure_locked();
+    reset_session(0);
+    return ESP_OK;
+}
+
+void ArqLink::reconfigure_locked()
+{
+    m_config = arq_config_from(m_settings);
+    // 参数变了就必须重建两端状态：窗口、重传预算与退避全都按新参数算。累计计数
+    // 一并归零是刻意的——参数变更即一次新的测量起点，做 A/B 对照时正好干净。
     m_sender.init(m_config, m_tx_storage, m_payload_cap, arq::MAX_WINDOW);
     m_receiver.init(m_config);
     m_sender.set_callbacks(this, &ArqLink::core_transmit, &ArqLink::core_event);
     m_receiver.set_callbacks(this, &ArqLink::core_event);
+}
 
-    reset_session(0);
+esp_err_t ArqLink::apply_settings(const ArqSettings &settings, u32 now_ms)
+{
+    if (!arq_settings_valid(settings))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    lock();
+    m_settings = clamp_window(settings);
+    reconfigure_locked();
+    m_settings_dirty = true; // 等主循环落盘（NVS 写入不放这里）
+    unlock();
+
+    // 换新 epoch 重置会话：对端据此重新对齐序号，并顺手采纳这份新参数
+    reset_session(now_ms);
     return ESP_OK;
+}
+
+ArqSettings ArqLink::settings() const
+{
+    lock();
+    const ArqSettings out = m_settings;
+    unlock();
+    return out;
+}
+
+bool ArqLink::take_settings_dirty()
+{
+    lock();
+    const bool dirty = m_settings_dirty;
+    m_settings_dirty = false;
+    unlock();
+    return dirty;
+}
+
+bool ArqLink::should_adopt_settings_locked(const ArqSettings &peer) const
+{
+    const i32 diff = static_cast<i32>(peer.generation - m_settings.generation);
+    if (diff > 0)
+    {
+        return true;
+    }
+    if (diff < 0)
+    {
+        return false;
+    }
+
+    // 代数相同（典型情形是两块板一起上电）：用 MAC 大小做确定性平局。两端比的是
+    // 同一个不等式，因此算出的赢家一致——MAC 小的一方那份参数会被两端共同采用，
+    // 不会出现"互相采纳、结果仍然不一致"。
+    if (!m_peer_known)
+    {
+        return false;
+    }
+    return std::memcmp(m_own_mac, m_peer_mac, sizeof(m_own_mac)) > 0;
 }
 
 void ArqLink::set_callbacks(const Callbacks &callbacks)
@@ -104,7 +374,8 @@ void ArqLink::dispatch(const Action *actions, size_t count)
         case Action::Kind::Reset: {
             if (m_callbacks.send_reset != nullptr)
             {
-                m_callbacks.send_reset(m_callbacks.ctx, action.epoch, action.ack, action.sack, action.window);
+                m_callbacks.send_reset(m_callbacks.ctx, action.epoch, action.settings, action.ack, action.sack,
+                                       action.window);
             }
             break;
         }
@@ -157,7 +428,8 @@ bool ArqLink::has_peer() const
 bool ArqLink::established() const
 {
     lock();
-    const bool value = m_established;
+    // 运行时关闭时不需要序号对齐：没有窗口、没有重传，也就没有"基准"这回事
+    const bool value = m_established || !m_settings.enable;
     unlock();
     return value;
 }
@@ -223,13 +495,32 @@ void ArqLink::reset_session(u32 now_ms)
 void ArqLink::on_ack(u16 ack, u16 sack, u8 window, u32 now_ms)
 {
     lock();
-    m_sender.on_ack(ack, sack, window, now_ms);
+    if (m_settings.enable)
+    {
+        m_sender.on_ack(ack, sack, window, now_ms);
+    }
     unlock();
 }
 
 void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now_ms)
 {
     lock();
+
+    if (!m_settings.enable)
+    {
+        // 运行时关闭：不判重、不排序，收到就交付（跳过核心）
+        if (m_callbacks.deliver != nullptr)
+        {
+            u8 peer_mac[6] = {};
+            if (m_peer_known)
+            {
+                std::memcpy(peer_mac, m_peer_mac, sizeof(peer_mac));
+            }
+            m_callbacks.deliver(m_callbacks.ctx, m_peer_known ? peer_mac : nullptr, seq, payload, len);
+        }
+        unlock();
+        return;
+    }
 
     const arq::RxResult result = m_receiver.on_frame(seq, gap_before, now_ms);
     if (result == arq::RxResult::Delivered)
@@ -267,13 +558,14 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     unlock();
 }
 
-void ArqLink::on_reset(u32 peer_epoch, u32 now_ms)
+void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now_ms)
 {
     lock();
 
     if (!m_peer_epoch_known || m_peer_epoch != peer_epoch)
     {
-        // 对端开了一个新会话（上电或链路重建）：本端把状态拉到同一序号基准
+        // 对端开了一个新会话（上电、链路重建或它刚被下发了新参数）：本端把状态
+        // 拉到同一序号基准
         m_peer_epoch = peer_epoch;
         m_peer_epoch_known = true;
         m_sender.reset();
@@ -282,6 +574,16 @@ void ArqLink::on_reset(u32 peer_epoch, u32 now_ms)
         m_replay_pending = false;
         std::memset(m_replay_map_valid, 0, sizeof(m_replay_map_valid));
         m_established = true;
+
+        // 参数只在对端换了 epoch（即它确实重启过一次会话）时才评估采纳，回显帧
+        // 因此不会来回改参数；采纳规则见 should_adopt_settings_locked
+        if (arq_settings_valid(peer_settings) && should_adopt_settings_locked(peer_settings))
+        {
+            m_settings = clamp_window(peer_settings);
+            reconfigure_locked();
+            m_settings_dirty = true; // 落盘交给主循环
+            ESP_LOGI(TAG, "adopted peer ARQ settings (generation %u)", static_cast<unsigned>(peer_settings.generation));
+        }
         ESP_LOGI(TAG, "peer session epoch 0x%08X accepted, sequence space realigned", peer_epoch);
     }
     else if (!m_established)
@@ -358,6 +660,7 @@ ArqLink::Action ArqLink::make_reset_action_locked() const
     action.ack = m_receiver.ack();
     action.sack = m_receiver.sack_bitmap();
     action.window = m_receiver.window();
+    action.settings = m_settings;
     return action;
 }
 
@@ -413,7 +716,33 @@ ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq
     m_action_count = 0;
 
     Submit result = Submit::NotEstablished;
-    if (m_peer_known && m_established)
+    if (m_peer_known && !m_settings.enable)
+    {
+        // 运行时关闭：绕过核心，发完即忘，等价于尽力而为。帧格式仍是带扩展头的
+        // 新格式，所以 A/B 对照只差"ARQ 有没有生效"这一件事。
+        if (payload == nullptr || len == 0 || len > m_payload_cap)
+        {
+            result = Submit::Invalid;
+        }
+        else
+        {
+            std::memcpy(m_tx_storage, payload, len);
+            Action action = {};
+            action.kind = Action::Kind::Message;
+            action.seq = 0;
+            action.len = len;
+            action.ack = m_receiver.ack();
+            action.sack = m_receiver.sack_bitmap();
+            action.window = m_receiver.window();
+            queue_locked(action);
+            if (seq_out != nullptr)
+            {
+                *seq_out = 0;
+            }
+            result = Submit::Ok;
+        }
+    }
+    else if (m_peer_known && m_established)
     {
         switch (m_sender.submit(payload, len, now_ms, seq_out))
         {

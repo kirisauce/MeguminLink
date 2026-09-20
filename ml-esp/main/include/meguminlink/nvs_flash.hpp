@@ -11,6 +11,9 @@
 
 namespace mlink
 {
+/** NVS 命名空间（peer MAC 与链路参数共用） */
+inline constexpr char NVS_NAMESPACE[] = "mlink";
+
 esp_err_t nvs_flash_init();
 
 /**
@@ -190,6 +193,36 @@ template <size_t N> class NvsKeyString : public NvsKey
     const char *m_default_value;
     mutable char m_data[N + 1] = {};
     mutable bool m_loaded = false;
+};
+
+/**
+ * NVS 写入批：把一组相互关联的键放进同一个 commit。
+ *
+ * NVS 只保证"一次 nvs_commit() 内的写入要么全部生效、要么全部不生效"，逐键各自
+ * commit 的话，掉电重启可能读到改了一半的混合状态。整份链路参数属于必须一致的一
+ * 组，因此走这个批；只读路径不需要它。
+ */
+class NvsWriteBatch
+{
+  public:
+    explicit NvsWriteBatch(const char *nvs_namespace);
+    NvsWriteBatch(const NvsWriteBatch &) = delete;
+    NvsWriteBatch &operator=(const NvsWriteBatch &) = delete;
+    ~NvsWriteBatch();
+
+    /** 命名空间是否已成功打开（未打开时所有写入都返回失败） */
+    bool ready() const;
+
+    esp_err_t set_u8(const char *key, u8 value);
+    esp_err_t set_u16(const char *key, u16 value);
+    esp_err_t set_u32(const char *key, u32 value);
+
+    /** 提交：本批的全部写入在这一刻原子落盘 */
+    esp_err_t commit();
+
+  private:
+    nvs_handle_t m_handle = 0;
+    bool m_open = false;
 };
 
 /** 读取已配对对端的 MAC 地址；不存在时返回 false */

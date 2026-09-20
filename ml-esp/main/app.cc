@@ -452,6 +452,28 @@ void Application::consume_pending_action()
         (void)m_wireless_link.set_wifi_rate(arg);
         break;
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    case ConfigChannel::Action::SetLinkConfig: {
+        // 参数落盘 + 立即应用。应用会换新 epoch 重置会话，对端据此重新对齐序号并
+        // 采纳这份参数——参数因此不必再走那条尽力而为的中继通道。
+        ArqSettings settings = {};
+        if (m_config_channel.take_link_config_draft(&settings) &&
+            m_wireless_link.arq_apply_settings(settings, static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS)) ==
+                ESP_OK)
+        {
+            const esp_err_t ret = arq_settings_store(settings);
+            if (ret != ESP_OK)
+            {
+                ESP_LOGW(TAG, "Failed to persist ARQ settings: %s", esp_err_to_name(ret));
+            }
+            ESP_LOGI(TAG, "Reliable transport settings applied (generation %u, window %u, rto %u-%u ms, retx %u)",
+                     static_cast<unsigned>(settings.generation), settings.window, settings.rto_min_ms,
+                     settings.rto_max_ms, settings.max_retx);
+        }
+        break;
+    }
+#endif
+
     case ConfigChannel::Action::SetLoss:
         // 注入丢包率（千分比）。只在发送端生效，两端各自由这条命令设置自己的值。
         (void)m_wireless_link.set_loss_permille(arg);
@@ -493,6 +515,17 @@ void Application::run()
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
         // 可靠传输的空闲驱动：重传、纯确认、响应重放与会话握手帧都在这里发出
         m_wireless_link.arq_poll(static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+
+        // 参数被改动过（主机下发，或按代数/MAC 采纳了对端那份）：落盘。NVS 写入
+        // 只在主循环做，不占 tinyusb 任务，也不占 WiFi 任务（接收回调会改参数）。
+        if (m_wireless_link.arq_take_settings_dirty())
+        {
+            const esp_err_t persist_ret = arq_settings_store(m_wireless_link.arq_settings());
+            if (persist_ret != ESP_OK)
+            {
+                ESP_LOGW(TAG, "Failed to persist ARQ settings: %s", esp_err_to_name(persist_ret));
+            }
+        }
 #endif
 
         // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）

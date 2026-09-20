@@ -14,6 +14,43 @@
 namespace mlink
 {
 /**
+ * 可靠传输参数。整份参数两端必须一致，否则窗口、重传预算这些会各按各的算，
+ * 测出来的行为解释不了。
+ *
+ * generation 是"参数代数"：主机每次下发参数 +1，落 NVS。两端参数不一致时靠它
+ * 判断该听谁的——代数大的那份更新；代数相同（比如两块板一起上电）则用 MAC 大小
+ * 做确定性平局，保证两端算出同一个赢家，最终收敛到同一组参数。
+ */
+struct ArqSettings
+{
+    u32 generation;       /**< 参数代数：每次主机下发 +1（落 NVS） */
+    u8 enable;            /**< 运行时开关：0 = 绕过核心，等价尽力而为（帧格式不变） */
+    u8 window;            /**< 发送窗口（本批固定 1） */
+    u8 max_retx;          /**< 单条消息重传次数上限 */
+    u8 breaker_failures;  /**< 连续多少条重传耗尽后熔断，0 = 不熔断 */
+    u16 rto_min_ms;       /**< RTO 下限 */
+    u16 initial_rto_ms;   /**< 还没有 RTT 样本时的初始 RTO */
+    u16 rto_max_ms;       /**< RTO 上限 */
+    u16 delayed_ack_ms;   /**< 没有数据可捎带时补纯 ACK 的延迟 */
+    u16 breaker_probe_ms; /**< 熔断期间放行试探的间隔 */
+};
+
+/** 参数是否合法（越界值一律拒绝，免得写进 NVS 或按它运行） */
+bool arq_settings_valid(const ArqSettings &settings);
+
+/** 出厂默认参数（与实测调优后的取值一致） */
+ArqSettings arq_default_settings();
+
+/** 参数 → 算法配置 */
+arq::Config arq_config_from(const ArqSettings &settings);
+
+/** 从 NVS 读回参数；无记录或失败时返回默认值 */
+ArqSettings arq_settings_load();
+
+/** 参数落 NVS：所有键在同一个 commit 里写入 */
+esp_err_t arq_settings_store(const ArqSettings &settings);
+
+/**
  * 无线链路的可靠传输适配层：把 arq::Sender / arq::Receiver 接到实际的收发上，
  * 并管理会话握手、待发确认与重复帧重放的排队。
  *
@@ -68,11 +105,11 @@ class ArqLink
     using AckFn = void (*)(void *ctx, u16 ack, u16 sack, u8 window);
 
     /**
-     * 发一个会话重置请求。重置帧同样携带本端接收侧的确认与窗口通告——扩展头的
-     * window 字段在所有帧上的含义都一样（本端还能收多少），漏填会被对端当成
-     * "对端窗口为 0"，于是它一条命令都发不出来。
+     * 发一个会话重置请求。重置帧同时携带本端的参数与确认/窗口通告：参数靠它传给
+     * 对端（这类帧会周期性重发直到握手完成，因此带重传保证），而扩展头的 window
+     * 在所有帧上的含义都一样（本端还能收多少），漏填会被对端当成"窗口为 0"。
      */
-    using ResetFn = void (*)(void *ctx, u32 epoch, u16 ack, u16 sack, u8 window);
+    using ResetFn = void (*)(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window);
 
     /**
      * 按序交付一条可靠消息。对端 MAC 一并给出：本回调是在持锁状态下被调用的，
@@ -91,10 +128,10 @@ class ArqLink
     };
 
     /**
-     * @param config       算法参数
+     * @param settings     参数（通常来自 arq_settings_load()）
      * @param payload_cap  单条可靠消息的载荷上限（≤ MAX_PAYLOAD）
      */
-    esp_err_t init(const arq::Config &config, size_t payload_cap);
+    esp_err_t init(const ArqSettings &settings, size_t payload_cap);
 
     void set_callbacks(const Callbacks &callbacks);
 
@@ -108,6 +145,18 @@ class ArqLink
 
     /** 会话握手是否已完成（两端序号基准已对齐） */
     bool established() const;
+
+    /**
+     * 应用一份新参数（主机下发）：立即生效、换新 epoch 重置会话，新参数随会话
+     * 重置帧传给对端；并把参数标记为待落盘（NVS 写入由主循环做）。
+     */
+    esp_err_t apply_settings(const ArqSettings &settings, u32 now_ms);
+
+    /** 当前参数快照（配置读取与落盘用） */
+    ArqSettings settings() const;
+
+    /** 参数被主机或对端改动过：主循环取走并落盘（取走即清标记） */
+    bool take_settings_dirty();
 
     /** 是否还有收到但未确认的帧（调用方据此把 delayed ACK 的到期时刻算进等待超时） */
     bool ack_pending() const;
@@ -137,8 +186,8 @@ class ArqLink
     /** 一条可靠消息（DAP 命令或响应，取决于是链路的哪一端） */
     void on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now_ms);
 
-    /** 对端的会话重置请求 */
-    void on_reset(u32 peer_epoch, u32 now_ms);
+    /** 对端的会话重置请求（携带对端参数） */
+    void on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now_ms);
 
     // ---- 任务上下文 ----
 
@@ -216,6 +265,7 @@ class ArqLink
         u16 sack;
         u8 window;
         u32 epoch;
+        ArqSettings settings; /**< 仅重置动作使用 */
     };
 
     static constexpr size_t MAX_ACTIONS = 4;
@@ -235,11 +285,20 @@ class ArqLink
     /** 锁内动作收集完毕：拷出副本、清空队列，调用方随后 dispatch */
     size_t take_actions_locked(Action *out);
 
-    /** 造一个会话重置动作（带上本端接收侧的确认与窗口通告） */
+    /** 造一个会话重置动作（带上本端参数与接收侧的确认、窗口通告） */
     Action make_reset_action_locked() const;
 
+    /** 参数是否该采纳对端那份：代数大的赢，代数相同用 MAC 做确定性平局 */
+    bool should_adopt_settings_locked(const ArqSettings &peer) const;
+
+    /** 按当前参数重建核心（Sender/Receiver 的配置随之生效） */
+    void reconfigure_locked();
+
+    ArqSettings m_settings = {};
     arq::Config m_config = {};
     size_t m_payload_cap = 0;
+    u8 m_own_mac[6] = {};
+    bool m_settings_dirty = false;
 
     arq::Sender m_sender;
     arq::Receiver m_receiver;
