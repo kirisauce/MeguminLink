@@ -145,9 +145,15 @@
 	}
 }
 
-/* 基础元素。Svelte island 渲染出的元素不带 Astro 的 scoped 属性，元素级字体
+/* 基础元素。Svelte island 渲染出的元素不带 Astro 的 scoped 属性，元素级样式
    规则必须留在全局样式表里，放进 Layout 的 <style> 只能命中 Astro 模板自身
-   渲染的节点。 */
+   渲染的节点；单文件版本（standalone/）也只引这张表，两边因此一致。 */
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+}
+
 body {
 	font-family: var(--md-sys-typescale-font);
 	background: var(--md-sys-color-surface);

@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "astro build && vite build --config vite.standalone.config.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },
@@ -21,6 +21,8 @@
     "esbuild": true
   },
   "devDependencies": {
-    "@types/w3c-web-usb": "^1.0.14"
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@types/w3c-web-usb": "^1.0.14",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }
