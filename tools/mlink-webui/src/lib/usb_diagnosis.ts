@@ -79,23 +79,24 @@ function describeOpenFailure(failure: { name: string; message: string }): {
 	switch (failure.name) {
 		case 'AccessDeniedError':
 			return {
-				detail: '设备被其它程序占用，或访问被拒绝',
-				advice: ['关闭 pyOCD / OpenOCD / 串口助手等正在使用同一块板子的程序，再点「连接设备」'],
+				detail: '设备被其它程序占用了',
+				advice: ['你可以：', '关掉正在用这块板子的程序（pyOCD、OpenOCD、串口工具），再试一次'],
 			};
 		case 'NetworkError':
 			return {
-				detail: '设备已不可用：驱动未绑定，或设备被独占',
+				detail: '设备打不开：驱动没装好，或者被别的程序占着',
 				advice: [
-					'Windows：确认该设备已绑定 WinUSB 驱动（用 Zadig 或设备提供的 .inf），设备管理器里不应有黄色感叹号',
-					'确认没有第二个标签页或程序已经打开这块设备',
+					'你可以：',
+					'Windows 上装一次 WinUSB 驱动（Zadig 或设备自带的 .inf），设备管理器里不要有黄色感叹号',
+					'确认没有别的程序正在用这块板子',
 				],
 			};
 		case 'NotFoundError':
-			return { detail: '设备已被拔出', advice: ['重新插上设备后再点「连接设备」'] };
+			return { detail: '设备已经拔掉了', advice: ['你可以：', '插好后重试'] };
 		case 'SecurityError':
 			return {
-				detail: '浏览器拒绝了这次调用',
-				advice: ['确认页面处于安全上下文，并且由点击「连接设备」这样的用户手势发起'],
+				detail: '浏览器拦下了这次调用',
+				advice: ['你可以：', '点「连接设备」按钮重试（浏览器要求由点击触发）'],
 			};
 		default:
 			return { detail: `浏览器报错 ${failure.name}：${failure.message}`, advice: [] };
@@ -103,10 +104,10 @@ function describeOpenFailure(failure: { name: string; message: string }): {
 }
 
 const HEADLINES: Record<UsbCheckId, string> = {
-	'secure-context': '当前页面不是安全上下文，WebUSB 被浏览器禁用',
-	'usb-api': '浏览器没有提供 WebUSB 接口，无法直连设备',
-	'permissions-policy': '页面被 Permissions-Policy 禁止使用 WebUSB',
-	'granted-device': '还没有已授权的设备',
+	'secure-context': '当前地址不是 secure context，WebUSB 被禁用',
+	'usb-api': '这个浏览器不支持 WebUSB',
+	'permissions-policy': '页面策略禁止使用 WebUSB',
+	'granted-device': '还没有授权过设备',
 	'device-open': '设备打开失败',
 };
 
@@ -119,25 +120,25 @@ export function diagnoseWebUsb(env: UsbEnvironment): UsbDiagnosis {
 	if (env.isSecureContext) {
 		checks.push({
 			id: 'secure-context',
-			label: '安全上下文',
+			label: 'secure context',
 			state: 'pass',
-			detail: `${host ?? env.href} 属于安全上下文`,
+			detail: `${host ?? env.href} 是 secure context`,
 			advice: [],
 		});
 	} else {
 		checks.push({
 			id: 'secure-context',
-			label: '安全上下文',
+			label: 'secure context',
 			state: 'fail',
-			detail: `${host ?? env.href} 不是安全上下文，浏览器没有暴露 WebUSB 接口`,
+			detail: `${host ?? env.href} 不是 secure context，浏览器不暴露 WebUSB 接口`,
 			advice: [
-				'改用本机地址访问：http://localhost:4321（localhost 与 127.0.0.1 都算安全上下文）',
-				'下载单文件版本，另存为本地 HTML 后双击打开——它把全部代码内联进一张 HTML，file:// 同样属于安全上下文',
-				'把站点拷到本机后用本地静态服务器打开：在 dist/ 目录执行 python3 -m http.server 8000，再访问 http://localhost:8000',
-				'确需在该地址调试：给 dev server 配置 https，或用 chrome://flags/#unsafely-treat-insecure-origin-as-secure 把该来源临时标记为安全',
+				'你可以：',
+				'下载单文件HTML到本地使用',
+				'通过 https 服务访问这个页面',
+				'或者用 chrome://flags 将这个site临时标记为secure',
 			],
 			link: {
-				label: '单文件版本',
+				label: '点这里下载单文件版本~',
 				href: '/mlink-webui-standalone.html',
 				download: true,
 			},
@@ -158,11 +159,12 @@ export function diagnoseWebUsb(env: UsbEnvironment): UsbDiagnosis {
 			id: 'usb-api',
 			label: 'WebUSB 接口',
 			state: env.isSecureContext ? 'fail' : 'unknown',
-			detail: env.isSecureContext ? '安全上下文正常，但 navigator.usb 不存在' : '接口未暴露，先解决安全上下文',
+			detail: env.isSecureContext ? '地址没问题，但 navigator.usb 不存在' : '接口未暴露，先解决 secure context',
 			advice: env.isSecureContext
 				? [
-						'改用 Chrome / Edge / Opera 桌面版打开本页（Firefox 与 Safari 没有实现 WebUSB）',
-						'已是 Chrome / Edge：打开 chrome://policy 检查 WebUsbAllowed 是否被企业策略设为 false',
+						'你可以：',
+						'用 Chrome 或 Edge 打开这个页面',
+						'已经用了 Chrome/Edge 的话，去 chrome://policy 看看 WebUsbAllowed 是不是被禁用了',
 					]
 				: [],
 		});
@@ -191,7 +193,11 @@ export function diagnoseWebUsb(env: UsbEnvironment): UsbDiagnosis {
 			label: 'Permissions-Policy',
 			state: 'fail',
 			detail: '页面策略禁止使用 usb',
-			advice: ['嵌入本页的 <iframe> 需要带 allow="usb"', '或直接在顶层标签页打开本页'],
+			advice: [
+				'你可以：',
+				'给嵌入这个页面的 iframe 加上 allow="usb"',
+				'或者直接在新标签页打开这个site',
+			],
 		});
 	}
 
@@ -225,8 +231,8 @@ export function diagnoseWebUsb(env: UsbEnvironment): UsbDiagnosis {
 			id: 'granted-device',
 			label: '已授权设备',
 			state: 'fail',
-			detail: `本来源还没有已授权的 ${env.deviceLabel}`,
-			advice: ['插上设备后点右上角「连接设备」，在选择器里选中它并允许访问'],
+			detail: `还没有授权过 ${env.deviceLabel}`,
+			advice: ['你可以：', '插上设备，点右上角「连接设备」，选中它'],
 		});
 	}
 

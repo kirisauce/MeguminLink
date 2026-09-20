@@ -45,12 +45,9 @@
 	ondismiss={onclose}
 >
 	{#snippet children()}
+		<p>保存到本地，用浏览器打开即可享用~</p>
 		<p>
-			单文件版本把整个监控面板（JS 与 CSS）内联进一张 HTML。保存在本地后双击打开即可使用，
-			<code>file://</code> 同样属于安全上下文，WebUSB 可以照常工作。
-		</p>
-		<p>
-			按「确定」由本页取回文件并保存；也可以<a href={href}>打开该页面</a>后自行按 Ctrl+S 保存网页。
+			按「确定」键开始下载；也可以<a href={href}>跳转到该页面</a>，按下 Ctrl+S 保存。
 		</p>
 		{#if error !== null}
 			<p class="error">下载失败：{error}</p>
