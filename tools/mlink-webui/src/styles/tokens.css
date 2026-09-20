@@ -161,3 +161,11 @@ samp,
 pre {
 	font-family: var(--md-sys-typescale-font-mono);
 }
+
+/* 表单控件靠 width: 100% 或 flex 撑满容器，左右 padding 与 border 必须算进
+   宽度里：否则每个控件都会比自己的列宽宽出一截，压到相邻列并溢出容器边缘。 */
+input,
+select,
+textarea {
+	box-sizing: border-box;
+}
