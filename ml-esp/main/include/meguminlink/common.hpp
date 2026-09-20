@@ -2,6 +2,7 @@
 #ifndef __MEGUMINLINK_COMMON_HPP__
 #define __MEGUMINLINK_COMMON_HPP__
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
