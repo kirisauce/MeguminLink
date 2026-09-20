@@ -85,8 +85,8 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         return;
     }
 
-    // 反序列化存储随无线对象持有：数据段可达 1467B，放栈上会吃掉 ESP-NOW
-    // 回调所在任务的栈。
+    // 反序列化存储随无线对象持有：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会
+    // 吃掉 ESP-NOW 回调所在任务的栈。
     WirelessLink &link = Application::get_instance().wireless_link();
 
     ReceivedPacket rp = {};
@@ -153,6 +153,15 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         app.config_channel().on_relayed_control(relay);
         return;
     }
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    case PacketType::Ack:
+    case PacketType::ArqReset: {
+        // 可靠传输层的就地消费点。必须在这里 return：落到下方的 default 会被
+        // 当成配对控制帧推给主循环，还要多打一条"未识别帧类型"。可靠传输层尚未
+        // 接线，当前只丢弃。
+        return;
+    }
+#endif
     default:
         // 配对控制帧（Probe/PairingRequest/PairingAccepted）：维持经主循环
         // 统一驱动配对状态机的原路径
@@ -733,44 +742,66 @@ Packet::Packet()
 
 size_t Packet::serialized_size() const
 {
+    // 各分支只算"类型 + 帧体"的长度，扩展头长度在末尾统一补上：新增帧体字段时
+    // 只需改一处，不会漏加导致发送被截断
+    size_t body = 0;
     switch (packet_type)
     {
     case PacketType::Probe: {
-        return 1;
+        body = 1;
+        break;
     }
     case PacketType::PairingRequest: {
-        return 1 + ESP_NOW_ETH_ALEN;
+        body = 1 + ESP_NOW_ETH_ALEN;
+        break;
     }
     case PacketType::PairingAccepted: {
-        return 1 + ESP_NOW_ETH_ALEN;
+        body = 1 + ESP_NOW_ETH_ALEN;
+        break;
     }
     case PacketType::DapCommand:
     case PacketType::DapResponse: {
         const u16 len = (packet_type == PacketType::DapCommand) ? payload.dap_command.len : payload.dap_response.len;
-        return DAP_FRAME_HEADER_SIZE + len;
+        body = DAP_FRAME_HEADER_SIZE + len;
+        break;
     }
     case PacketType::UartData: {
-        return UART_FRAME_HEADER_SIZE + payload.uart_data.len;
+        body = UART_FRAME_HEADER_SIZE + payload.uart_data.len;
+        break;
     }
     case PacketType::UartLineCoding: {
         // 帧头 3B + 数据段 7B（baud 4B + 3 个 1B）
-        return UART_FRAME_HEADER_SIZE + 7;
+        body = UART_FRAME_HEADER_SIZE + 7;
+        break;
     }
     case PacketType::Ping:
     case PacketType::Pong: {
         // 帧头 3B + 数据段 4B（token）
-        return UART_FRAME_HEADER_SIZE + 4;
+        body = UART_FRAME_HEADER_SIZE + 4;
+        break;
     }
     case PacketType::RelayedUsbControl: {
         // 帧头 3B + len 2B + SETUP 包 8B + 载荷
-        return UART_FRAME_HEADER_SIZE + 2 + payload::RELAYED_CONTROL_HEADER_SIZE +
-               payload.relayed_usb_control.len;
+        body = UART_FRAME_HEADER_SIZE + 2 + payload::RELAYED_CONTROL_HEADER_SIZE + payload.relayed_usb_control.len;
+        break;
     }
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    case PacketType::Ack: {
+        body = 1; // 只有类型字节：纯确认帧没有帧体，信息全在扩展头里
+        break;
+    }
+    case PacketType::ArqReset: {
+        body = 1 + 4; // 类型 1B + 数据段 4B（epoch）；与 Probe 一样不带 len 字段
+        break;
+    }
+#endif
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
     }
     }
+
+    return body + ARQ_HEADER_SIZE;
 }
 
 esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t storage_cap)
@@ -779,6 +810,17 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
 
     MLINK_CHECK_SIZE(p, 1);
     packet_type = static_cast<PacketType>(p.read_u8());
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    // 扩展头位置固定（紧跟在类型字节之后）、与帧类型无关，因此在 switch 之前
+    // 统一读一次，各分支都不需要感知它
+    MLINK_CHECK_SIZE(p, ARQ_HEADER_SIZE);
+    arq.seq = p.read_u16();
+    arq.ack = p.read_u16();
+    arq.window = p.read_u8();
+    arq.flags = p.read_u8();
+    arq.sack = p.read_u16();
+#endif
 
     switch (packet_type)
     {
@@ -890,6 +932,18 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.data = storage;
         break;
     }
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    case PacketType::Ack: {
+        // 纯确认帧没有帧体：累积确认号、SACK 位图与窗口通告全在扩展头里
+        break;
+    }
+    case PacketType::ArqReset: {
+        auto &content = payload.arq_reset;
+        MLINK_CHECK_SIZE(p, 4);
+        content.epoch = p.read_u32();
+        break;
+    }
+#endif
     default: {
         break;
     }
@@ -903,6 +957,16 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
     BinSerializer s(buffer, len);
     MLINK_CHECK_SIZE(s, 1);
     s.write_u8(static_cast<u8>(packet_type));
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    // 扩展头写在类型字节之后、帧体之前，所有帧统一携带——各分支都不需要感知它
+    MLINK_CHECK_SIZE(s, ARQ_HEADER_SIZE);
+    s.write_u16(arq.seq);
+    s.write_u16(arq.ack);
+    s.write_u8(arq.window);
+    s.write_u8(arq.flags);
+    s.write_u16(arq.sack);
+#endif
 
     switch (packet_type)
     {
@@ -999,6 +1063,18 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_bytes(content.data, content.len);
         break;
     }
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    case PacketType::Ack: {
+        // 纯确认帧没有帧体：只发类型与扩展头
+        break;
+    }
+    case PacketType::ArqReset: {
+        auto &content = payload.arq_reset;
+        MLINK_CHECK_SIZE(s, 4);
+        s.write_u32(content.epoch);
+        break;
+    }
+#endif
     default: {
         return ESP_ERR_NOT_SUPPORTED;
     }

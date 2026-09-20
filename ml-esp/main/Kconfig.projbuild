@@ -169,16 +169,54 @@ endmenu
 
 menu "Wireless"
 
+config MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    bool "Enable reliable wireless DAP transport (ARQ)"
+    default y
+    help
+        Compile the reliable transport for the DAP command/response path:
+        sequence numbers, cumulative plus selective ACK, timeout-driven
+        retransmission with exponential backoff, duplicate suppression with
+        response replay, and a consecutive-failure breaker that fails fast
+        instead of stalling every command behind a dead peer.
+
+        While enabled every frame carries an 8-byte extension header, which
+        lowers the DAP payload limit from 1467 to 1459 bytes. The host adapts
+        by itself (DAP_Info reports the per-channel packet size), so no host
+        tool needs changing. While disabled the frame format is byte-for-byte
+        the historic one.
+
+        Enable this on BOTH ends and flash them together: the two ends must
+        agree, otherwise the frame formats differ and nothing gets through.
+
+config MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW
+    int "Reliable transport window limit"
+    default 1
+    range 1 8
+    help
+        Upper bound on how many DAP messages may be in flight at once. The
+        window is what overlaps the peer's execution time with the next
+        transfer; a value of 1 is plain stop-and-wait (one command on the
+        wire at a time, matching the strictly serial command/response
+        semantics the host assumes).
+
+        Both ends size static storage from this value (the sender's window
+        buffer and the receiver's out-of-order replay storage), so raising it
+        costs RAM on both ends. The wire format already carries the window
+        and selective-ACK fields a larger window needs; only the effective
+        window limit is capped here, and the peer's advertised receive window
+        can lower it further at runtime.
+
 config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
     int "Wireless DAP response timeout (ms)"
     default 1800
     range 10 5000
     help
         How long the USB-side (sender) waits for a wireless DAP response
-        after forwarding a command to the paired peer before giving up.
-        On timeout the response is dropped without retransmission: the
-        PC-side debugger (pyOCD/OpenOCD) will see a command timeout and
-        retry on its own.
+        after forwarding a command to the paired peer before giving up. This
+        is the outer wall for the whole attempt: with ARQ enabled the
+        retransmission budget (initial RTO plus backoff) elapses inside it,
+        and only when that budget is exhausted is the command dropped and the
+        PC-side debugger left to see a command timeout and retry on its own.
 
 config MEGUMINLINK_PING_TIMEOUT_MS
     int "Paired peer ping timeout (ms)"

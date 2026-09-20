@@ -148,8 +148,8 @@ void mlink::dap_executor_run(DapCommandSource cmd_src, DapResponseSink resp_sink
         const u16 resp_len = dap_execute_once(request, req_len, response, response_cap);
         if (resp_len > MAX_DAP_PAYLOAD_SIZE)
         {
-            // 无线帧承载上限（ESP-NOW v2 1467B 载荷）装不下：丢弃，
-            // PC 端 debugger 会超时并自行重试（发送截断响应只会破坏协议）
+            // 无线单帧载荷上限装不下：丢弃，PC 端 debugger 会超时并自行重试
+            // （发送截断响应只会破坏协议）
             ESP_LOGW(TAG, "DAP response too large (%u bytes, max %u), dropped", static_cast<unsigned>(resp_len),
                      static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
             continue;
