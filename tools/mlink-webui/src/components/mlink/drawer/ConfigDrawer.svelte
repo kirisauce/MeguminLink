@@ -3,7 +3,6 @@
 	import type { MlinkSession } from '../../../lib/session.svelte';
 	import AdvancedSettings from './AdvancedSettings.svelte';
 	import ConfigActions from './ConfigActions.svelte';
-	import RateSettings from './RateSettings.svelte';
 	import UsbSettings from './UsbSettings.svelte';
 
 	let { session, open, onclose }: { session: MlinkSession; open: boolean; onclose: () => void } = $props();
@@ -68,8 +67,6 @@
 			</div>
 		{/each}
 	</dl>
-
-	<RateSettings {session} />
 
 	<UsbSettings {session} />
 

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { LOSS_PERCENT_MAX, LOSS_PERMILLE_PER_PERCENT, lossPercentText } from '../../../lib/protocol';
 	import type { MlinkSession } from '../../../lib/session.svelte';
+	import RateSettings from './RateSettings.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 
@@ -50,6 +51,8 @@
 	<summary>高级</summary>
 
 	<div class="body">
+		<RateSettings {session} />
+
 		<div class="field">
 			<label class="label" for="loss-percent">丢包注入</label>
 			<div class="input-row">

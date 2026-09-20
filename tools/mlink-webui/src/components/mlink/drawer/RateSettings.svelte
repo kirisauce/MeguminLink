@@ -22,8 +22,6 @@
 </script>
 
 <section class="rate-settings">
-	<h3>无线链路</h3>
-
 	<div class="field">
 		<label class="label" for="wifi-rate">ESP-NOW 发送速率</label>
 		<select id="wifi-rate" bind:value={selected} disabled={busy || unsupported} onchange={onchange}>
@@ -56,15 +54,6 @@
 		gap: var(--md-sys-space-sm);
 	}
 
-	h3 {
-		margin: 0;
-		font-size: var(--md-sys-typescale-label-sm);
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		color: var(--md-sys-color-on-surface-variant);
-	}
-
 	.field {
 		display: flex;
 		flex-direction: column;
@@ -83,7 +72,7 @@
 		padding: 0.4rem 0.7rem;
 		border: 1px solid var(--md-sys-color-outline-variant);
 		border-radius: var(--md-sys-shape-corner-md);
-		background: var(--md-sys-color-surface-container);
+		background: var(--md-sys-color-surface-container-high);
 		color: var(--md-sys-color-on-surface);
 		transition:
 			border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter),
