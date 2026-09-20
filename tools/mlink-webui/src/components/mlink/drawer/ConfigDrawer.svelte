@@ -7,6 +7,10 @@
 
 	let { session, open, onclose }: { session: MlinkSession; open: boolean; onclose: () => void } = $props();
 
+	// 面板标题充当无障碍名：文案只留标题这一处，不再另写一份 aria-label
+	const uid = $props.id();
+	const titleId = `${uid}-title`;
+
 	let panel = $state<HTMLElement | null>(null);
 
 	// 身份、配置与 USB 能力都是低频变化：打开时刷新一次即可，不跟随 200ms 轮询
@@ -44,18 +48,18 @@
 <!-- 常驻 DOM：class 切换驱动进出 transition，关闭态由 visibility + inert 兜住交互 -->
 <button class="scrim" class:open type="button" tabindex="-1" aria-label="关闭配置面板" onclick={onclose}></button>
 
-<aside
+<div
 	class="drawer"
 	class:open
 	inert={!open}
 	role="dialog"
 	aria-modal="true"
-	aria-label="设备配置"
+	aria-labelledby={titleId}
 	tabindex="-1"
 	bind:this={panel}
 >
 	<header>
-		<h2>设备配置</h2>
+		<h2 id={titleId}>设备配置</h2>
 		<button class="close" type="button" aria-label="关闭" onclick={onclose}>✕</button>
 	</header>
 
@@ -73,7 +77,7 @@
 	<AdvancedSettings {session} />
 
 	<ConfigActions {session} />
-</aside>
+</div>
 
 <style>
 	.scrim {
