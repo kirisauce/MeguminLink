@@ -60,6 +60,9 @@
 	/* 进场：强调减速，末段留长拖尾；出场：带初速起步、终点平滑收住（不硬停） */
 	--md-sys-motion-easing-enter: cubic-bezier(0.05, 0.7, 0.1, 1);
 	--md-sys-motion-easing-exit: cubic-bezier(0.3, 0.2, 0.7, 1);
+	/* 尺寸收拢（高度折叠等）：起步慢、末尾速度最大。收东西该是"加速离场"，
+	   exit 的减速收尾放在高度上会显得拖着不收 */
+	--md-sys-motion-easing-accelerate: cubic-bezier(0.3, 0, 1, 1);
 
 	/* 曲线序列色。uPlot 的 stroke 吃不了 CSS 变量，由组件读实际色值。 */
 	--mlink-chart-1: #9c1f2e;
