@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { MlinkSession } from '../../../lib/session.svelte';
+	import Disclosure from '../../ui/Disclosure.svelte';
 	import StandaloneDownloadDialog from './StandaloneDownloadDialog.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
@@ -29,8 +30,7 @@
 			</button>
 		{/if}
 
-		<details class="checks">
-			<summary>检查详情</summary>
+		<Disclosure summary="检查详情">
 			<dl>
 				{#each diagnosis.checks as check (check.id)}
 					<div class="row" data-state={check.state}>
@@ -39,7 +39,7 @@
 					</div>
 				{/each}
 			</dl>
-		</details>
+		</Disclosure>
 	</section>
 
 	{#if diagnosis.link !== undefined}
@@ -112,35 +112,29 @@
 		font-size: var(--md-sys-typescale-body-sm);
 	}
 
-	.checks summary {
-		font-size: var(--md-sys-typescale-body-sm);
-		cursor: pointer;
-		opacity: 0.85;
-	}
-
-	.checks dl {
+	dl {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		margin: var(--md-sys-space-xs) 0 0;
+		margin: 0;
 		font-size: var(--md-sys-typescale-body-sm);
 	}
 
-	.checks .row {
+	.row {
 		display: flex;
 		gap: var(--md-sys-space-sm);
 	}
 
-	.checks dt {
+	dt {
 		flex: 0 0 7.5rem;
 		opacity: 0.75;
 	}
 
-	.checks dd {
+	dd {
 		margin: 0;
 	}
 
-	.checks .row[data-state='fail'] dd {
+	.row[data-state='fail'] dd {
 		font-weight: 600;
 	}
 
