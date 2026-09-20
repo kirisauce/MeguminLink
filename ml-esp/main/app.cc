@@ -464,7 +464,24 @@ void Application::run()
 {
     while (true)
     {
-        xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(200));
+        // 空闲等待按可靠传输的下一个待办时刻收短：纯确认、重传与握手帧都靠主循环
+        // 在空闲时被驱动，睡满 200ms 会让它们迟到（对端会因此白重传一轮）
+        u32 idle_ms = 200;
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+        {
+            const u32 arq_deadline = m_wireless_link.arq_next_deadline_ms();
+            const u32 now = static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (arq_deadline != 0)
+            {
+                const u32 until = static_cast<u32>(static_cast<i32>(arq_deadline - now));
+                if (until < idle_ms)
+                {
+                    idle_ms = (until == 0) ? 1 : until;
+                }
+            }
+        }
+#endif
+        xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(idle_ms));
 
         // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
         consume_pending_action();
@@ -472,6 +489,11 @@ void Application::run()
         // 无线侧与对端的档位同步：接收回调只登记待生效值（不可在回调里操作
         // WiFi 驱动），实际应用在这里
         m_wireless_link.poll();
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+        // 可靠传输的空闲驱动：重传、纯确认、响应重放与会话握手帧都在这里发出
+        m_wireless_link.arq_poll(static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS));
+#endif
 
         // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
         m_config_channel.poll_ping_timeout();
@@ -569,7 +591,9 @@ void Application::run()
                     {
                     case PacketType::DapCommand: {
                         const auto &cmd = rp.packet.payload.dap_command;
-                        const esp_err_t ret = m_wireless_link.dap_execute(rp.src_mac, cmd.data, cmd.len);
+                        // 装了可靠传输时 DAP 命令在接收回调里就地消费（重复帧要立即
+                        // 重放），不会走到这条经主循环的老路径；序号填 0 只为兼容
+                        const esp_err_t ret = m_wireless_link.dap_execute(rp.src_mac, 0, cmd.data, cmd.len);
                         if (ret != ESP_OK)
                         {
                             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),

@@ -7,10 +7,11 @@ using namespace mlink::arq;
 
 // ---- RttEstimator ----
 
-void RttEstimator::init(u16 min_ms, u16 max_ms)
+void RttEstimator::init(u16 min_ms, u16 max_ms, u16 initial_ms)
 {
     m_min_ms = min_ms;
     m_max_ms = max_ms;
+    m_initial_ms = (initial_ms < min_ms) ? min_ms : ((initial_ms > max_ms) ? max_ms : initial_ms);
     m_srtt_ms = 0;
     m_rttvar_ms = 0;
     m_have_sample = false;
@@ -34,7 +35,7 @@ void RttEstimator::update(u32 sample_ms)
 
 u32 RttEstimator::base_ms() const
 {
-    u32 rto = m_have_sample ? (m_srtt_ms + 4 * m_rttvar_ms) : m_min_ms;
+    u32 rto = m_have_sample ? (m_srtt_ms + 4 * m_rttvar_ms) : m_initial_ms;
     if (rto < m_min_ms)
     {
         rto = m_min_ms;
@@ -174,7 +175,7 @@ void Sender::reset()
     m_abandoned = false;
     m_peer_window = MAX_WINDOW;
 
-    m_rtt.init(m_config.rto_min_ms, m_config.rto_max_ms);
+    m_rtt.init(m_config.rto_min_ms, m_config.rto_max_ms, m_config.initial_rto_ms);
     m_breaker.init(m_config.breaker_failures, m_config.breaker_probe_ms);
 }
 

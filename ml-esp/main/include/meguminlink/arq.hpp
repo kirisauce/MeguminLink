@@ -75,10 +75,26 @@ struct Config
      */
     bool reorder = false;
 
-    /** RTO 下限（同时也是还没有 RTT 样本时的初值） */
-    u16 rto_min_ms = 15;
+    /**
+     * RTO 下限。取值必须覆盖"对端执行整条命令"的时间：本链路的确认随响应捎带
+     * 回来，一次往返里含执行时间，而命令长度差异极大（探测类命令执行不到 1ms，
+     * 写满载荷的批量传输命令十几毫秒），估计值跟不上下限一低就会出现"RTT 超过
+     * RTO → 重传 → 该条消息因 Karn 不再采样 → 估计值回不去"的自锁，之后每条大
+     * 命令都白重传一次。
+     */
+    u16 rto_min_ms = 60;
     /** RTO 上限：指数退避到此为止 */
     u16 rto_max_ms = 250;
+    /**
+     * 还没有 RTT 样本时的初始 RTO。
+     *
+     * 不能取下限：本链路的确认是随响应捎带回来的，一次往返里含着对端执行整条
+     * 命令的时间（实测约 13ms，批量传输命令更久），取下限会让会话开头几条命令
+     * 必然白重传一次。第一个样本一到就切换到自适应估计，所以这个值只影响会话
+     * 开头；它同时是重传预算的起点，取值过大会把最坏失败时刻顶到主机侧的命令
+     * 超时之外（当前取值下最坏 1.42s，仍在 1.8s 之内）。
+     */
+    u16 initial_rto_ms = 60;
     /** 单条消息的重传次数上限（首传不计）；超限即判定失败并丢弃 */
     u8 max_retx = 6;
     /** 连续多少条消息重传耗尽后熔断（快速失败），0 = 不熔断 */
@@ -182,12 +198,12 @@ inline u16 sack_set(u16 bitmap, u16 ack, u16 seq)
 class RttEstimator
 {
   public:
-    void init(u16 min_ms, u16 max_ms);
+    void init(u16 min_ms, u16 max_ms, u16 initial_ms);
 
     /** 喂一个往返样本（毫秒） */
     void update(u32 sample_ms);
 
-    /** 基础 RTO（不含退避），已按上下限截断 */
+    /** 基础 RTO：还没有样本时用初始值，之后是 clamp(SRTT + 4·RTTVAR, 下限, 上限) */
     u32 base_ms() const;
 
     /** 带退避的 RTO：基础值左移 shift 位后按上限截断（shift 由每条消息各自持有） */
@@ -211,6 +227,7 @@ class RttEstimator
   private:
     u16 m_min_ms = 15;
     u16 m_max_ms = 250;
+    u16 m_initial_ms = 60;
     u32 m_srtt_ms = 0;
     u32 m_rttvar_ms = 0;
     bool m_have_sample = false;

@@ -9,6 +9,10 @@
 #include "meguminlink/dap_executor.hpp" // DAP_MAX_REQUEST_SIZE / DAP_MAX_RESPONSE_SIZE（执行器缓冲）
 #include "sdkconfig.h"
 
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+#include "meguminlink/arq_link.hpp"
+#endif
+
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
 #include <freertos/semphr.h> // SemaphoreHandle_t
@@ -455,12 +459,34 @@ class WirelessLink
      */
     void poll();
 
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    /**
+     * 驱动可靠传输：重传、纯确认、响应重放与会话握手。调用方是主循环与 USB 侧
+     * 的等待循环——接收回调只置待发标记，所有出向帧都在这里发出。
+     */
+    void arq_poll(u32 now_ms);
+
+    /** 会话握手是否已完成（USB 侧据此在转发命令前先等一等） */
+    bool arq_established() const;
+
+    /** 可靠传输的下一个待办时刻（0 = 无待办），调用方据此收短等待超时 */
+    u32 arq_next_deadline_ms() const;
+
+    /** 可靠传输累计计数（统计与日志用） */
+    ArqLink::Snapshot arq_snapshot() const;
+#endif
+
     /**
      * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
      * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
      * resp 缓冲（容量 resp_cap，需 ≥ MAX_DAP_PAYLOAD_SIZE）。
-     * @return ESP_OK=已收到响应；否则失败（未配对 / 发送失败 / 响应超时，
-     *         命令已丢弃，PC 端 debugger 会自行超时重试）
+     *
+     * 装了可靠传输时，等待期间会驱动重传：一帧丢了由本层自己补，不再直接变成
+     * 主机侧的一次命令超时。超时上限仍是 MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS，
+     * 重传预算在它之内耗尽才判失败。
+     *
+     * @return ESP_OK=已收到响应；否则失败（未配对 / 会话未对齐 / 发送失败 /
+     *         重传耗尽 / 响应超时，命令已丢弃，PC 端 debugger 会自行超时重试）
      */
     esp_err_t forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len);
 
@@ -476,10 +502,12 @@ class WirelessLink
     /**
      * 投递一条无线接收到的 DAP 命令给执行器（异步入队，立即返回）。
      * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
+     * @param cmd_seq 该命令在可靠传输里的序号（无 ARQ 时填 0）；回响应时按它记账，
+     *                对端重传同一条命令时据此重放响应而不是重新执行
      * @param data    DAP 命令原样字节流
      * @param len     命令长度（> MAX_DAP_PAYLOAD_SIZE 时拒绝）
      */
-    esp_err_t dap_execute(const u8 *src_mac, const u8 *data, size_t len);
+    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len);
 
   private:
     /** ESP-NOW 接收/发送回调（esp_now 要求 C 函数指针，无 arg；经 Application 访问） */
@@ -491,8 +519,31 @@ class WirelessLink
     static void dap_resp_sink(const u8 *data, u16 len, void *arg);
     static void dap_task_fn(void *arg);
 
+    /**
+     * 序列化并交给 ESP-NOW。只取发送锁，不碰可靠传输的锁——可靠传输的重传回调
+     * 是在持有它自己那把锁的情况下调用本函数的，反过来再取一次会死锁。
+     */
+    esp_err_t send_raw(const u8 *dest_mac, const Packet &packet);
+
     /** 设置单播 peer 的 ESP-NOW 发送速率（广播地址跳过） */
     esp_err_t set_peer_rate(const u8 *peer_mac);
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    /** 可靠传输的输出回调：把核心给的消息/确认/重置封成帧送出去 */
+    static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u16 ack,
+                             u16 sack, u8 window);
+    static void arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window);
+    static void arq_send_reset(void *ctx, u32 epoch, u16 ack, u16 sack, u8 window);
+    static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
+
+    /** 本端可靠传输发送的消息类型：USB 侧发命令，无 USB 侧发响应 */
+    static constexpr PacketType ARQ_MESSAGE_TYPE =
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+        PacketType::DapCommand;
+#else
+        PacketType::DapResponse;
+#endif
+#endif
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     /** xorshift32 取下一个随机数（状态在 send 的发送锁内推进） */
@@ -547,9 +598,16 @@ class WirelessLink
     TaskHandle_t m_dap_task = nullptr;
     /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
     u8 m_dap_src_mac[ESP_NOW_ETH_ALEN];
+    /** 最近一条命令的可靠传输序号；仅执行任务线程读写（回响应时按它记账） */
+    u16 m_dap_cmd_seq = 0;
     /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */
     u8 m_dap_request[DAP_MAX_REQUEST_SIZE];
     u8 m_dap_response[DAP_MAX_RESPONSE_SIZE];
+
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    /** 可靠传输适配层（收发状态机 + 会话握手 + 重放排队，见 arq_link.hpp） */
+    ArqLink m_arq;
+#endif
 };
 } // namespace mlink
 

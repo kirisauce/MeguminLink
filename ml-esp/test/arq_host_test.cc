@@ -607,9 +607,10 @@ void test_failure_budget()
         failed_at = sim.now;
     }
 
-    // 静默全丢：重传序列 15+30+60+120+240+250+250 = 965ms，仍是首传 + 6 次重传
+    // 静默全丢：还没有 RTT 样本，RTO 从初始值 60ms 起指数退避
+    // （60+120+240+250+250+250），首传 + 6 次重传之后判死
     CHECK_EQ(sim.ep[0].tx.snapshot().failed_frames, 1u);
-    CHECK(failed_at >= 940 && failed_at <= 1000);
+    CHECK(failed_at >= 1400 && failed_at <= 1450);
     CHECK(failed_at < 1800); // 必须留在主机侧的命令超时之内
     CHECK(sim.ep[0].tx.idle());
 }
