@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { MlinkSession } from '../../../../lib/session.svelte';
+	import LinkSettings from './LinkSettings.svelte';
 	import LossSettings from './LossSettings.svelte';
 	import RateSettings from './RateSettings.svelte';
 
@@ -13,6 +14,8 @@
 		<RateSettings {session} />
 
 		<LossSettings {session} />
+
+		<LinkSettings {session} />
 	</div>
 </details>
 

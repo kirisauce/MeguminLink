@@ -18,6 +18,7 @@ import {
 	CMD_SET_LOSS,
 	CMD_SET_WIFI_RATE,
 	MODE_WIRELESS,
+	type LinkConfigPatch,
 	PAIR_PAIRED,
 	PID,
 	ProtocolError,
@@ -29,6 +30,7 @@ import {
 	applyUsbConfig,
 	pingPeer,
 	readConfig,
+	writeLinkConfig,
 	readStats,
 	readUsbConfig,
 	runCommand,
@@ -352,6 +354,34 @@ export class MlinkSession {
 	 *
 	 * 回显值就地更新，理由同 setWifiRate。
 	 */
+	/**
+	 * 下发可靠传输参数（SetLinkConfig）。
+	 *
+	 * 与速率档位、丢包率不同，这里一次提交整组改动：设备每应用一次就会重置可靠
+	 * 传输会话（换新 epoch 让两端重新对齐序号并同步参数），逐项提交会把会话反复
+	 * 打断。参数随即生效并落盘，对端由会话重置帧拿到同一份。
+	 *
+	 * 应用在设备主循环里做，所以写完要重读一次配置——读到的才是生效值与新代数。
+	 */
+	async setLinkConfig(patch: LinkConfigPatch): Promise<void> {
+		const device = this.device;
+		if (device === null || this.commandPending) return;
+		this.commandPending = true;
+		this.commandError = null;
+		try {
+			await writeLinkConfig(device, this.#seq, patch);
+			this.#seq = (this.#seq + 1) & 0xff;
+			// 设备应用是异步的：给主循环一拍再去读，免得读到旧值
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			this.config = await readConfig(device, this.#seq);
+			this.#seq = (this.#seq + 1) & 0xff;
+		} catch (error) {
+			this.commandError = describeCommandError(error);
+		} finally {
+			this.commandPending = false;
+		}
+	}
+
 	async setLossPermille(permille: number): Promise<void> {
 		await this.#sendCommand(CMD_SET_LOSS, permille);
 		if (this.commandError === null && this.config !== null) {

@@ -52,6 +52,7 @@ PID = 0x4020
 VENDOR_CODE = 0x4D
 CMD_GET_STATS = 0x01
 CMD_GET_CONFIG = 0x02
+CMD_SET_LINK_CONFIG = 0x1B
 CMD_GET_USB_CONFIG = 0x03
 CMD_SET_MODE = 0x10
 CMD_ENTER_PAIRING = 0x11
@@ -98,6 +99,11 @@ STATS_FIELDS = [
     (0x33, "uart_wl_tx_bytes"),
     (0x26, "loss_frames"),
     (0x27, "loss_dropped"),
+    (0x71, "arq_tx"),
+    (0x72, "arq_retx"),
+    (0x74, "arq_failed"),
+    (0x75, "arq_dup"),
+    (0x7C, "arq_breaker_trips"),
     (0x40, "uptime_ms"),
 ]
 
@@ -112,6 +118,14 @@ CONFIG_FIELDS = [
     (0x51, "peer_mac"),
     (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
     (TAG_CONFIG_LOSS_PERMILLE, "loss_percent"),
+    (0x54, "arq_generation"),
+    (0x55, "arq_enable"),
+    (0x56, "arq_window"),
+    (0x57, "arq_max_retx"),
+    (0x58, "arq_breaker"),
+    (0x59, "arq_rto_min_ms"),
+    (0x5B, "arq_rto_max_ms"),
+    (0x5C, "arq_delayed_ack_ms"),
 ]
 
 # CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
@@ -277,6 +291,7 @@ def render_stats(values):
         parts.append(f"{name}={value}")
     parts.extend(render_uart_state(values))
     parts.extend(render_peer_state(values))
+    parts.extend(render_arq_state(values))
     return " ".join(parts)
 
 
@@ -313,6 +328,41 @@ def render_peer_state(values):
     return parts
 
 
+# 可靠传输（GetStats 的 0x70-0x7C、GetConfig 的 0x54-0x5D，与固件 config_channel.cc 一致）
+TAG_ARQ_STATE = 0x70
+TAG_ARQ_ACKED = 0x73
+TAG_ARQ_REPLAYED = 0x78
+TAG_ARQ_REPLAY_MISS = 0x79
+TAG_ARQ_SRTT_MS = 0x7A
+TAG_ARQ_RTO_MS = 0x7B
+TAG_ARQ_ENABLE = 0x55
+TAG_ARQ_GENERATION = 0x54
+TAG_ARQ_RTO_INIT_MS = 0x5A
+TAG_ARQ_PROBE_MS = 0x5D
+
+
+def render_arq_state(values):
+    """可靠传输状态：窗口/熔断位在 0x70 里打包，重传率由 tx 与 retx 现算（老固件整组跳过）。"""
+    if TAG_ARQ_STATE not in values:
+        return []
+
+    state = u8_of(values, TAG_ARQ_STATE)
+    tx = u32_of(values, 0x71)
+    retx = u32_of(values, 0x72)
+    rate = f"{retx / tx * 100:.1f}%" if tx else "—"
+    return [
+        f"arq={'off' if u8_of(values, TAG_ARQ_ENABLE) == 0 else 'on'}",
+        f"arq_window={state & 0x0F}",
+        f"arq_in_flight={(state >> 4) & 0x07}",
+        f"arq_broken={'yes' if state & 0x80 else 'no'}",
+        f"arq_srtt_ms={u32_of(values, TAG_ARQ_SRTT_MS)}",
+        f"arq_rto_ms={u32_of(values, TAG_ARQ_RTO_MS)}",
+        f"arq_retx_rate={rate}",
+        f"arq_replayed={u32_of(values, TAG_ARQ_REPLAYED)}",
+        f"arq_replay_miss={u32_of(values, TAG_ARQ_REPLAY_MISS)}",
+    ]
+
+
 def render_config(values):
     parts = []
     for tag, name in CONFIG_FIELDS:
@@ -333,6 +383,13 @@ def render_config(values):
             # 设备端按千分比存放，界面上统一按百分比呈现（0.1% 步进）
             code = int.from_bytes(raw, "big") if raw else None
             value = "?" if code is None else f"{code / 10:.1f}%"
+        elif name.startswith("arq_"):
+            # 可靠传输参数都是整数；开关单独译成人看得懂的 on/off
+            code = int.from_bytes(raw, "big") if raw else None
+            if name == "arq_enable":
+                value = "?" if code is None else ("on" if code else "off")
+            else:
+                value = "?" if code is None else code
         else:
             value = raw.decode("utf-8", "replace") if raw is not None else ""
         parts.append(f"{name}={value}")
@@ -340,6 +397,11 @@ def render_config(values):
 
 
 def u8_of(values, tag):
+    raw = values.get(tag)
+    return int.from_bytes(raw, "big") if raw else 0
+
+
+def u16_of(values, tag):
     raw = values.get(tag)
     return int.from_bytes(raw, "big") if raw else 0
 
@@ -393,6 +455,107 @@ def cmd_read_config(_args):
 
 def cmd_read_usb(_args):
     print(render_usb(decode(fetch(find_device(), CMD_GET_USB_CONFIG))))
+
+
+def cmd_arq(_args):
+    """可靠传输的聚焦视图：状态、RTO 估计与全部计数各一行，便于盯链路质量。"""
+    dev = find_device()
+    stats = decode(fetch(dev, CMD_GET_STATS))
+    config = decode(fetch(dev, CMD_GET_CONFIG))
+
+    if TAG_ARQ_STATE not in stats:
+        die("固件不支持可靠传输（GetStats 里没有 0x70），或该功能未编译")
+
+    state = u8_of(stats, TAG_ARQ_STATE)
+    tx = u32_of(stats, 0x71)
+    retx = u32_of(stats, 0x72)
+    print(
+        f"arq={'off' if u8_of(config, TAG_ARQ_ENABLE) == 0 else 'on'}"
+        f" window={state & 0x0F}"
+        f" in_flight={(state >> 4) & 0x07}"
+        f" broken={'yes' if state & 0x80 else 'no'}"
+        f" generation={u32_of(config, TAG_ARQ_GENERATION)}"
+    )
+    print(
+        f"rto_ms={u32_of(stats, TAG_ARQ_RTO_MS)}"
+        f" srtt_ms={u32_of(stats, TAG_ARQ_SRTT_MS)}"
+        f" min={u16_of(config, 0x59)}"
+        f" init={u16_of(config, TAG_ARQ_RTO_INIT_MS)}"
+        f" max={u16_of(config, 0x5B)}"
+    )
+    print(
+        f"tx={tx} retx={retx}"
+        f" retx_rate={f'{retx / tx * 100:.1f}%' if tx else '—'}"
+        f" failed={u32_of(stats, 0x74)}"
+        f" breaker_trips={u32_of(stats, 0x7C)}"
+    )
+    print(
+        f"acked={u32_of(stats, TAG_ARQ_ACKED)}"
+        f" dup={u32_of(stats, 0x75)}"
+        f" ooo={u32_of(stats, 0x76)}"
+        f" skipped={u32_of(stats, 0x77)}"
+        f" replayed={u32_of(stats, TAG_ARQ_REPLAYED)}"
+        f" replay_miss={u32_of(stats, TAG_ARQ_REPLAY_MISS)}"
+    )
+
+
+def cmd_set_link(args):
+    """下发可靠传输参数：只覆盖指定的字段，代数由设备自己 +1。"""
+    u8_items = [
+        ("enable", 0x01, None if args.enable is None else (1 if args.enable == "on" else 0)),
+        ("window", 0x02, args.window),
+        ("max-retx", 0x03, args.max_retx),
+        ("breaker", 0x04, args.breaker),
+    ]
+    u16_items = [
+        ("rto-min", 0x05, args.rto_min),
+        ("rto-init", 0x06, args.rto_init),
+        ("rto-max", 0x07, args.rto_max),
+        ("delayed-ack", 0x08, args.delayed_ack),
+        ("probe", 0x09, args.probe),
+    ]
+
+    payload = b""
+    for name, tag, value in u8_items:
+        if value is None:
+            continue
+        if not 0 <= value <= 0xFF:
+            die(f"--{name} 超出 u8 范围：{value}")
+        payload += encode_tlv(tag, bytes([value]))
+    for name, tag, value in u16_items:
+        if value is None:
+            continue
+        if not 1 <= value <= 0xFFFF:
+            die(f"--{name} 超出 u16 范围：{value}")
+        payload += encode_tlv(tag, value.to_bytes(2, "big"))
+
+    if not payload:
+        die("至少要指定一个参数（--enable / --window / --rto-min / --max-retx / …）")
+
+    dev = find_device()
+    generation = u32_of(decode(fetch(dev, CMD_GET_CONFIG)), TAG_ARQ_GENERATION)
+
+    try:
+        dev.ctrl_transfer(0x40, VENDOR_CODE, CMD_SET_LINK_CONFIG, 0, payload, TIMEOUT_MS)
+    except usb.core.USBError as err:
+        die(f"设备拒绝了该载荷（参数越界或 TLV 格式非法）：{err}")
+
+    # 参数由主循环应用并落盘，代数随之 +1。OUT 请求没有响应阶段，只能盯着代数等它
+    # 变——不等的话读到的还是旧值（应用还没跑到）。
+    deadline = time.time() + 2.0
+    config = decode(fetch(dev, CMD_GET_CONFIG))
+    while u32_of(config, TAG_ARQ_GENERATION) == generation and time.time() < deadline:
+        time.sleep(0.05)
+        config = decode(fetch(dev, CMD_GET_CONFIG))
+
+    if u32_of(config, TAG_ARQ_GENERATION) == generation:
+        die("设备没有应用这份参数（代数未变化），检查设备日志")
+
+    print(render_config(config))
+    print(
+        "mlinkctl: 参数随即生效并重置会话，对端由会话重置帧同步；设备已自行落盘",
+        file=sys.stderr,
+    )
 
 
 def cmd_set_usb(args):
@@ -577,6 +740,22 @@ def build_parser():
     set_mode = subparsers.add_parser("set-mode", help="切换运行模式")
     set_mode.add_argument("mode", choices=sorted(MODE_ARG), help="local 或 wireless")
     set_mode.set_defaults(handler=cmd_set_mode)
+
+    set_link = subparsers.add_parser("set-link", help="设置可靠传输参数（随即生效并同步给对端）")
+    set_link.add_argument("--enable", choices=("on", "off"), help="运行时开关：off = 不等确认、不重传")
+    set_link.add_argument("--window", type=int, metavar="N", help="发送窗口（本固件上限 1）")
+    set_link.add_argument("--rto-min", type=int, metavar="MS", help="RTO 下限（毫秒）")
+    set_link.add_argument("--rto-init", type=int, metavar="MS", help="还没有 RTT 样本时的初始 RTO（毫秒）")
+    set_link.add_argument("--rto-max", type=int, metavar="MS", help="RTO 上限（毫秒，退避到此为止）")
+    set_link.add_argument("--max-retx", type=int, metavar="N", help="单条消息重传次数上限")
+    set_link.add_argument("--breaker", type=int, metavar="N", help="连续多少条重传耗尽后熔断（0 = 不熔断）")
+    set_link.add_argument("--delayed-ack", type=int, metavar="MS", help="没有数据可捎带时补纯 ACK 的延迟")
+    set_link.add_argument("--probe", type=int, metavar="MS", help="熔断期间放行试探的间隔")
+    set_link.set_defaults(handler=cmd_set_link)
+
+    subparsers.add_parser("arq", help="可靠传输聚焦视图：状态、RTO 估计与全部计数").set_defaults(
+        handler=cmd_arq
+    )
 
     set_rate = subparsers.add_parser("set-rate", help="设置 ESP-NOW 发送速率档位（两端同时应用）")
     set_rate.add_argument("rate", nargs="?", help="档位名（如 mcs7-sgi）或数值（如 0x1F）")

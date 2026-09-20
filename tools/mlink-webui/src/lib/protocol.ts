@@ -34,6 +34,7 @@ export const CMD_APPLY_USB_CONFIG = 0x17;
 export const CMD_PING = 0x18;
 export const CMD_SET_WIFI_RATE = 0x19;
 export const CMD_SET_LOSS = 0x1a;
+export const CMD_SET_LINK_CONFIG = 0x1b;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -90,6 +91,56 @@ const TAG_LOSS_DROPPED = 0x27;
 export const PEER_UNKNOWN = 0;
 export const PEER_ONLINE = 1;
 export const PEER_OFFLINE = 2;
+
+/**
+ * 可靠传输的 tag。参数在 GetConfig 的 0x54-0x5D（持久化配置项段），运行时状态与
+ * 计数在 GetStats 的 0x70-0x7C（无线段 0x20-0x2F 已排满，单开一段）。
+ * 固件未编译该功能时整组不下发，界面显示「—」。
+ */
+const TAG_ARQ_GENERATION = 0x54;
+const TAG_ARQ_ENABLE = 0x55;
+const TAG_ARQ_WINDOW = 0x56;
+const TAG_ARQ_MAX_RETX = 0x57;
+const TAG_ARQ_BREAKER = 0x58;
+const TAG_ARQ_RTO_MIN = 0x59;
+const TAG_ARQ_RTO_INIT = 0x5a;
+const TAG_ARQ_RTO_MAX = 0x5b;
+const TAG_ARQ_DELAYED_ACK = 0x5c;
+const TAG_ARQ_PROBE = 0x5d;
+
+const TAG_ARQ_STATE = 0x70;
+const TAG_ARQ_TX = 0x71;
+const TAG_ARQ_RETX = 0x72;
+const TAG_ARQ_ACKED = 0x73;
+const TAG_ARQ_FAILED = 0x74;
+const TAG_ARQ_DUP = 0x75;
+const TAG_ARQ_OOO = 0x76;
+const TAG_ARQ_SKIPPED = 0x77;
+const TAG_ARQ_REPLAYED = 0x78;
+const TAG_ARQ_REPLAY_MISS = 0x79;
+const TAG_ARQ_SRTT_MS = 0x7a;
+const TAG_ARQ_RTO_MS = 0x7b;
+const TAG_ARQ_BREAKER_TRIPS = 0x7c;
+
+/** SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，与响应帧的 tag 无关。 */
+const LINK_TAG_ENABLE = 0x01;
+const LINK_TAG_WINDOW = 0x02;
+const LINK_TAG_MAX_RETX = 0x03;
+const LINK_TAG_BREAKER = 0x04;
+const LINK_TAG_RTO_MIN = 0x05;
+const LINK_TAG_RTO_INIT = 0x06;
+const LINK_TAG_RTO_MAX = 0x07;
+const LINK_TAG_DELAYED_ACK = 0x08;
+const LINK_TAG_PROBE = 0x09;
+
+/**
+ * 状态字节（0x70）的位域：bit0-3 生效窗口、bit4-6 在途消息数、bit7 熔断中。
+ * 在途数与窗口打包成一个字节，是为了省一个 TLV；窗口上限 8、在途上限 7 都装得下。
+ */
+export const ARQ_STATE_WINDOW_MASK = 0x0f;
+export const ARQ_STATE_IN_FLIGHT_SHIFT = 4;
+export const ARQ_STATE_IN_FLIGHT_MASK = 0x07;
+export const ARQ_STATE_BROKEN = 0x80;
 
 /** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
 const TAG_USB_SUPPORTED = 0x60;
@@ -155,7 +206,60 @@ export type Stats = {
 	 */
 	lossFrames: number | null;
 	lossDropped: number | null;
+	/**
+	 * 可靠传输的运行状态与计数（同一次快照）。arqState 是打包字节，用上面那组位掩码
+	 * 拆；arqRetx / arqTx 之比即重传率，是"链路现在有多差"最直观的读数。
+	 * 固件未编译该功能时为 null。
+	 */
+	arqState: number | null;
+	arqTx: number | null;
+	arqRetx: number | null;
+	arqAcked: number | null;
+	arqFailed: number | null;
+	arqDup: number | null;
+	arqOoo: number | null;
+	arqSkipped: number | null;
+	arqReplayed: number | null;
+	arqReplayMiss: number | null;
+	arqSrttMs: number | null;
+	arqRtoMs: number | null;
+	arqBreakerTrips: number | null;
 };
+
+/** 可靠传输那组可空字段的键（不参与速率差分，见 rate.ts 的 CounterKey）。 */
+export type ArqStateKey =
+	| 'arqState'
+	| 'arqTx'
+	| 'arqRetx'
+	| 'arqAcked'
+	| 'arqFailed'
+	| 'arqDup'
+	| 'arqOoo'
+	| 'arqSkipped'
+	| 'arqReplayed'
+	| 'arqReplayMiss'
+	| 'arqSrttMs'
+	| 'arqRtoMs'
+	| 'arqBreakerTrips';
+
+/** SetLinkConfig 的载荷：只带要改的字段，undefined = 保持设备当前值。 */
+export type LinkConfigPatch = {
+	enable?: number;
+	window?: number;
+	maxRetx?: number;
+	breaker?: number;
+	rtoMinMs?: number;
+	rtoInitMs?: number;
+	rtoMaxMs?: number;
+	delayedAckMs?: number;
+	probeMs?: number;
+};
+
+/** 重传率（百分比）；一次都没发出去过时返回 null（显示「—」而不是 0%）。 */
+export function arqRetxRate(stats: Stats): number | null {
+	if (stats.arqTx === null || stats.arqTx === 0) return null;
+	return ((stats.arqRetx ?? 0) / stats.arqTx) * 100;
+}
 
 export type StatField = {
 	tag: number;
@@ -265,6 +369,16 @@ export type DeviceConfig = {
 	peerMac: string | null;
 	wifiRate: number | null;
 	lossPermille: number | null;
+	/** 可靠传输参数（0x54-0x5D）；固件未编译该功能时为 null。 */
+	arqGeneration: number | null;
+	arqEnable: number | null;
+	arqWindow: number | null;
+	arqMaxRetx: number | null;
+	arqBreaker: number | null;
+	arqRtoMinMs: number | null;
+	arqRtoInitMs: number | null;
+	arqRtoMaxMs: number | null;
+	arqDelayedAckMs: number | null;
 };
 
 /**
@@ -421,6 +535,19 @@ export function decodeStats(frame: DataView): Stats {
 	stats.pingFail = readOptional(tags.get(TAG_PING_FAIL));
 	stats.lossFrames = readOptional(tags.get(TAG_LOSS_FRAMES));
 	stats.lossDropped = readOptional(tags.get(TAG_LOSS_DROPPED));
+	stats.arqState = readOptional(tags.get(TAG_ARQ_STATE));
+	stats.arqTx = readOptional(tags.get(TAG_ARQ_TX));
+	stats.arqRetx = readOptional(tags.get(TAG_ARQ_RETX));
+	stats.arqAcked = readOptional(tags.get(TAG_ARQ_ACKED));
+	stats.arqFailed = readOptional(tags.get(TAG_ARQ_FAILED));
+	stats.arqDup = readOptional(tags.get(TAG_ARQ_DUP));
+	stats.arqOoo = readOptional(tags.get(TAG_ARQ_OOO));
+	stats.arqSkipped = readOptional(tags.get(TAG_ARQ_SKIPPED));
+	stats.arqReplayed = readOptional(tags.get(TAG_ARQ_REPLAYED));
+	stats.arqReplayMiss = readOptional(tags.get(TAG_ARQ_REPLAY_MISS));
+	stats.arqSrttMs = readOptional(tags.get(TAG_ARQ_SRTT_MS));
+	stats.arqRtoMs = readOptional(tags.get(TAG_ARQ_RTO_MS));
+	stats.arqBreakerTrips = readOptional(tags.get(TAG_ARQ_BREAKER_TRIPS));
 	return stats;
 }
 
@@ -434,6 +561,15 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
 		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
 		lossPermille: readOptional(tags.get(TAG_CONFIG_LOSS_PERMILLE)),
+		arqGeneration: readOptional(tags.get(TAG_ARQ_GENERATION)),
+		arqEnable: readOptional(tags.get(TAG_ARQ_ENABLE)),
+		arqWindow: readOptional(tags.get(TAG_ARQ_WINDOW)),
+		arqMaxRetx: readOptional(tags.get(TAG_ARQ_MAX_RETX)),
+		arqBreaker: readOptional(tags.get(TAG_ARQ_BREAKER)),
+		arqRtoMinMs: readOptional(tags.get(TAG_ARQ_RTO_MIN)),
+		arqRtoInitMs: readOptional(tags.get(TAG_ARQ_RTO_INIT)),
+		arqRtoMaxMs: readOptional(tags.get(TAG_ARQ_RTO_MAX)),
+		arqDelayedAckMs: readOptional(tags.get(TAG_ARQ_DELAYED_ACK)),
 	};
 }
 
@@ -551,6 +687,53 @@ export function landingPageError(url: string): string | null {
  * 载荷是全量三项的 TLV（WebUSB / WinUSB / landing page），设备端只校验并缓存，
  * 不落盘不生效；结果用随后的 readUsbConfig 读草稿状态确认。
  */
+/**
+ * 下发可靠传输参数（SetLinkConfig，OUT 方向）。
+ *
+ * 只把 patch 里给出的字段编进载荷——设备端按"只覆盖出现的字段"处理，没给的保持它
+ * 当前值；参数代数由设备自己 +1。应用在设备主循环里做，因此本函数返回只代表载荷
+ * 已被接受，生效值与新一代代数要随后读一次 GetConfig。
+ */
+export async function writeLinkConfig(
+	device: USBDevice,
+	seq: number,
+	patch: LinkConfigPatch
+): Promise<void> {
+	const u8 = (tag: number, value: number): Uint8Array<ArrayBuffer> =>
+		encodeTlv(tag, new Uint8Array([value & 0xff]));
+	const u16 = (tag: number, value: number): Uint8Array<ArrayBuffer> =>
+		encodeTlv(tag, new Uint8Array([(value >> 8) & 0xff, value & 0xff]));
+
+	const parts: Uint8Array[] = [];
+	if (patch.enable !== undefined) parts.push(u8(LINK_TAG_ENABLE, patch.enable));
+	if (patch.window !== undefined) parts.push(u8(LINK_TAG_WINDOW, patch.window));
+	if (patch.maxRetx !== undefined) parts.push(u8(LINK_TAG_MAX_RETX, patch.maxRetx));
+	if (patch.breaker !== undefined) parts.push(u8(LINK_TAG_BREAKER, patch.breaker));
+	if (patch.rtoMinMs !== undefined) parts.push(u16(LINK_TAG_RTO_MIN, patch.rtoMinMs));
+	if (patch.rtoInitMs !== undefined) parts.push(u16(LINK_TAG_RTO_INIT, patch.rtoInitMs));
+	if (patch.rtoMaxMs !== undefined) parts.push(u16(LINK_TAG_RTO_MAX, patch.rtoMaxMs));
+	if (patch.delayedAckMs !== undefined) parts.push(u16(LINK_TAG_DELAYED_ACK, patch.delayedAckMs));
+	if (patch.probeMs !== undefined) parts.push(u16(LINK_TAG_PROBE, patch.probeMs));
+
+	if (parts.length === 0) {
+		throw new ProtocolError('empty link config patch');
+	}
+
+	const result = await device.controlTransferOut(
+		{
+			requestType: 'vendor',
+			recipient: 'device',
+			request: VENDOR_CODE,
+			value: CMD_SET_LINK_CONFIG,
+			index: seq & 0xff,
+		},
+		concatBytes(parts)
+	);
+	if (result.status !== 'ok') {
+		throw new ProtocolError(`transfer ${result.status}`);
+	}
+}
+
 export async function writeUsbConfig(device: USBDevice, seq: number, config: UsbCapability): Promise<void> {
 	const encoder = new TextEncoder();
 	const payload = concatBytes([
