@@ -236,7 +236,8 @@ class WirelessLink
     static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u16 ack,
                              u16 sack, u8 window);
     static void arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window);
-    static void arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window);
+    static void arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
+                               u8 window);
     static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
 
     /** 本端可靠传输发送的消息类型：USB 侧发命令，无 USB 侧发响应 */

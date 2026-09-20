@@ -374,8 +374,8 @@ void ArqLink::dispatch(const Action *actions, size_t count)
         case Action::Kind::Reset: {
             if (m_callbacks.send_reset != nullptr)
             {
-                m_callbacks.send_reset(m_callbacks.ctx, action.epoch, action.settings, action.ack, action.sack,
-                                       action.window);
+                m_callbacks.send_reset(m_callbacks.ctx, action.epoch, action.settings, action.reset_echo, action.ack,
+                                       action.sack, action.window);
             }
             break;
         }
@@ -558,10 +558,11 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     unlock();
 }
 
-void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now_ms)
+void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now_ms)
 {
     lock();
 
+    bool reply = false;
     if (!m_peer_epoch_known || m_peer_epoch != peer_epoch)
     {
         // 对端开了一个新会话（上电、链路重建或它刚被下发了新参数）：本端把状态
@@ -574,6 +575,7 @@ void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now
         m_replay_pending = false;
         std::memset(m_replay_map_valid, 0, sizeof(m_replay_map_valid));
         m_established = true;
+        reply = true;
 
         // 参数只在对端换了 epoch（即它确实重启过一次会话）时才评估采纳，回显帧
         // 因此不会来回改参数；采纳规则见 should_adopt_settings_locked
@@ -588,15 +590,26 @@ void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now
     }
     else if (!m_established)
     {
+        // 同一会话但本端还没对齐：对端仍在重发请求，对齐并回一个
         m_established = true;
+        reply = true;
     }
-
-    // 无论是否新会话都要回一个自己的 epoch，对端据此完成握手。这里是 ESP-NOW
-    // 接收回调的上下文，只能登记，真正的发送在 poll 里做。
-    m_reset_reply_pending = true;
-    if (static_cast<i32>(now_ms - m_reset_reply_due_ms) >= 0)
+    else if (!echo)
     {
-        m_reset_reply_due_ms = now_ms + RESET_REPLY_MIN_MS;
+        // 会话已建立却又收到同 epoch 的请求：本端上一次回显没有送达，再回一次
+        reply = true;
+    }
+    // 会话已建立且收到的是回显：对端只是在确认它收到了本端请求，回显到此为止。
+    // 少了这一条，两端会把对方的回显当成新的请求，互相回显下去永不停止。
+
+    // 回显只在这里登记，真正的发送在 poll 里（这里是 ESP-NOW 接收回调的上下文）
+    if (reply)
+    {
+        m_reset_reply_pending = true;
+        if (static_cast<i32>(now_ms - m_reset_reply_due_ms) >= 0)
+        {
+            m_reset_reply_due_ms = now_ms + RESET_REPLY_MIN_MS;
+        }
     }
 
     unlock();
@@ -610,17 +623,17 @@ void ArqLink::poll(u32 now_ms)
 
     lock();
 
-    // 1) 会话未对齐：周期性发重置请求，直到收到对端的 epoch
+    // 1) 会话未对齐：周期性发重置请求（echo=false），直到收到对端的 epoch
     if (!m_established && m_peer_known && static_cast<i32>(now_ms - m_next_reset_tx_ms) >= 0)
     {
-        queue_locked(make_reset_action_locked());
+        queue_locked(make_reset_action_locked(false));
         m_next_reset_tx_ms = now_ms + RESET_INTERVAL_MS;
     }
 
-    // 1b) 对端请求重置的回显（限速）
+    // 1b) 对端请求的回显（echo=true，限速）
     if (m_reset_reply_pending && static_cast<i32>(now_ms - m_reset_reply_due_ms) >= 0)
     {
-        queue_locked(make_reset_action_locked());
+        queue_locked(make_reset_action_locked(true));
         m_reset_reply_pending = false;
     }
 
@@ -652,10 +665,11 @@ void ArqLink::poll(u32 now_ms)
     dispatch(actions, count);
 }
 
-ArqLink::Action ArqLink::make_reset_action_locked() const
+ArqLink::Action ArqLink::make_reset_action_locked(bool echo) const
 {
     Action action = {};
     action.kind = Action::Kind::Reset;
+    action.reset_echo = echo;
     action.epoch = m_epoch;
     action.ack = m_receiver.ack();
     action.sack = m_receiver.sack_bitmap();

@@ -227,6 +227,7 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.settings.rto_max_ms = p.read_u16();
         content.settings.delayed_ack_ms = p.read_u16();
         content.settings.breaker_probe_ms = p.read_u16();
+        content.flags = payload::ArqResetFlags::from_raw(p.read_u16());
         break;
     }
 #endif
@@ -370,6 +371,7 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_u16(content.settings.rto_max_ms);
         s.write_u16(content.settings.delayed_ack_ms);
         s.write_u16(content.settings.breaker_probe_ms);
+        s.write_u16(content.flags.raw());
         break;
     }
 #endif

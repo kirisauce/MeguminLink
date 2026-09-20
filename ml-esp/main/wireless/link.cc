@@ -185,8 +185,9 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     }
     case PacketType::ArqReset: {
         // 对端开了新会话：把本端序号基准拉回去对齐，并按代数决定是否采纳它的参数
-        // （迟到帧携带旧 epoch，会被挡住）
-        link.m_arq.on_reset(rp.packet.payload.arq_reset.epoch, rp.packet.payload.arq_reset.settings, arq_now);
+        // （迟到帧携带旧 epoch，会被挡住）；flags.echo 区分请求与回显，回显不再回显
+        link.m_arq.on_reset(rp.packet.payload.arq_reset.epoch, rp.packet.payload.arq_reset.settings,
+                            rp.packet.payload.arq_reset.flags.echo, arq_now);
         return;
     }
 #endif
@@ -1022,7 +1023,8 @@ void WirelessLink::arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window)
     }
 }
 
-void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window)
+void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
+                                  u8 window)
 {
     auto *self = static_cast<WirelessLink *>(ctx);
 
@@ -1041,6 +1043,7 @@ void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &setti
     packet.arq.flags = 0;
     packet.payload.arq_reset.epoch = epoch;
     packet.payload.arq_reset.settings = settings;
+    packet.payload.arq_reset.flags.echo = echo;
     const esp_err_t reset_ret = self->send_raw(peer_mac, packet);
     if (reset_ret != ESP_OK)
     {

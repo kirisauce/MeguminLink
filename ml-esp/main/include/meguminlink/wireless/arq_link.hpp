@@ -105,11 +105,14 @@ class ArqLink
     using AckFn = void (*)(void *ctx, u16 ack, u16 sack, u8 window);
 
     /**
-     * 发一个会话重置请求。重置帧同时携带本端的参数与确认/窗口通告：参数靠它传给
-     * 对端（这类帧会周期性重发直到握手完成，因此带重传保证），而扩展头的 window
+     * 发一个会话重置帧。重置帧同时携带本端的参数与确认/窗口通告：参数靠它传给
+     * 对端（请求会周期性重发直到握手完成，因此带重传保证），而扩展头的 window
      * 在所有帧上的含义都一样（本端还能收多少），漏填会被对端当成"窗口为 0"。
+     *
+     * @param echo true = 对端请求的回显（收到方不再回），false = 本端的重置请求
      */
-    using ResetFn = void (*)(void *ctx, u32 epoch, const ArqSettings &settings, u16 ack, u16 sack, u8 window);
+    using ResetFn = void (*)(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
+                             u8 window);
 
     /**
      * 按序交付一条可靠消息。对端 MAC 一并给出：本回调是在持锁状态下被调用的，
@@ -187,7 +190,7 @@ class ArqLink
     void on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now_ms);
 
     /** 对端的会话重置请求（携带对端参数） */
-    void on_reset(u32 peer_epoch, const ArqSettings &peer_settings, u32 now_ms);
+    void on_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now_ms);
 
     // ---- 任务上下文 ----
 
@@ -253,12 +256,13 @@ class ArqLink
         {
             Message, /**< 可靠消息（首传 / 重传 / 重放） */
             Ack,     /**< 纯确认帧 */
-            Reset,   /**< 会话重置请求 */
+            Reset,   /**< 会话重置帧（请求或回显，见 reset_echo） */
         };
 
         Kind kind;
         bool retransmit;
         bool gap_before;
+        bool reset_echo; /**< 仅重置动作使用：true = 回显，false = 请求 */
         u16 seq;
         u16 len;
         u16 ack;
@@ -285,8 +289,8 @@ class ArqLink
     /** 锁内动作收集完毕：拷出副本、清空队列，调用方随后 dispatch */
     size_t take_actions_locked(Action *out);
 
-    /** 造一个会话重置动作（带上本端参数与接收侧的确认、窗口通告） */
-    Action make_reset_action_locked() const;
+    /** 造一个会话重置动作（带上本端参数与接收侧的确认、窗口通告）；echo 语义见 ResetFn */
+    Action make_reset_action_locked(bool echo) const;
 
     /** 参数是否该采纳对端那份：代数大的赢，代数相同用 MAC 做确定性平局 */
     bool should_adopt_settings_locked(const ArqSettings &peer) const;

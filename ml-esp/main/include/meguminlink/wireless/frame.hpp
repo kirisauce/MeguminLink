@@ -186,10 +186,37 @@ inline constexpr size_t MAX_RELAYED_CONTROL_PAYLOAD = 256;
  * 的重复帧直接忽略：没有这道判断，一个迟到的旧重置帧会把正在跑的会话打回去，
  * 有了它，旧 epoch 的重置天然被挡住。
  */
+/**
+ * ArqReset 帧体标志（16 位位域，字段与线格式一一对应）。
+ *
+ * 请求与回显必须分开：收到请求要回一个回显，收到回显不能再回。少了这道区分，
+ * 两端会把对方的回显当成新的重置请求，互相回显下去永不停止。
+ */
+struct ArqResetFlags
+{
+    u16 echo : 1;      /**< 本帧是对端重置请求的回显（而不是请求本身） */
+    u16 reserved : 15; /**< 预留 */
+
+    /** 线格式写出的 16 位值 */
+    u16 raw() const
+    {
+        return echo ? 0x0001u : 0x0000u;
+    }
+
+    /** 由线格式的 16 位值解析（预留位忽略） */
+    static ArqResetFlags from_raw(u16 value)
+    {
+        ArqResetFlags flags = {};
+        flags.echo = value & 0x0001u;
+        return flags;
+    }
+};
+
 struct ArqReset
 {
     u32 epoch;
     ArqSettings settings; /**< 本端参数：对端 epoch 变化时一并评估采纳 */
+    ArqResetFlags flags;  /**< 请求 / 回显 的区分 */
 };
 #endif
 } // namespace payload
@@ -197,10 +224,10 @@ struct ArqReset
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
 /**
  * ArqReset 数据段长度：epoch 4B + 代数 4B + enable/window/max_retx/breaker 4B
- * + 五个 u16 参数 10B。会话重置帧不带 len 字段（与 Probe 同形），长度由本常量
- * 与收发两侧共同保证。
+ * + 五个 u16 参数 10B + 标志 2B。会话重置帧不带 len 字段（与 Probe 同形），长度
+ * 由本常量与收发两侧共同保证。
  */
-inline constexpr size_t ARQ_RESET_PAYLOAD_SIZE = 4 + 4 + 4 + 10;
+inline constexpr size_t ARQ_RESET_PAYLOAD_SIZE = 4 + 4 + 4 + 10 + 2;
 #endif
 
 enum class PacketType
