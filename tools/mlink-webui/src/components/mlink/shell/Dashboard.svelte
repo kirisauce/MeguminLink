@@ -10,6 +10,7 @@
 	import StatTable from '../panel/StatTable.svelte';
 	import RateChart from '../panel/RateChart.svelte';
 	import StatusChip from '../../ui/StatusChip.svelte';
+	import UsbDiagnosisAlert from './UsbDiagnosisAlert.svelte';
 
 	const session = new MlinkSession();
 
@@ -103,11 +104,11 @@
 	<DeviceBar {session} onconfig={() => (configOpen = true)} />
 
 	<main>
-		{#if session.state === 'unsupported'}
-			<p class="alert">当前浏览器没有 WebUSB 接口，无法直连设备。请改用 Chrome 或 Edge 打开本页。</p>
-		{:else if session.error !== null}
+		<UsbDiagnosisAlert {session} />
+
+		{#if session.error !== null}
 			<p class="alert">{session.error}</p>
-		{:else if session.state === 'disconnected'}
+		{:else if session.state === 'disconnected' && session.usbDiagnosis?.status === 'ok'}
 			<p class="hint">点右上角「连接设备」，在选择器里选 MeguminLink（303a:4020）即可开始监控。</p>
 		{/if}
 

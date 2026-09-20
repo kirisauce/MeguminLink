@@ -41,6 +41,7 @@ import {
 	type UsbConfig,
 } from './protocol';
 import { computeRates, type Rates } from './rate';
+import { diagnoseWebUsb, type UsbDiagnosis } from './usb_diagnosis';
 
 /** 页面在前台时的采样间隔。 */
 const POLL_INTERVAL_MS = 200;
@@ -141,11 +142,61 @@ export class MlinkSession {
 	#destroyed = false;
 	/** 刚应用完 USB 能力、设备正在重新枚举：此间的断开与轮询失败都是预期的 */
 	#expectingReconnect = false;
+	/** 最近一次打开设备的失败（诊断用）；成功打开后清空 */
+	#openFailure: { name: string; message: string } | null = null;
+	/** WebUSB 可用性诊断；未在客户端采集前为 null */
+	usbDiagnosis = $state<UsbDiagnosis | null>(null);
 
 	constructor() {
 		// 初始状态与浏览器能力无关，保证服务端预渲染与客户端首帧一致；
 		// 能力探测推迟到 restore()/request()，避免 hydration 前后状态跳变。
 		this.state = 'disconnected';
+	}
+
+	/**
+	 * 重新采集环境并刷新诊断：回答「WebUSB 为什么不可用 / 为什么连不上」。
+	 * 只在客户端调用——SSR 阶段没有 window / navigator。
+	 */
+	async refreshDiagnosis(): Promise<void> {
+		if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+
+		const hasUsbApi = navigator.usb !== undefined;
+
+		// Permissions-Policy 的新旧 API 名字不同，两个都探一下；查不到记 null（未知），
+		// 不能把"查不了"当成"被禁止"。
+		const policyHost = document as Document & {
+			permissionsPolicy?: { allowsFeature(feature: string): boolean };
+			featurePolicy?: { allowsFeature(feature: string): boolean };
+		};
+		const policyApi = policyHost.permissionsPolicy ?? policyHost.featurePolicy;
+		let policyAllowed: boolean | null = null;
+		if (policyApi !== undefined && typeof policyApi.allowsFeature === 'function') {
+			try {
+				policyAllowed = policyApi.allowsFeature('usb');
+			} catch {
+				policyAllowed = null;
+			}
+		}
+
+		let granted: number | null = null;
+		if (hasUsbApi) {
+			try {
+				const devices = await navigator.usb.getDevices();
+				granted = devices.filter((item) => item.vendorId === VID && item.productId === PID).length;
+			} catch {
+				granted = null;
+			}
+		}
+
+		this.usbDiagnosis = diagnoseWebUsb({
+			isSecureContext: window.isSecureContext,
+			hasUsbApi,
+			usbPolicyAllowed: policyAllowed,
+			href: location.href,
+			grantedMatchingDevices: granted,
+			openFailure: this.#openFailure,
+			deviceLabel: `MeguminLink（${VID.toString(16)}:${PID.toString(16)}）`,
+		});
 	}
 
 	get supported(): boolean {
@@ -161,6 +212,7 @@ export class MlinkSession {
 
 	/** 页面加载时尝试静默接回本 origin 已授权过的设备，省掉每次刷新都要重新选设备。 */
 	async restore(): Promise<void> {
+		void this.refreshDiagnosis();
 		if (!this.supported) {
 			this.state = 'unsupported';
 			return;
@@ -180,6 +232,7 @@ export class MlinkSession {
 	async request(): Promise<void> {
 		if (!this.supported) {
 			this.state = 'unsupported';
+			void this.refreshDiagnosis();
 			return;
 		}
 		this.#bindListeners();
@@ -228,9 +281,15 @@ export class MlinkSession {
 			if (!device.opened) await device.open();
 			if (device.configuration === null) await device.selectConfiguration(1);
 		} catch (error) {
+			this.#openFailure =
+				error instanceof DOMException
+					? { name: error.name, message: error.message }
+					: { name: 'Error', message: describeError(error) };
+			void this.refreshDiagnosis();
 			this.#fail(`打开设备失败：${describeError(error)}`);
 			return;
 		}
+		this.#openFailure = null;
 		this.device = device;
 		this.#seq = 0;
 		this.#pingProbeAt = 0; // 接上设备即尽快探一次，不必等满一个间隔

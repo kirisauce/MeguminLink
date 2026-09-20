@@ -1,4 +1,6 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	let {
 		open,
 		title,
@@ -8,10 +10,12 @@
 		danger = false,
 		onconfirm,
 		ondismiss,
+		children,
 	}: {
 		open: boolean;
 		title: string;
-		message: string;
+		/** 纯文本说明；需要内嵌链接等富内容时改用 children */
+		message?: string;
 		confirmLabel?: string;
 		cancelLabel?: string;
 		/** 破坏性操作：确认按钮改用错误色填充。 */
@@ -19,6 +23,8 @@
 		onconfirm: () => void;
 		/** 取消：取消按钮、遮罩与 Esc 都走这里。 */
 		ondismiss: () => void;
+		/** 富内容说明，与 message 二选一 */
+		children?: Snippet;
 	} = $props();
 
 	const uid = $props.id();
@@ -88,7 +94,11 @@
 	aria-describedby={messageId}
 >
 	<h2 id={titleId}>{title}</h2>
-	<p id={messageId}>{message}</p>
+	{#if children}
+		<div id={messageId} class="rich">{@render children()}</div>
+	{:else}
+		<p id={messageId}>{message}</p>
+	{/if}
 
 	<div class="buttons">
 		<button class="button" type="button" bind:this={cancelButton} onclick={ondismiss}>
@@ -165,6 +175,15 @@
 		margin: 0;
 		font-size: var(--md-sys-typescale-body-md);
 		color: var(--md-sys-color-on-surface-variant);
+	}
+
+	.rich {
+		font-size: var(--md-sys-typescale-body-md);
+		color: var(--md-sys-color-on-surface-variant);
+	}
+
+	.rich :global(a) {
+		color: var(--md-sys-color-primary);
 	}
 
 	.buttons {
