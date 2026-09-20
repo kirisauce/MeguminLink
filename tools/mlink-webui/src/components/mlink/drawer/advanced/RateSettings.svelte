@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { WIFI_RATE_GROUPS } from '../../../lib/protocol';
-	import type { MlinkSession } from '../../../lib/session.svelte';
+	import { WIFI_RATE_GROUPS } from '../../../../lib/protocol';
+	import type { MlinkSession } from '../../../../lib/session.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 

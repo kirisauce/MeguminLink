@@ -1,7 +1,6 @@
 <script lang="ts">
-	import { LOSS_PERCENT_MAX, LOSS_PERMILLE_PER_PERCENT, lossPercentText } from '../../../lib/protocol';
-	import type { MlinkSession } from '../../../lib/session.svelte';
-	import RateSettings from './RateSettings.svelte';
+	import { LOSS_PERCENT_MAX, LOSS_PERMILLE_PER_PERCENT, lossPercentText } from '../../../../lib/protocol';
+	import type { MlinkSession } from '../../../../lib/session.svelte';
 
 	let { session }: { session: MlinkSession } = $props();
 
@@ -47,70 +46,43 @@
 	});
 </script>
 
-<details class="advanced">
-	<summary>高级</summary>
-
-	<div class="body">
-		<RateSettings {session} />
-
-		<div class="field">
-			<label class="label" for="loss-percent">丢包注入</label>
-			<div class="input-row">
-				<input
-					id="loss-percent"
-					type="number"
-					min="0"
-					max={LOSS_PERCENT_MAX}
-					step="0.1"
-					inputmode="decimal"
-					bind:value={percent}
-					disabled={busy || unsupported}
-					onchange={commit}
-				/>
-				<span class="unit">%</span>
-			</div>
+<div class="loss-settings">
+	<div class="field">
+		<label class="label" for="loss-percent">丢包注入</label>
+		<div class="input-row">
+			<input
+				id="loss-percent"
+				type="number"
+				min="0"
+				max={LOSS_PERCENT_MAX}
+				step="0.1"
+				inputmode="decimal"
+				bind:value={percent}
+				disabled={busy || unsupported}
+				onchange={commit}
+			/>
+			<span class="unit">%</span>
 		</div>
-
-		{#if unsupported}
-			<p class="hint">当前固件不支持</p>
-		{:else if session.config !== null && session.config.lossPermille !== null}
-			<p class="readout">
-				当前 {lossPercentText(session.config.lossPermille)}{lossReadout === null ? '' : ` · ${lossReadout}`}
-			</p>
-		{/if}
-
-		{#if session.commandError !== null}
-			<p class="error">{session.commandError}</p>
-		{/if}
 	</div>
-</details>
+
+	{#if unsupported}
+		<p class="hint">当前固件不支持</p>
+	{:else if session.config !== null && session.config.lossPermille !== null}
+		<p class="readout">
+			当前 {lossPercentText(session.config.lossPermille)}{lossReadout === null ? '' : ` · ${lossReadout}`}
+		</p>
+	{/if}
+
+	{#if session.commandError !== null}
+		<p class="error">{session.commandError}</p>
+	{/if}
+</div>
 
 <style>
-	.advanced {
-		border-radius: var(--md-sys-shape-corner-md);
-		background: var(--md-sys-color-surface-container);
-	}
-
-	summary {
-		padding: var(--md-sys-space-sm) var(--md-sys-space-md);
-		font-size: var(--md-sys-typescale-label-sm);
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		color: var(--md-sys-color-on-surface-variant);
-		cursor: pointer;
-		user-select: none;
-	}
-
-	summary:hover {
-		color: var(--md-sys-color-on-surface);
-	}
-
-	.body {
+	.loss-settings {
 		display: flex;
 		flex-direction: column;
 		gap: var(--md-sys-space-sm);
-		padding: 0 var(--md-sys-space-md) var(--md-sys-space-md);
 	}
 
 	.field {

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { MODE_NAMES, PAIR_NAMES } from '../../../lib/protocol';
 	import type { MlinkSession } from '../../../lib/session.svelte';
-	import AdvancedSettings from './AdvancedSettings.svelte';
+	import AdvancedSettings from './advanced/AdvancedSettings.svelte';
 	import ConfigActions from './ConfigActions.svelte';
 	import UsbSettings from './UsbSettings.svelte';
 
