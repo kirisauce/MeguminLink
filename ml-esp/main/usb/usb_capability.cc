@@ -52,6 +52,11 @@ constexpr size_t MS_OS_20_SET_HEADER_LEN = 10;
 constexpr size_t MS_OS_20_CONFIG_SUBSET_HEADER_LEN = 8;
 constexpr size_t MS_OS_20_FUNCTION_SUBSET_HEADER_LEN = 8;
 constexpr size_t MS_OS_20_COMPATIBLE_ID_LEN = 20;
+constexpr size_t MS_OS_20_VENDOR_REVISION_LEN = 6;
+
+/** 功能子集长度：子集头 + Compatible ID + vendor revision */
+constexpr size_t MS_OS_20_FUNCTION_SUBSET_LEN =
+    MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN + MS_OS_20_VENDOR_REVISION_LEN;
 
 // 零填充辅助
 #define MS_OS_20_PAD_4 0x00, 0x00, 0x00, 0x00
@@ -62,10 +67,11 @@ constexpr size_t MS_OS_20_COMPATIBLE_ID_LEN = 20;
     U16_TO_U8S_LE(MS_OS_20_SET_HEADER_LEN), U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR),                             \
         U32_TO_U8S_LE(MS_OS_20_WINDOWS_VERSION), U16_TO_U8S_LE(_total_len)
 
-// 配置子集头：wLength + 类型 + bConfigurationValue + 保留 + 子集 wTotalLength
-#define MS_OS_20_DESC_CONFIG_SUBSET(_config_value, _total_len)                                                         \
+// 配置子集头：wLength + 类型 + 配置索引 + 保留 + 子集 wTotalLength
+// Windows 按配置索引匹配子集，设备的默认（唯一）配置即索引 0
+#define MS_OS_20_DESC_CONFIG_SUBSET(_config_index, _total_len)                                                         \
     U16_TO_U8S_LE(MS_OS_20_CONFIG_SUBSET_HEADER_LEN), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION),             \
-        (_config_value), 0x00, U16_TO_U8S_LE(_total_len)
+        (_config_index), 0x00, U16_TO_U8S_LE(_total_len)
 
 // 功能子集头：wLength + 类型 + bFirstInterface + 保留 + 子集 wTotalLength
 #define MS_OS_20_DESC_FUNCTION_SUBSET(_first_interface, _total_len)                                                    \
@@ -79,14 +85,18 @@ constexpr size_t MS_OS_20_COMPATIBLE_ID_LEN = 20;
         'B', 0x00, 0x00, /* CompatibleID */                                                                            \
         MS_OS_20_PAD_8   /* SubCompatibleID */
 
+// Vendor revision 描述符：复合设备的每个功能子集都必须携带（规范 Table 19），
+// 其数值变化是主机刷新已缓存 MSOS 属性的依据
+#define MS_OS_20_DESC_VENDOR_REVISION(_revision)                                                                       \
+    U16_TO_U8S_LE(MS_OS_20_VENDOR_REVISION_LEN), U16_TO_U8S_LE(MS_OS_20_FEATURE_VENDOR_REVISION),                     \
+        U16_TO_U8S_LE(_revision)
+
 u8 MS_OS_DESCRIPTOR_SET[] = {
-    MS_OS_20_DESC_SET_HEADER(MS_OS_20_SET_HEADER_LEN + MS_OS_20_CONFIG_SUBSET_HEADER_LEN +
-                             MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN),
-    MS_OS_20_DESC_CONFIG_SUBSET(1, MS_OS_20_CONFIG_SUBSET_HEADER_LEN + MS_OS_20_FUNCTION_SUBSET_HEADER_LEN +
-                                       MS_OS_20_COMPATIBLE_ID_LEN),
-    MS_OS_20_DESC_FUNCTION_SUBSET(USB_CAPABILITY_INTERFACE,
-                                  MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN),
+    MS_OS_20_DESC_SET_HEADER(MS_OS_20_SET_HEADER_LEN + MS_OS_20_CONFIG_SUBSET_HEADER_LEN + MS_OS_20_FUNCTION_SUBSET_LEN),
+    MS_OS_20_DESC_CONFIG_SUBSET(0, MS_OS_20_CONFIG_SUBSET_HEADER_LEN + MS_OS_20_FUNCTION_SUBSET_LEN),
+    MS_OS_20_DESC_FUNCTION_SUBSET(USB_CAPABILITY_INTERFACE, MS_OS_20_FUNCTION_SUBSET_LEN),
     MS_OS_20_DESC_COMPATIBLE_ID_WINUSB(),
+    MS_OS_20_DESC_VENDOR_REVISION(1),
 };
 
 // 长度自洽：BOS 平台能力里的 wDescriptorSetLength 与 USB_MS_OS_DESCRIPTOR_SET_LEN 引用同一长度

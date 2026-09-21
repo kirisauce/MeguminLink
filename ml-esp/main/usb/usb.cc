@@ -819,6 +819,10 @@ CmsisDapUsb::CmsisDapUsb()
     m_string_descriptors[(usize)UsbStringIndex::Product] = "CMSIS-DAP on " CONFIG_IDF_TARGET;
     m_string_descriptors[(usize)UsbStringIndex::SerialNumber] = m_serial;
     m_string_descriptors[(usize)UsbStringIndex::DapInterfaceName] = "CMSIS-DAP v2";
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    // CDC 接口的 iInterface 必须给出字符串：空槽会让主机的字符串请求吃到 STALL
+    m_string_descriptors[(usize)UsbStringIndex::UartBridgeInterfaceName] = "UART Bridge";
+#endif
 #if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
     m_string_descriptors[(usize)UsbStringIndex::HidInterfaceName] = "CMSIS-DAP v1";
 #endif

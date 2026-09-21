@@ -70,8 +70,8 @@ struct UsbCapabilitySettings
     }
 };
 
-/** MS OS 2.0 描述符集长度（集合头 10 + 配置子集头 8 + 功能子集头 8 + Compatible ID 20） */
-inline constexpr u16 USB_MS_OS_DESCRIPTOR_SET_LEN = 46;
+/** MS OS 2.0 描述符集长度（集合头 10 + 配置子集头 8 + 功能子集头 8 + Compatible ID 20 + vendor revision 6） */
+inline constexpr u16 USB_MS_OS_DESCRIPTOR_SET_LEN = 52;
 
 /** MS OS 2.0 平台能力圈定的接口号：DAP vendor 接口（usb.cc 的 ITF_NUM_DAP） */
 inline constexpr u8 USB_CAPABILITY_INTERFACE = 0;
