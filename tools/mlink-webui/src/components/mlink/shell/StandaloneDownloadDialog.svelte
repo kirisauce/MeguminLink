@@ -66,10 +66,6 @@
 		margin-top: var(--md-sys-space-sm);
 	}
 
-	code {
-		font-family: var(--md-sys-typescale-font-mono);
-	}
-
 	a {
 		color: var(--md-sys-color-primary);
 	}
