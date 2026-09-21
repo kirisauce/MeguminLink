@@ -190,14 +190,13 @@ config MEGUMINLINK_WIRELESS_ARQ_ENABLE
 
 config MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW
     int "Reliable transport window limit"
-    default 1
+    default 8
     range 1 8
     help
         Upper bound on how many DAP messages may be in flight at once. The
         window is what overlaps the peer's execution time with the next
         transfer; a value of 1 is plain stop-and-wait (one command on the
-        wire at a time, matching the strictly serial command/response
-        semantics the host assumes).
+        wire at a time, kept for A/B comparison against the windowed path).
 
         Both ends size static storage from this value (the sender's window
         buffer and the receiver's out-of-order replay storage), so raising it

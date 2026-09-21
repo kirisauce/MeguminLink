@@ -483,6 +483,81 @@ SenderSnapshot Sender::snapshot() const
     return out;
 }
 
+// ---- ReorderStore ----
+
+void ReorderStore::init(u8 *storage, size_t slot_cap, size_t slot_count)
+{
+    m_storage = storage;
+    m_slot_cap = slot_cap;
+
+    m_slot_count = (slot_count > MAX_WINDOW) ? MAX_WINDOW : slot_count;
+    if (m_slot_count == 0)
+    {
+        m_slot_count = 1;
+    }
+
+    reset();
+}
+
+size_t ReorderStore::slot_of(u16 seq) const
+{
+    return static_cast<size_t>(seq) % m_slot_count;
+}
+
+void ReorderStore::store(u16 seq, const u8 *payload, u16 len)
+{
+    if (m_storage == nullptr || payload == nullptr)
+    {
+        return;
+    }
+    if (len > m_slot_cap)
+    {
+        len = static_cast<u16>(m_slot_cap);
+    }
+
+    const size_t slot = slot_of(seq);
+    std::memcpy(m_storage + slot * m_slot_cap, payload, len);
+    m_len[slot] = len;
+    m_valid[slot] = true;
+}
+
+const u8 *ReorderStore::get(u16 seq, u16 *len) const
+{
+    if (m_storage == nullptr)
+    {
+        return nullptr;
+    }
+
+    const size_t slot = slot_of(seq);
+    if (!m_valid[slot])
+    {
+        return nullptr;
+    }
+
+    if (len != nullptr)
+    {
+        *len = m_len[slot];
+    }
+    return m_storage + slot * m_slot_cap;
+}
+
+void ReorderStore::release(u16 seq)
+{
+    m_valid[slot_of(seq)] = false;
+}
+
+void ReorderStore::reset()
+{
+    for (u16 &len : m_len)
+    {
+        len = 0;
+    }
+    for (bool &valid : m_valid)
+    {
+        valid = false;
+    }
+}
+
 // ---- Receiver ----
 
 void Receiver::init(const Config &config)

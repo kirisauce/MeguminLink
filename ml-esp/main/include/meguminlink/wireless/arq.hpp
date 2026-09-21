@@ -64,16 +64,20 @@ inline constexpr u8 MAX_BACKOFF_SHIFT = 8;
 struct Config
 {
     /** 发送窗口（可同时在途的消息数）；运行时可被对端通告的接收窗口压低 */
-    u8 window = 1;
+    u8 window = 8;
 
     /**
      * 接收端是否接受并标记乱序帧（SACK 相送）。
      *
      * 关：乱序帧判为 OutOfWindow，不标记也不 SACK，等发送端超时重传——正确但
-     * 浪费空口；开：乱序帧进 SACK 位图，调用方必须自己为重排缓冲准备载荷存储，
-     * 并在 Receiver::commit 返回的区间里把补齐的帧按序交付。
+     * 浪费空口，窗口为 1 时够用；开：乱序帧进 SACK 位图，调用方必须自己为重排
+     * 缓冲准备载荷存储（见 ReorderStore），并在 Receiver::commit 返回的区间里
+     * 把补齐的帧按序交付。
+     *
+     * 窗口大于 1 时必须打开：同时在途的多条消息一旦乱序就全被判超窗，只能靠
+     * 重传逐条补齐，窗口带来的流水线收益会被重传风暴吃掉。
      */
-    bool reorder = false;
+    bool reorder = true;
 
     /**
      * RTO 下限。取值必须覆盖"对端执行整条命令"的时间：本链路的确认随响应捎带
@@ -448,6 +452,54 @@ class Sender
     u32 m_retx_frames = 0;
     u32 m_acked_frames = 0;
     u32 m_failed_frames = 0;
+};
+
+/**
+ * 接收侧的乱序载荷存储：与 Sender 的窗口存储对称，内存由调用方提供，槽位由
+ * seq % slot_count 决定。
+ *
+ * 它只做"存、取、失效"三件事，判定仍归 Receiver：调用方必须先 on_frame 拿到
+ * 判定、再决定存不存 —— 重复帧的槽位可能与某个还没交付的乱序帧撞车，顺序反了
+ * 会覆盖掉有效载荷。交付由调用方按 Receiver::commit 返回的区间逐帧取出。
+ *
+ * 只有 reorder 打开且窗口大于 1 时才用得上：窗口为 1 时乱序帧被判 OutOfWindow、
+ * 由对端超时重传补齐，不经过乱序缓冲。
+ */
+class ReorderStore
+{
+  public:
+    /**
+     * @param storage    槽存储（容量 ≥ slot_count × slot_cap）
+     * @param slot_cap   单个槽的载荷容量
+     * @param slot_count 槽数（1..MAX_WINDOW）；应不小于生效窗口，否则同时在途的
+     *                   乱序帧会落到同一个槽上互相覆盖
+     */
+    void init(u8 *storage, size_t slot_cap, size_t slot_count);
+
+    /** 存一帧乱序载荷（仅在 on_frame 返回 Buffered 后调用）；超长按 slot_cap 截断 */
+    void store(u16 seq, const u8 *payload, u16 len);
+
+    /**
+     * 取一帧载荷。
+     * @param len 可选，回填该帧的载荷长度
+     * @return 载荷指针；该序号没有有效载荷时返回 nullptr
+     */
+    const u8 *get(u16 seq, u16 *len) const;
+
+    /** 释放一帧（交付完成或确认丢弃后调用） */
+    void release(u16 seq);
+
+    /** 清空全部槽位（会话重置、参数变更时调用） */
+    void reset();
+
+  private:
+    size_t slot_of(u16 seq) const;
+
+    u8 *m_storage = nullptr;
+    size_t m_slot_cap = 0;
+    size_t m_slot_count = 1;
+    u16 m_len[MAX_WINDOW] = {};
+    bool m_valid[MAX_WINDOW] = {};
 };
 
 /**

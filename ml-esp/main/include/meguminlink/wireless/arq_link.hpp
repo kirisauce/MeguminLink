@@ -117,6 +117,9 @@ class ArqLink
     /**
      * 按序交付一条可靠消息。对端 MAC 一并给出：本回调是在持锁状态下被调用的，
      * 再回头调本层的 peer_mac() 会去抢同一把非递归互斥量而死锁。
+     *
+     * 乱序补齐时它会在同一次 on_message 里按序被连续调用多次（补齐几帧就几次），
+     * 实现必须接得住连续交付，不能假设"一次收帧只交付一条"。
      */
     using DeliverFn = void (*)(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
 
@@ -298,6 +301,14 @@ class ArqLink
     /** 按当前参数重建核心（Sender/Receiver 的配置随之生效） */
     void reconfigure_locked();
 
+    /**
+     * 按序交付连续区间 [first, last] 的载荷（须在持锁时调用）。
+     *
+     * first 那一帧的载荷由调用方直接给出（就是本次收到的帧），其余从乱序缓冲里
+     * 取出并在交付后释放；区间内没有载荷的序号（对端声明放弃的空洞）跳过。
+     */
+    void deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u16 last);
+
     ArqSettings m_settings = {};
     arq::Config m_config = {};
     size_t m_payload_cap = 0;
@@ -307,6 +318,10 @@ class ArqLink
     arq::Sender m_sender;
     arq::Receiver m_receiver;
     u8 m_tx_storage[static_cast<size_t>(arq::MAX_WINDOW) * MAX_PAYLOAD] = {};
+
+    /** 接收侧的乱序载荷缓冲：窗口大于 1 时补齐落在游标之后的帧 */
+    arq::ReorderStore m_rx_reorder;
+    u8 m_rx_storage[static_cast<size_t>(arq::MAX_WINDOW) * MAX_PAYLOAD] = {};
 
     mutable SemaphoreHandle_t m_mutex = nullptr;
     Callbacks m_callbacks = {};

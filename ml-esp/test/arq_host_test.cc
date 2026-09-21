@@ -714,6 +714,111 @@ void test_replay_and_miss()
     CHECK(!sim.ep[0].tx.resend(1, sim.now)); // 尚未分配：不可重放
 }
 
+void test_reorder_store()
+{
+    // 乱序载荷存储：槽位由 seq % slot_count 决定，存、取、释放、复位各司其职
+    u8 storage[static_cast<size_t>(MAX_WINDOW) * 8] = {};
+    ReorderStore store;
+    store.init(storage, 8, MAX_WINDOW);
+
+    const u8 a[4] = {1, 2, 3, 4};
+    u16 len = 0;
+
+    CHECK(store.get(3, &len) == nullptr); // 没存过：取不到
+    store.store(3, a, sizeof(a));
+    const u8 *got = store.get(3, &len);
+    CHECK(got != nullptr);
+    CHECK_EQ(len, sizeof(a));
+    CHECK(std::memcmp(got, a, sizeof(a)) == 0);
+    CHECK(got == storage + 3 * 8); // 落在第 3 个槽
+
+    // 槽位按 seq % slot_count 复用：回绕到同一槽的序号读到的是新载荷，调用方靠
+    // "在途距离 < slot_count"避免这种混淆
+    const u8 b[2] = {9, 8};
+    store.store(3 + MAX_WINDOW, b, sizeof(b));
+    got = store.get(3 + MAX_WINDOW, &len);
+    CHECK(got != nullptr);
+    CHECK_EQ(len, sizeof(b));
+    CHECK(got == storage + 3 * 8);
+
+    store.release(3 + MAX_WINDOW);
+    CHECK(store.get(3 + MAX_WINDOW, &len) == nullptr);
+
+    store.store(5, a, sizeof(a));
+    store.reset();
+    CHECK(store.get(5, &len) == nullptr);
+
+    // 载荷超过槽容量：按槽容量截断，不越界写
+    u8 small[4] = {};
+    ReorderStore tiny;
+    tiny.init(small, 2, 2);
+    const u8 big[5] = {1, 2, 3, 4, 5};
+    tiny.store(0, big, sizeof(big));
+    got = tiny.get(0, &len);
+    CHECK(got != nullptr);
+    CHECK_EQ(len, 2u);
+    CHECK_EQ(got[0], 1u);
+    CHECK_EQ(got[1], 2u);
+
+    // 槽数越界收敛到 MAX_WINDOW：槽偏移按收敛后的槽数算
+    u8 wide[static_cast<size_t>(MAX_WINDOW) * 4] = {};
+    ReorderStore clamped;
+    clamped.init(wide, 4, MAX_WINDOW + 4);
+    clamped.store(MAX_WINDOW + 1, a, sizeof(a));
+    got = clamped.get(MAX_WINDOW + 1, &len);
+    CHECK(got != nullptr);
+    CHECK(got == wide + 1 * 4); // 第 (MAX_WINDOW + 1) % MAX_WINDOW 个槽
+}
+
+void test_receiver_pairs_with_reorder_store()
+{
+    // 窗口大于 1 的接收路径：乱序帧先进缓冲，缺的那条到达时一次补齐整段
+    Config cfg;
+    cfg.window = 8;
+    cfg.reorder = true;
+
+    Receiver rx;
+    rx.init(cfg);
+    rx.reset(0);
+
+    u8 storage[static_cast<size_t>(MAX_WINDOW) * 16] = {};
+    ReorderStore store;
+    store.init(storage, 16, MAX_WINDOW);
+
+    const u8 p1[3] = {11, 11, 11};
+    const u8 p2[3] = {22, 22, 22};
+
+    // 先到两条乱序帧：只进缓冲，交付游标不动
+    CHECK(rx.on_frame(1, false, 0) == RxResult::Buffered);
+    store.store(1, p1, sizeof(p1));
+    CHECK(rx.on_frame(2, false, 0) == RxResult::Buffered);
+    store.store(2, p2, sizeof(p2));
+    CHECK_EQ(rx.ack(), 0u);
+    CHECK(rx.sack_bitmap() != 0u);
+
+    // 缺的那条到了：一次 commit 把 0..2 整段推出去
+    CHECK(rx.on_frame(0, false, 0) == RxResult::Delivered);
+    const u16 last = rx.commit(0, 0);
+    CHECK_EQ(last, 2u);
+
+    // 区间里 1、2 的载荷都能从缓冲里取出来，顺序与长度都对
+    u16 len = 0;
+    const u8 *one = store.get(1, &len);
+    CHECK(one != nullptr);
+    CHECK_EQ(len, sizeof(p1));
+    CHECK(std::memcmp(one, p1, sizeof(p1)) == 0);
+    const u8 *two = store.get(2, &len);
+    CHECK(two != nullptr);
+    CHECK_EQ(len, sizeof(p2));
+    CHECK(std::memcmp(two, p2, sizeof(p2)) == 0);
+    CHECK_EQ(rx.ack(), 3u);
+
+    // 交付完的槽释放后不再有效
+    store.release(1);
+    store.release(2);
+    CHECK(store.get(1, &len) == nullptr);
+}
+
 struct TestCase
 {
     const char *name;
@@ -736,6 +841,8 @@ const TestCase kTests[] = {
     {"放弃后空洞可跳过、流继续走", test_gap_skip_after_give_up},
     {"对端窗口为 0 时流控", test_flow_control_blocks_on_zero_window},
     {"重放与未命中上报", test_replay_and_miss},
+    {"乱序载荷存储的槽位与截断", test_reorder_store},
+    {"接收端与乱序缓冲联动补齐", test_receiver_pairs_with_reorder_store},
 };
 } // namespace
 

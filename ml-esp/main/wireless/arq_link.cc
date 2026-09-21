@@ -34,7 +34,7 @@ ArqSettings mlink::arq_default_settings()
     ArqSettings out = {};
     out.generation = 0;
     out.enable = 1;
-    out.window = 1;
+    out.window = 8;
     out.max_retx = 6;
     out.breaker_failures = 3;
     out.rto_min_ms = 60;
@@ -49,7 +49,9 @@ arq::Config mlink::arq_config_from(const ArqSettings &settings)
 {
     arq::Config config;
     config.window = settings.window;
-    config.reorder = false; // 窗口为 1，乱序帧一律拒绝并由对端重传，不需要重排缓冲
+    // 窗口大于 1 必须开重排：同时在途的多条消息一旦乱序，只能靠乱序缓冲补齐，
+    // 否则整窗判超窗、退化成靠重传逐条补齐
+    config.reorder = (settings.window > 1);
     config.rto_min_ms = settings.rto_min_ms;
     config.initial_rto_ms = settings.initial_rto_ms;
     config.rto_max_ms = settings.rto_max_ms;
@@ -65,9 +67,9 @@ namespace
 /**
  * 把窗口收敛到本固件编译期允许的上限（Kconfig 的 ARQ_MAX_WINDOW）。
  *
- * 主机下发的值与对端传来的值都可能是更大窗口那份固件给的；本固件没有按窗口
- * 准备重排缓冲，因此只认自己的上限——收敛后再存，上报与转发出去的也就是这个值，
- * 不会出现"声称支持 8、实际只按 1 跑"。
+ * 主机下发的值与对端传来的值都可能是更大窗口那份固件给的；本固件按自己的上限
+ * 为发送窗口与乱序缓冲分配静态存储，因此只认自己的上限——收敛后再存，上报与
+ * 转发出去的也就是这个值，不会出现"声称支持 8、实际只按 1 跑"。
  */
 ArqSettings clamp_window(ArqSettings settings)
 {
@@ -245,6 +247,7 @@ void ArqLink::reconfigure_locked()
     // 一并归零是刻意的——参数变更即一次新的测量起点，做 A/B 对照时正好干净。
     m_sender.init(m_config, m_tx_storage, m_payload_cap, arq::MAX_WINDOW);
     m_receiver.init(m_config);
+    m_rx_reorder.init(m_rx_storage, m_payload_cap, arq::MAX_WINDOW);
     m_sender.set_callbacks(this, &ArqLink::core_transmit, &ArqLink::core_event);
     m_receiver.set_callbacks(this, &ArqLink::core_event);
 }
@@ -476,6 +479,7 @@ void ArqLink::reset_session(u32 now_ms)
     lock();
     m_sender.reset();
     m_receiver.reset(0);
+    m_rx_reorder.reset();
     m_established = false;
     m_ack_scheduled = false;
     m_replay_pending = false;
@@ -525,22 +529,14 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     const arq::RxResult result = m_receiver.on_frame(seq, gap_before, now_ms);
     if (result == arq::RxResult::Delivered)
     {
-        // 重排关闭时 commit 只推进一帧，手里这条载荷就是要交付的那条
+        // commit 返回本次连续交付的最后一帧：乱序缓冲补齐时区间会不止一帧
         const u16 last = m_receiver.commit(seq, now_ms);
-        if (last != seq)
-        {
-            // 打开重排才可能出现：那时交付的是缓冲区里的后继帧，本层没有它的载荷
-            ESP_LOGW(TAG, "reorder not supported here (commit %u..%u)", seq, last);
-        }
-        if (m_callbacks.deliver != nullptr)
-        {
-            u8 peer_mac[6] = {};
-            if (m_peer_known)
-            {
-                std::memcpy(peer_mac, m_peer_mac, sizeof(peer_mac));
-            }
-            m_callbacks.deliver(m_callbacks.ctx, m_peer_known ? peer_mac : nullptr, seq, payload, len);
-        }
+        deliver_range_locked(seq, payload, len, last);
+    }
+    else if (result == arq::RxResult::Buffered)
+    {
+        // 判为窗口内的乱序帧：先把载荷收进乱序缓冲，等 commit 的区间把它补出来
+        m_rx_reorder.store(seq, payload, len);
     }
     else if (result == arq::RxResult::Duplicate)
     {
@@ -556,6 +552,49 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     }
 
     unlock();
+}
+
+void ArqLink::deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u16 last)
+{
+    u8 peer_mac[6] = {};
+    const bool peer_known = m_peer_known;
+    if (peer_known)
+    {
+        std::memcpy(peer_mac, m_peer_mac, sizeof(peer_mac));
+    }
+
+    for (u16 seq = first;; ++seq)
+    {
+        const u8 *payload = first_payload;
+        u16 len = first_len;
+        if (seq != first)
+        {
+            payload = m_rx_reorder.get(seq, &len);
+            if (payload == nullptr)
+            {
+                // 区间内没有载荷：对端声明放弃的空洞，跳过不交付
+                if (seq == last)
+                {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        if (m_callbacks.deliver != nullptr)
+        {
+            m_callbacks.deliver(m_callbacks.ctx, peer_known ? peer_mac : nullptr, seq, payload, len);
+        }
+
+        if (seq != first)
+        {
+            m_rx_reorder.release(seq);
+        }
+        if (seq == last)
+        {
+            break;
+        }
+    }
 }
 
 void ArqLink::on_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now_ms)
