@@ -44,7 +44,7 @@ const char *mode_to_string(Mode mode)
 Application::Application()
     : m_mode_key(NVS_KEY_MODE, static_cast<u8>(Mode::Local)), m_mode(Mode::Local),
       m_main_task_wake(xSemaphoreCreateBinary()), m_rx_mutex(xSemaphoreCreateMutex()),
-      m_wireless_response_sem(xSemaphoreCreateBinary()), m_wireless_response_mutex(xSemaphoreCreateMutex())
+      m_wireless_response_queue(xQueueCreate(CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH, sizeof(WirelessResponse)))
 {
     // 延迟构造（get_instance 首次调用，此时 NVS 已初始化）：
     // 从 NVS 恢复模式（Local/Wireless，无记录默认 Local）。
@@ -158,36 +158,49 @@ std::vector<ReceivedPacket> Application::take_received_packets()
     return packets;
 }
 
-void Application::push_wireless_response(const u8 *data, u16 len)
+void Application::push_wireless_response(u16 seq, const u8 *data, u16 len)
 {
-    xSemaphoreTake(m_wireless_response_mutex, portMAX_DELAY);
-    if (len > sizeof(m_wireless_response))
+    if (m_wireless_response_queue == nullptr)
+    {
+        return;
+    }
+
+    WirelessResponse response = {};
+    if (len > sizeof(response.data))
     {
         // 无线帧承载上限的防御性截断（正常不会触发）
-        len = static_cast<u16>(sizeof(m_wireless_response));
+        len = static_cast<u16>(sizeof(response.data));
     }
-    m_wireless_response_len = len;
-    std::memcpy(m_wireless_response, data, len);
-    xSemaphoreGive(m_wireless_response_mutex);
+    response.seq = seq;
+    response.len = len;
+    std::memcpy(response.data, data, len);
 
-    // 先写完缓冲再 give：等待方 take 成功后读到的必然是本次完整响应
-    xSemaphoreGive(m_wireless_response_sem);
+    // 队列满说明消费侧没跟上：丢弃并告警，等这条响应的命令最终由超时销账
+    if (xQueueSend(m_wireless_response_queue, &response, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "wireless response queue full, dropped seq=%u (%u bytes)", seq, len);
+    }
 }
 
-bool Application::wait_wireless_response(u8 *buf, u16 *len, u32 timeout_ms)
+bool Application::wait_wireless_response(u16 *seq, u8 *buf, u16 *len, u32 timeout_ms)
 {
-    if (xSemaphoreTake(m_wireless_response_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+    if (m_wireless_response_queue == nullptr)
     {
-        return false; // 超时：调用方丢弃（PC 端 debugger 自行重试）
+        return false;
     }
 
-    xSemaphoreTake(m_wireless_response_mutex, portMAX_DELAY);
-    const u16 n = m_wireless_response_len;
-    std::memcpy(buf, m_wireless_response, n);
-    m_wireless_response_len = 0;
-    xSemaphoreGive(m_wireless_response_mutex);
+    WirelessResponse response = {};
+    if (xQueueReceive(m_wireless_response_queue, &response, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+    {
+        return false; // 超时或队列为空：调用方按自己的节奏再来取
+    }
 
-    *len = n;
+    if (seq != nullptr)
+    {
+        *seq = response.seq;
+    }
+    std::memcpy(buf, response.data, response.len);
+    *len = response.len;
     return true;
 }
 
@@ -638,7 +651,8 @@ void Application::run()
                     }
                     case PacketType::DapResponse: {
                         const auto &resp = rp.packet.payload.dap_response;
-                        push_wireless_response(resp.data, resp.len);
+                        // 未经可靠传输的响应没有序号：填 0，配对退化为先进先出
+                        push_wireless_response(0, resp.data, resp.len);
                         break;
                     }
                     case PacketType::Ping: {

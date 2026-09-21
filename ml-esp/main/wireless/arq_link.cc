@@ -487,6 +487,8 @@ void ArqLink::reset_session(u32 now_ms)
     m_action_count = 0;
     m_peer_epoch_known = false;
     std::memset(m_replay_map_valid, 0, sizeof(m_replay_map_valid));
+    m_failed_head = 0;
+    m_failed_count = 0;
 
     // 换一个 epoch：对端据此把"本端重启后的新会话"与"旧会话的迟到帧"分开
     m_epoch = esp_random() | 1u;
@@ -894,6 +896,59 @@ void ArqLink::core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool
     self->m_ack_scheduled = false;
 }
 
+void ArqLink::record_failed_locked(u16 seq)
+{
+    if (m_failed_count == arq::MAX_WINDOW)
+    {
+        // 队列满：挤掉最老的一条。上层没跟上时保最新更有用——旧的那条早已经
+        // 被自己的响应超时销账了。
+        m_failed_head = static_cast<u8>((m_failed_head + 1) % arq::MAX_WINDOW);
+        m_failed_count--;
+    }
+    const u8 tail = static_cast<u8>((m_failed_head + m_failed_count) % arq::MAX_WINDOW);
+    m_failed_seqs[tail] = seq;
+    m_failed_count++;
+}
+
+bool ArqLink::take_failed(u16 *seq_out)
+{
+    lock();
+    if (m_failed_count == 0)
+    {
+        unlock();
+        return false;
+    }
+
+    if (seq_out != nullptr)
+    {
+        *seq_out = m_failed_seqs[m_failed_head];
+    }
+    m_failed_head = static_cast<u8>((m_failed_head + 1) % arq::MAX_WINDOW);
+    m_failed_count--;
+    unlock();
+    return true;
+}
+
+bool ArqLink::can_submit() const
+{
+    lock();
+
+    bool value = false;
+    if (!m_settings.enable)
+    {
+        // 绕过核心：没有窗口，配对在就能发
+        value = m_peer_known;
+    }
+    else if (m_peer_known && m_established)
+    {
+        const arq::SenderSnapshot snap = m_sender.snapshot();
+        value = !snap.breaker_open && snap.in_flight < m_sender.window();
+    }
+
+    unlock();
+    return value;
+}
+
 void ArqLink::core_event(void *raw, arq::Event event, u16 seq, u32 now_ms)
 {
     auto *self = static_cast<ArqLink *>(raw);
@@ -909,6 +964,8 @@ void ArqLink::core_event(void *raw, arq::Event event, u16 seq, u32 now_ms)
     }
     case arq::Event::Failed:
         ESP_LOGW(TAG, "message seq=%u dropped after all retries", seq);
+        // 上抛给调用方销账：这条消息不会再有响应，在途条目要尽快释放
+        self->record_failed_locked(seq);
         break;
     case arq::Event::BreakerTrip:
         ESP_LOGW(TAG, "link breaker tripped: consecutive messages exhausted retries");

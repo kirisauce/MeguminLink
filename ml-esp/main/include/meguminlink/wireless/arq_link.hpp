@@ -153,6 +153,25 @@ class ArqLink
     bool established() const;
 
     /**
+     * 取出一条"重传耗尽、已判定失败"的消息序号。
+     *
+     * 失败的消息不会再有响应，调用方据此把在途条目销账（策略是不回响应、让主机
+     * 那条命令自己超时）。核心的事件回调跑在持锁上下文里，不能直接回调上层，
+     * 因此这里改成查询式的小队列。
+     * @return false = 当前没有待处理的失败
+     */
+    bool take_failed(u16 *seq_out);
+
+    /**
+     * 现在能不能提交新消息（会话已对齐、未熔断、窗口还有空位）。
+     *
+     * 调用方据此形成背压：不能提交时先别取新命令，让命令留在队列里、由 USB 把主机
+     * 挡回去。取出来再丢弃会让主机那条命令永远等不到响应，只能一路超时。
+     * 未启用可靠传输时没有窗口概念，返回真。
+     */
+    bool can_submit() const;
+
+    /**
      * 应用一份新参数（主机下发）：立即生效、换新 epoch 重置会话，新参数随会话
      * 重置帧传给对端；并把参数标记为待落盘（NVS 写入由主循环做）。
      */
@@ -309,6 +328,9 @@ class ArqLink
      */
     void deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u16 last);
 
+    /** 记录一条失败消息的序号（须在持锁时调用，供核心事件回调使用） */
+    void record_failed_locked(u16 seq);
+
     ArqSettings m_settings = {};
     arq::Config m_config = {};
     size_t m_payload_cap = 0;
@@ -355,6 +377,11 @@ class ArqLink
     /** 命令序号 → 响应序号（无 USB 侧重放用；USB 侧不接收命令，不使用） */
     u16 m_replay_map[arq::MAX_WINDOW] = {};
     bool m_replay_map_valid[arq::MAX_WINDOW] = {};
+
+    /** 失败消息序号的小队列：核心事件回调只入队，上层用 take_failed 取走销账 */
+    u16 m_failed_seqs[arq::MAX_WINDOW] = {};
+    u8 m_failed_head = 0;
+    u8 m_failed_count = 0;
 
     u32 m_replayed = 0;
     u32 m_replay_missed = 0;

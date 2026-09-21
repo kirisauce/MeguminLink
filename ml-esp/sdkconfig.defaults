@@ -1,8 +1,10 @@
 # 启用 TinyUSB vendor 类驱动（CMSIS-DAP v2 bulk transport 接口）
 CONFIG_TINYUSB_VENDOR_COUNT=1
 # vendor FIFO 必须放得下整条 DAP 命令/响应（单帧上限 1467B）：命令大于单个
-# USB 包，FIFO 过小会导致一次只能取到命令的一段
-CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=1470
+# USB 包，FIFO 过小会导致一次只能取到命令的一段。接收侧还决定主机能"先发几条"：
+# 只放得下一条时，OpenOCD 连发的第 2、3 条会被 USB 流控挡住，设备侧在途永远只有
+# 一条，可靠传输的窗口就没有可并发的对象——因此按 3 条命令（3 × 1470B）预留。
+CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=4410
 CONFIG_TINYUSB_VENDOR_TX_BUFSIZE=1470
 # 启用 TinyUSB CDC ACM（UART 透传接口）
 CONFIG_TINYUSB_CDC_ENABLED=y

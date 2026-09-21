@@ -90,20 +90,30 @@ class Application
     /** 由主任务调用：取走全部积压帧（返回后本队列为空） */
     std::vector<ReceivedPacket> take_received_packets();
 
-    /**
-     * 主循环调用：存入收到的无线 DAP 响应并唤醒等待者。
-     * 发送端 dap_task 转发命令后阻塞等待的正是这个响应（一次一个在途请求）。
-     */
-    void push_wireless_response(const u8 *data, u16 len);
+    /** 一条无线 DAP 响应：带上可靠传输序号，供发送端配回挂起的命令 */
+    struct WirelessResponse
+    {
+        u16 seq;                       /**< 可靠传输序号；未启用可靠传输时为 0 */
+        u16 len;                       /**< 载荷长度 */
+        u8 data[MAX_DAP_PAYLOAD_SIZE]; /**< 载荷 */
+    };
 
     /**
-     * 由 dap_task 调用：阻塞等待无线 DAP 响应（带超时）。
+     * 主循环/接收回调调用：把收到的无线 DAP 响应连同它的可靠传输序号入队。
+     * 队列而不是单缓冲——窗口大于 1 时一次乱序补齐会连续交付多条响应，单缓冲会把
+     * 前一条覆盖掉，主机的响应流随之整体错位。
+     */
+    void push_wireless_response(u16 seq, const u8 *data, u16 len);
+
+    /**
+     * 由 dap_task 调用：取一条已到达的无线 DAP 响应。
+     * @param seq        输出：响应的可靠传输序号（未启用可靠传输时为 0）
      * @param buf        响应缓冲区（容量需 ≥ MAX_DAP_PAYLOAD_SIZE）
      * @param len        输出：实际响应字节数
-     * @param timeout_ms 超时（MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS）
-     * @return true=成功；false=超时（调用方丢弃，PC 端 debugger 自行重试）
+     * @param timeout_ms 等待超时；0 = 只取已到达的，不等待
+     * @return true=取到；false=超时或队列为空
      */
-    bool wait_wireless_response(u8 *buf, u16 *len, u32 timeout_ms);
+    bool wait_wireless_response(u16 *seq, u8 *buf, u16 *len, u32 timeout_ms);
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb &usb();
@@ -185,15 +195,11 @@ class Application
     PairingState m_pairing;
 
     /**
-     * 无线 DAP 响应通道（发送端用）：
-     * 主循环收到 DapResponse 帧 → push_wireless_response 写入并 give 信号量；
-     * dap_task 转发命令后 → wait_wireless_response 等待信号量并读出。
-     * 缓冲大小对齐无线帧承载上限（MAX_DAP_PAYLOAD_SIZE）。
+     * 无线 DAP 响应队列（发送端用）：接收回调把响应连同可靠传输序号入队，
+     * dap_task 出队后按序号配回挂起的命令。深度对齐 USB 命令队列（两者都受
+     * 在途窗口约束），存不下时丢弃并告警——等待中的命令最终由超时销账。
      */
-    u8 m_wireless_response[MAX_DAP_PAYLOAD_SIZE];
-    u16 m_wireless_response_len = 0;
-    SemaphoreHandle_t m_wireless_response_sem;   /**< 响应到达信号（二进制） */
-    SemaphoreHandle_t m_wireless_response_mutex; /**< 响应缓冲互斥 */
+    QueueHandle_t m_wireless_response_queue = nullptr;
 
     /** 配对流程活动标志（进入置位，成功/超时/按键/切模式后复位） */
     bool m_pairing_active = false;

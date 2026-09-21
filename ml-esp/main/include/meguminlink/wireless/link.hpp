@@ -65,7 +65,8 @@ inline constexpr u8 MAX_LOSS_PERMILLE = 255;
  * 无线链路：ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，状态全在对象内。
  * 与 usb.cc 的 dap_task（USB 侧执行接线）对称：无线传输层负责把收到的
  * DapCommand 交给公共执行器（dap_executor_run）执行，结果以 DapResponse
- * 帧回发给来源；发送端（USB 侧）经 forward_dap_command 转发并等待响应。
+ * 帧回发给来源；发送端（USB 侧）经 submit_dap_command 提交命令，响应由接收回调
+ * 入队后按可靠传输序号配回。
  * 实例由 Application 持有（m_wireless_link），与 m_usb/m_pairing 同模式。
  */
 class WirelessLink
@@ -180,18 +181,35 @@ class WirelessLink
 #endif
 
     /**
-     * 转发一条 DAP 命令给配对 peer 并等待其响应（Wireless 模式 USB→无线通路）。
-     * 查找配对 peer、打包 DapCommand、等待 DapResponse 均在此完成；响应写入
-     * resp 缓冲（容量 resp_cap，需 ≥ MAX_DAP_PAYLOAD_SIZE）。
+     * 异步转发一条 DAP 命令给配对 peer（Wireless 模式 USB→无线通路）：只负责把它
+     * 发出去并回填它的可靠传输序号，不等响应。
      *
-     * 装了可靠传输时，等待期间会驱动重传：一帧丢了由本层自己补，不再直接变成
-     * 主机侧的一次命令超时。超时上限仍是 MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS，
-     * 重传预算在它之内耗尽才判失败。
+     * 响应不在这里等——接收回调把它连同序号入 Application 的响应队列，USB 侧的
+     * dap_task 再按序号配回本条命令。多条命令因此可以同时在途，窗口才有意义。
      *
-     * @return ESP_OK=已收到响应；否则失败（未配对 / 会话未对齐 / 发送失败 /
-     *         重传耗尽 / 响应超时，命令已丢弃，PC 端 debugger 会自行超时重试）
+     * 装了可靠传输时，提交前会先把会话握手做完（两端序号基准对齐），失败由重传
+     * 兜底；重传预算在 MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS 之内耗尽则判失败，
+     * 那之后由 take_failed_command 上抛给调用方销账。
+     *
+     * @param seq_out 输出：本条命令的可靠传输序号（未启用可靠传输时为 0）
+     * @return ESP_OK=已发出；否则失败（未配对 / 会话未对齐 / 发送或提交失败）
      */
-    esp_err_t forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len);
+    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u16 *seq_out);
+
+    /**
+     * 取出一条已被可靠传输判定失败的命令序号（重传耗尽）。
+     * 调用方据此把对应的在途条目销账：策略是不回响应，让主机那条命令自己超时。
+     * @return false = 当前没有待处理的失败
+     */
+    bool take_failed_command(u16 *seq_out);
+
+    /**
+     * 现在能不能提交新命令（可靠传输窗口还有空位）。
+     *
+     * USB 侧的 dap_task 用它做背压：不能提交时先不取命令，让命令留在队列里，
+     * 主机的 USB 写入自然被挡回；取出来再丢弃会让那条命令永远等不到响应。
+     */
+    bool can_submit_command();
 
     /**
      * 登记一个对端 peer（encrypt=false）。仅登记尚未存在于 peer list 的地址，

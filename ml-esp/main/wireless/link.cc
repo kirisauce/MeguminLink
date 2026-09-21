@@ -27,8 +27,15 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/** 无线侧 DAP 执行器：命令队列深度 */
-constexpr size_t DAP_QUEUE_DEPTH = 8;
+/**
+ * 无线侧 DAP 执行器：命令队列深度。
+ *
+ * 可靠传输的 ACK 只代表"帧到了"，不代表"执行完了"：发送端窗口一释放就继续发，
+ * 而本端执行是串行的，队列会以"发送速率 - 执行速率"的差值持续积压，满了就只能
+ * 丢命令（那条命令的响应永远不会产生，主机侧表现为超时）。深度按一次连续写入的
+ * 最大积压预留——96KB 写入实测峰值约 29 条。
+ */
+constexpr size_t DAP_QUEUE_DEPTH = 32;
 
 /** 一条待执行的 DAP 命令：命令来源（响应回发）+ 可靠传输序号 + 原样命令字节流 */
 struct DapExecuteRequest
@@ -152,7 +159,7 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
         link.m_arq.on_message(rp.packet.arq.seq, (rp.packet.arq.flags & ARQ_FLAG_GAP_BEFORE) != 0, resp.data,
                               resp.len, arq_now);
 #else
-        app.push_wireless_response(resp.data, resp.len);
+        app.push_wireless_response(0, resp.data, resp.len);
 #endif
         return;
     }
@@ -671,7 +678,7 @@ esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const paylo
     return send(dest_mac, packet);
 }
 
-esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp, size_t resp_cap, u16 *resp_len)
+esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u16 *seq_out)
 {
     u8 peer_mac[ESP_NOW_ETH_ALEN];
     if (!mlink::peer_mac_load(peer_mac))
@@ -680,12 +687,11 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
         return ESP_ERR_NOT_FOUND;
     }
 
-    auto &app = Application::get_instance();
-
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     // 会话握手（ArqReset）必须先完成：两端序号基准没对齐时发出去的命令会被对端
     // 当成重复帧丢掉，而对端回报的累积确认号又会把它"确认"掉，命令静默消失。
-    // 握手是周期重发 + 回显，两端同时上电时通常几十毫秒就完成。
+    // 握手是周期重发 + 回显，两端同时上电时通常几十毫秒就完成；流水线化之后每次
+    // 提交仍走这道检查，已建立时它只是一次判断，不阻塞。
     m_arq.set_peer(peer_mac, now_ms());
     const TickType_t handshake_start = xTaskGetTickCount();
     while (!m_arq.established())
@@ -701,13 +707,6 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    // 上一条命令超时后迟到的响应必须清掉：留着会被下一条命令当成自己的响应收走，
-    // 主机会看到响应与命令错位
-    u16 stale = 0;
-    while (app.wait_wireless_response(resp, &stale, 0))
-    {
-    }
-
     u16 seq = 0;
     const ArqLink::Submit submitted = m_arq.submit(cmd, static_cast<u16>(len), now_ms(), &seq);
     if (submitted != ArqLink::Submit::Ok)
@@ -716,62 +715,13 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
                  static_cast<int>(submitted));
         return ESP_ERR_TIMEOUT;
     }
-    // 性能诊断（DEBUG 级）：转发命令发出的时刻。配合接收端（C3）的
-    // Executing/Done 日志与下方的"收到响应"日志，可分离 USB/ESP-NOW/执行
-    // 各段延迟（无线 DAP 路径单命令往返约 12ms 的实测瓶颈定位用）。
-    const TickType_t sent_tick = xTaskGetTickCount();
-    ESP_LOGD(TAG, "Wireless: DAP request %uB seq=%u sent (tick=%u)", static_cast<unsigned>(len), seq,
-             static_cast<unsigned>(sent_tick));
+    ESP_LOGD(TAG, "Wireless: DAP request %uB seq=%u submitted", static_cast<unsigned>(len), seq);
 
-    // 等到响应为止：等待时长取"硬超时"与"可靠传输下一个待办时刻"的较小者，
-    // 到点醒来驱动重传与确认，因此不必轮询也能及时补帧
-    const TickType_t hard_deadline = sent_tick + pdMS_TO_TICKS(CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS);
-    u16 rlen = 0;
-    for (;;)
+    if (seq_out != nullptr)
     {
-        const u32 now = now_ms();
-        arq_poll(now);
-
-        const TickType_t remaining = hard_deadline - xTaskGetTickCount();
-        if (static_cast<i32>(remaining) <= 0)
-        {
-            break;
-        }
-
-        u32 wait_ms = static_cast<u32>(remaining) * portTICK_PERIOD_MS;
-        const u32 arq_deadline = m_arq.next_deadline_ms();
-        if (arq_deadline != 0)
-        {
-            const u32 until_arq = static_cast<u32>(static_cast<i32>(arq_deadline - now));
-            if (until_arq < wait_ms)
-            {
-                wait_ms = until_arq;
-            }
-        }
-        if (wait_ms == 0)
-        {
-            wait_ms = 1;
-        }
-
-        if (app.wait_wireless_response(resp, &rlen, wait_ms))
-        {
-            ESP_LOGD(TAG, "Wireless: DAP response %uB received (tick=%u, wireless_rtt=%u ms)",
-                     static_cast<unsigned>(rlen), static_cast<unsigned>(xTaskGetTickCount()),
-                     static_cast<unsigned>(xTaskGetTickCount() - sent_tick));
-            if (rlen > resp_cap)
-            {
-                // 防御性截断（正常不会触发：接收端只发送 ≤ MAX_DAP_PAYLOAD_SIZE 的响应）
-                ESP_LOGW(TAG, "Wireless response truncated (%u -> %u)", rlen, static_cast<unsigned>(resp_cap));
-                rlen = static_cast<u16>(resp_cap);
-            }
-            *resp_len = rlen;
-            return ESP_OK;
-        }
+        *seq_out = seq;
     }
-
-    ESP_LOGW(TAG, "Wireless: no response within %u ms, %u-byte request dropped",
-             CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS, static_cast<unsigned>(len));
-    return ESP_ERR_TIMEOUT;
+    return ESP_OK;
 #else
     const esp_err_t ret = send_dap_command(peer_mac, cmd, len);
     if (ret != ESP_OK)
@@ -780,29 +730,32 @@ esp_err_t WirelessLink::forward_dap_command(const u8 *cmd, size_t len, u8 *resp,
                  esp_err_to_name(ret));
         return ret;
     }
-    const TickType_t sent_tick = xTaskGetTickCount();
-    ESP_LOGD(TAG, "Wireless: DAP request %uB sent (tick=%u)", static_cast<unsigned>(len),
-             static_cast<unsigned>(sent_tick));
+    ESP_LOGD(TAG, "Wireless: DAP request %uB sent", static_cast<unsigned>(len));
 
-    // 阻塞等待接收端响应（一次一个在途请求，与 CMSIS-DAP v2 同步请求/响应
-    // 语义一致；等待期间不处理下一个请求）。
-    u16 rlen = 0;
-    if (!app.wait_wireless_response(resp, &rlen, CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS))
+    if (seq_out != nullptr)
     {
-        ESP_LOGW(TAG, "Wireless: no response within %u ms, %u-byte request dropped",
-                 CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS, static_cast<unsigned>(len));
-        return ESP_ERR_TIMEOUT;
+        *seq_out = 0; // 没有可靠传输：序号统一为 0，响应按先进先出配回
     }
-    ESP_LOGD(TAG, "Wireless: DAP response %uB received (tick=%u, wireless_rtt=%u ms)", static_cast<unsigned>(rlen),
-             static_cast<unsigned>(xTaskGetTickCount()), static_cast<unsigned>(xTaskGetTickCount() - sent_tick));
-
-    if (rlen > resp_cap)
-    {
-        ESP_LOGW(TAG, "Wireless response truncated (%u -> %u)", rlen, static_cast<unsigned>(resp_cap));
-        rlen = static_cast<u16>(resp_cap);
-    }
-    *resp_len = rlen;
     return ESP_OK;
+#endif
+}
+
+bool WirelessLink::take_failed_command(u16 *seq_out)
+{
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    return m_arq.take_failed(seq_out);
+#else
+    (void)seq_out;
+    return false;
+#endif
+}
+
+bool WirelessLink::can_submit_command()
+{
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    return m_arq.can_submit();
+#else
+    return true; // 未启用可靠传输：没有窗口可等
 #endif
 }
 
@@ -1063,7 +1016,7 @@ void WirelessLink::arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 
     (void)self;
     (void)peer_mac;
     (void)seq;
-    Application::get_instance().push_wireless_response(payload, len);
+    Application::get_instance().push_wireless_response(seq, payload, len);
 #else
     // 无 USB 侧收到的是命令：入执行队列，序号一并带上（回响应时按它记账）
     if (peer_mac == nullptr)
