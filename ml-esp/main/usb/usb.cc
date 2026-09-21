@@ -30,14 +30,14 @@
 static constexpr char TAG[] = "mlink::usb";
 
 /**
- * vendor IN 传输完成次数（由 tud_vendor_tx_cb 递增）。
+ * vendor IN 已发出的累计字节数（由 tud_vendor_tx_cb 累加）。
  *
- * 响应写回靠它确认"上一条真的被主机读走了"：vendor FIFO 是字节流、没有消息边界，
+ * 响应写回靠它确认"这一整条真的被主机读走了"：vendor FIFO 是字节流、没有消息边界，
  * 两条响应同时排在里面会被主机的一次读合并成一条，而按"一次读一条响应"解析的主机
- * （pyocd 的延迟传输正是如此）只能解出第一条、其余全丢，表现为命令超时。
- * FIFO 空不足以判断——数据可能已经移进端点缓冲、尚未被主机取走。
+ * （pyocd 的延迟传输正是如此）只能解出第一条、其余全丢。注意一条响应可能跨多次 IN
+ * 传输（端点 64B），所以判据是"累计字节数够了"，而不是"回调来过一次"。
  */
-static volatile u32 s_vendor_tx_done = 0;
+static volatile u32 s_vendor_tx_bytes = 0;
 
 /** 重新枚举前的断开时长：给主机足够时间感知拔出（软断开本身在 ms 级生效） */
 static constexpr u32 RECONNECT_DELAY_MS = 100;
@@ -341,13 +341,21 @@ void dap_send_vendor_response(const u8 *data, u16 len)
     // 不会自动发起 IN 传输，短响应必须显式 flush 才能送达主机
     tud_vendor_n_write_flush(ITF_NUM_DAP);
 
-    // 等这条响应真的被主机读走再返回（见 s_vendor_tx_done 的说明）：FIFO 空不等于
-    // 主机读走——数据可能已经移进端点缓冲，下一条响应紧接着进 FIFO 仍会与它合并。
-    // 最多等 ~5ms；主机本来就该在读响应，真等不到就交给调用方的超时销账兜底。
-    const u32 done_before = s_vendor_tx_done;
-    for (int w = 0; w < 50 && s_vendor_tx_done == done_before; w++)
+    // 等这条响应整条被主机读走再返回（见 s_vendor_tx_bytes 的说明）：端点只有 64B，
+    // 大响应要跨多次 IN 传输，只等第一段就放行会把这条响应截断、下一条接上去。
+    // 等待要够长：主机在连发命令时不会同时读响应。500ms 仍等不到就交给超时销账兜底。
+    const u32 sent_before = s_vendor_tx_bytes;
+    for (int w = 0; w < 500; w++)
     {
-        esp_rom_delay_us(100);
+        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+        {
+            return;
+        }
+        if ((s_vendor_tx_bytes - sent_before) >= len)
+        {
+            break;
+        }
+        vTaskDelay(1);
     }
 }
 
@@ -680,7 +688,7 @@ void tud_vendor_tx_cb(u8 idx, u32 sent_bytes)
     (void)sent_bytes;
     if (idx == ITF_NUM_DAP)
     {
-        s_vendor_tx_done = s_vendor_tx_done + 1u;
+        s_vendor_tx_bytes = s_vendor_tx_bytes + sent_bytes;
     }
 }
 
