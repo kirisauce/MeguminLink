@@ -2,6 +2,7 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/common.hpp"
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（无线侧执行接线）
+#include "meguminlink/dap_frame.hpp"
 #include "meguminlink/nvs_flash.hpp"
 
 #include <cstring>
@@ -839,9 +840,10 @@ bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     link->arq_poll(now_ms());
 #endif
 
-    // 无线接收端只有这一条 DAP 通道：DAP_Info 按无线单帧上限上报，
+    // 无线接收端只有这一条 DAP 通道：DAP_Info 上报值受 CMSIS-DAP 单字节
+    // Transfer Count 的安全上限约束（见 DAP_REPORTED_PACKET_SIZE_MAX），
     // 主机据此决定一条命令能携带多少数据
-    DAP_Data.packet_size = static_cast<u16>(MAX_DAP_PAYLOAD_SIZE);
+    DAP_Data.packet_size = static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX);
     return true;
 }
 

@@ -9,6 +9,20 @@
 namespace mlink
 {
 /**
+ * 上报给主机的单包尺寸上限（DAP_Info 的 Packet Size）。
+ *
+ * CMSIS-DAP 只用单个字节表示 DAP_Transfer 的 Transfer Count（1..255），主机据此
+ * 把一次批量传输拆成多条命令。OpenOCD 的 cmsis_dap.c 按 `(packet_size - 4) / 5`
+ * 计算一条命令能带多少个写传输，且不把结果收敛到 255：上报值超过
+ * 4 + 255 × 5 = 1279 时，算出的传输数会溢出那个单字节字段（291 被截断成 35），
+ * 而它随后仍按未截断的原值校验响应，直接报 "transfer count mismatch" 并让整条
+ * 命令流错位。留一个传输的余量取 1274，代价是单条命令少带一个写传输。
+ *
+ * 本值低于无线单帧能承载的 MAX_DAP_PAYLOAD_SIZE，不会反过来压窄命令上限。
+ */
+inline constexpr size_t DAP_REPORTED_PACKET_SIZE_MAX = 1274;
+
+/**
  * 计算一条 CMSIS-DAP 请求的完整字节数（含命令 ID）。
  *
  * USB bulk 端点小于命令本身时，一条命令会跨多个 USB 包到达；接收侧必须

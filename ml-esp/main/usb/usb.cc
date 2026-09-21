@@ -431,10 +431,12 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     ctx.source = source;
     ctx.request_len = req_len;
 
-    // DAP_Info 上报的单包尺寸按传输通道设定：vendor bulk 用无线单帧上限，
-    // HID 是定长 64B 报告。主机据此决定一条命令能携带多少数据。
-    DAP_Data.packet_size = (source == DapSource::VendorBulk) ? static_cast<u16>(MAX_DAP_PAYLOAD_SIZE)
-                                                            : HID_REPORT_SIZE;
+    // DAP_Info 上报的单包尺寸按传输通道设定：vendor bulk 受 CMSIS-DAP 单字节
+    // Transfer Count 的安全上限约束（见 DAP_REPORTED_PACKET_SIZE_MAX），HID 是
+    // 定长 64B 报告。主机据此决定一条命令能携带多少数据。
+    DAP_Data.packet_size = (source == DapSource::VendorBulk)
+                               ? static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX)
+                               : HID_REPORT_SIZE;
 
     if (!dap_source_ready(source))
     {
