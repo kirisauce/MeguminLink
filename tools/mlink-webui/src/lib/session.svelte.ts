@@ -146,6 +146,8 @@ export class MlinkSession {
 	#openFailure: { name: string; message: string } | null = null;
 	/** WebUSB 可用性诊断；未在客户端采集前为 null */
 	usbDiagnosis = $state<UsbDiagnosis | null>(null);
+	/** 诊断采集的单调序号：只允许最新一次采集写回 */
+	#diagnosisSeq = 0;
 
 	constructor() {
 		// 初始状态与浏览器能力无关，保证服务端预渲染与客户端首帧一致；
@@ -159,6 +161,10 @@ export class MlinkSession {
 	 */
 	async refreshDiagnosis(): Promise<void> {
 		if (typeof window === 'undefined' || typeof navigator === 'undefined') return;
+
+		// getDevices() 是异步的：连接成功后的那次采集可能被更早发出的慢查询追上，
+		// 只有序号仍属于自己的采集才写回结果。
+		const seq = ++this.#diagnosisSeq;
 
 		const hasUsbApi = navigator.usb !== undefined;
 
@@ -188,6 +194,7 @@ export class MlinkSession {
 			}
 		}
 
+		if (seq !== this.#diagnosisSeq) return;
 		this.usbDiagnosis = diagnoseWebUsb({
 			isSecureContext: window.isSecureContext,
 			hasUsbApi,
@@ -301,6 +308,8 @@ export class MlinkSession {
 		this.state = 'streaming';
 		void this.refreshConfig();
 		void this.refreshUsbConfig();
+		// 设备已授权并接上，「已授权设备」这项的结论变了，重新采集一次
+		void this.refreshDiagnosis();
 		this.#schedule(0);
 	}
 
