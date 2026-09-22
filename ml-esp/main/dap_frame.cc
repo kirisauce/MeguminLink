@@ -325,3 +325,78 @@ size_t mlink::dap_response_bound(const u8 *request, size_t avail)
 {
     return parse_frame(request, avail, true).bound;
 }
+
+const char *mlink::dap_command_name(u8 id)
+{
+    switch (id)
+    {
+    case ID_DAP_Info:
+        return "DAP_Info";
+    case ID_DAP_HostStatus:
+        return "DAP_HostStatus";
+    case ID_DAP_Connect:
+        return "DAP_Connect";
+    case ID_DAP_Disconnect:
+        return "DAP_Disconnect";
+    case ID_DAP_TransferConfigure:
+        return "DAP_TransferConfigure";
+    case ID_DAP_Transfer:
+        return "DAP_Transfer";
+    case ID_DAP_TransferBlock:
+        return "DAP_TransferBlock";
+    case ID_DAP_TransferAbort:
+        return "DAP_TransferAbort";
+    case ID_DAP_WriteABORT:
+        return "DAP_WriteABORT";
+    case ID_DAP_Delay:
+        return "DAP_Delay";
+    case ID_DAP_ResetTarget:
+        return "DAP_ResetTarget";
+    case ID_DAP_SWJ_Pins:
+        return "DAP_SWJ_Pins";
+    case ID_DAP_SWJ_Clock:
+        return "DAP_SWJ_Clock";
+    case ID_DAP_SWJ_Sequence:
+        return "DAP_SWJ_Sequence";
+    case ID_DAP_SWD_Configure:
+        return "DAP_SWD_Configure";
+    case ID_DAP_JTAG_Sequence:
+        return "DAP_JTAG_Sequence";
+    case ID_DAP_JTAG_Configure:
+        return "DAP_JTAG_Configure";
+    case ID_DAP_JTAG_IDCODE:
+        return "DAP_JTAG_IDCODE";
+    case ID_DAP_SWO_Transport:
+        return "DAP_SWO_Transport";
+    case ID_DAP_SWO_Mode:
+        return "DAP_SWO_Mode";
+    case ID_DAP_SWO_Baudrate:
+        return "DAP_SWO_Baudrate";
+    case ID_DAP_SWO_Control:
+        return "DAP_SWO_Control";
+    case ID_DAP_SWO_Status:
+        return "DAP_SWO_Status";
+    case ID_DAP_SWO_Data:
+        return "DAP_SWO_Data";
+    case ID_DAP_SWD_Sequence:
+        return "DAP_SWD_Sequence";
+    case ID_DAP_SWO_ExtendedStatus:
+        return "DAP_SWO_ExtendedStatus";
+    case ID_DAP_UART_Transport:
+        return "DAP_UART_Transport";
+    case ID_DAP_UART_Configure:
+        return "DAP_UART_Configure";
+    case ID_DAP_UART_Transfer:
+        return "DAP_UART_Transfer";
+    case ID_DAP_UART_Control:
+        return "DAP_UART_Control";
+    case ID_DAP_UART_Status:
+        return "DAP_UART_Status";
+    case ID_DAP_QueueCommands:
+        return "DAP_QueueCommands";
+    case ID_DAP_ExecuteCommands:
+        return "DAP_ExecuteCommands";
+    default:
+        return "unknown";
+    }
+}

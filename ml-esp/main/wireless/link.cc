@@ -43,6 +43,7 @@ struct DapExecuteRequest
     u8 src_mac[ESP_NOW_ETH_ALEN];
     u16 cmd_seq;
     u16 len;
+    u8 channel; /**< 主机侧 USB 传输通道（DAP_CHANNEL_*）：决定回给主机的 Packet Size */
     u8 data[MAX_DAP_PAYLOAD_SIZE];
 };
 
@@ -142,9 +143,9 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
         // 可靠消息先过适配层：新帧才交付执行，重复帧只记下待重放，绝不重新执行
         link.m_arq.on_message(rp.packet.arq.seq, (rp.packet.arq.flags & ARQ_FLAG_GAP_BEFORE) != 0, cmd.data, cmd.len,
-                              arq_now);
+                              cmd.channel, arq_now);
 #else
-        const esp_err_t ret = app.wireless_link().dap_execute(rp.src_mac, 0, cmd.data, cmd.len);
+        const esp_err_t ret = app.wireless_link().dap_execute(rp.src_mac, 0, cmd.data, cmd.len, cmd.channel);
         if (ret != ESP_OK)
         {
             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),
@@ -156,8 +157,9 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     case PacketType::DapResponse: {
         const auto &resp = rp.packet.payload.dap_response;
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+        // 响应帧没有通道字段：通道标记只在命令方向有意义，接收侧（USB 侧）忽略它
         link.m_arq.on_message(rp.packet.arq.seq, (rp.packet.arq.flags & ARQ_FLAG_GAP_BEFORE) != 0, resp.data,
-                              resp.len, arq_now);
+                              resp.len, 0, arq_now);
 #else
         app.push_wireless_response(0, resp.data, resp.len);
 #endif
@@ -580,7 +582,7 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const Packet &packet)
     return send_ret;
 }
 
-esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len)
+esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel)
 {
     if (len > MAX_DAP_PAYLOAD_SIZE)
     {
@@ -594,6 +596,7 @@ esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, siz
     packet.packet_type = PacketType::DapCommand;
     auto &content = packet.payload.dap_command;
     content.len = static_cast<u16>(len);
+    content.channel = channel;
     content.data = data;
     return send(dest_mac, packet);
 }
@@ -678,7 +681,7 @@ esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const paylo
     return send(dest_mac, packet);
 }
 
-esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u16 *seq_out)
+esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 *seq_out)
 {
     u8 peer_mac[ESP_NOW_ETH_ALEN];
     if (!mlink::peer_mac_load(peer_mac))
@@ -708,7 +711,7 @@ esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u16 *seq_o
     }
 
     u16 seq = 0;
-    const ArqLink::Submit submitted = m_arq.submit(cmd, static_cast<u16>(len), now_ms(), &seq);
+    const ArqLink::Submit submitted = m_arq.submit(cmd, static_cast<u16>(len), channel, now_ms(), &seq);
     if (submitted != ArqLink::Submit::Ok)
     {
         ESP_LOGW(TAG, "Wireless: cannot submit %u-byte DAP request (result %d)", static_cast<unsigned>(len),
@@ -723,7 +726,7 @@ esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u16 *seq_o
     }
     return ESP_OK;
 #else
-    const esp_err_t ret = send_dap_command(peer_mac, cmd, len);
+    const esp_err_t ret = send_dap_command(peer_mac, cmd, len, channel);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Wireless: failed to forward %u-byte DAP request: %s", static_cast<unsigned>(len),
@@ -793,10 +796,12 @@ bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     link->arq_poll(now_ms());
 #endif
 
-    // 无线接收端只有这一条 DAP 通道：DAP_Info 上报值受 CMSIS-DAP 单字节
-    // Transfer Count 的安全上限约束（见 DAP_REPORTED_PACKET_SIZE_MAX），
-    // 主机据此决定一条命令能携带多少数据
-    DAP_Data.packet_size = static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX);
+    // DAP_Info 上报的单包尺寸按命令来源通道给：HID 是定长 64B 报告，只有 vendor
+    // bulk 才用得上 1274B 这个安全上限（见 DAP_REPORTED_PACKET_SIZE_MAX）。混用会
+    // 让主机按 1274 构造装不进 64B 报告的命令——那正是 DAP_TransferBlock 被截断、
+    // 执行器判长度不足而回 Invalid 的原因。
+    DAP_Data.packet_size = (req.channel == DAP_CHANNEL_HID) ? DAP_HID_PACKET_SIZE
+                                                            : static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX);
     return true;
 }
 
@@ -830,7 +835,7 @@ void WirelessLink::dap_task_fn(void *arg)
                      sizeof(link->m_dap_request), link->m_dap_response, sizeof(link->m_dap_response));
 }
 
-esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len)
+esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len, u8 channel)
 {
     if (m_dap_queue == nullptr)
     {
@@ -847,6 +852,7 @@ esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *da
     std::memcpy(req.src_mac, src_mac, ESP_NOW_ETH_ALEN);
     req.cmd_seq = cmd_seq;
     req.len = static_cast<u16>(len);
+    req.channel = channel;
     std::memcpy(req.data, data, len);
 
     if (xQueueSend(m_dap_queue, &req, 0) != pdTRUE)
@@ -910,7 +916,7 @@ bool WirelessLink::arq_take_settings_dirty()
 }
 
 void WirelessLink::arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
-                                u16 ack, u16 sack, u8 window)
+                                u8 meta, u16 ack, u16 sack, u8 window)
 {
     auto *self = static_cast<WirelessLink *>(ctx);
 
@@ -940,6 +946,7 @@ void WirelessLink::arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     // USB 侧发送的是命令
     packet.payload.dap_command.len = len;
+    packet.payload.dap_command.channel = meta;
     packet.payload.dap_command.data = payload;
 #else
     // 无 USB 侧发送的是响应
@@ -1006,25 +1013,28 @@ void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &setti
     }
 }
 
-void WirelessLink::arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len)
+void WirelessLink::arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 channel)
 {
     auto *self = static_cast<WirelessLink *>(ctx);
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     // USB 侧收到的是响应：交给正在等待的转发路径。写缓冲 + give 信号量都是
-    // 非阻塞操作，因此在适配层持锁时调用是安全的。
+    // 非阻塞操作，因此在适配层持锁时调用是安全的。通道标记是命令侧的概念，
+    // 响应路径按在途表自己知道回哪条通道，这里用不上。
     (void)self;
     (void)peer_mac;
     (void)seq;
+    (void)channel;
     Application::get_instance().push_wireless_response(seq, payload, len);
 #else
-    // 无 USB 侧收到的是命令：入执行队列，序号一并带上（回响应时按它记账）
+    // 无 USB 侧收到的是命令：入执行队列，序号与来源通道一并带上（序号用于回响应
+    // 时记账，通道决定执行器回答 DAP_Info 的单包尺寸）
     if (peer_mac == nullptr)
     {
         ESP_LOGW(TAG, "ARQ command seq=%u dropped: peer unknown", seq);
         return;
     }
-    const esp_err_t ret = self->dap_execute(peer_mac, seq, payload, len);
+    const esp_err_t ret = self->dap_execute(peer_mac, seq, payload, len, channel);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to enqueue ARQ DAP command seq=%u: %s", seq, esp_err_to_name(ret));

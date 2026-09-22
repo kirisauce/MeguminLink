@@ -640,8 +640,10 @@ void Application::run()
                     case PacketType::DapCommand: {
                         const auto &cmd = rp.packet.payload.dap_command;
                         // 装了可靠传输时 DAP 命令在接收回调里就地消费（重复帧要立即
-                        // 重放），不会走到这条经主循环的老路径；序号填 0 只为兼容
-                        const esp_err_t ret = m_wireless_link.dap_execute(rp.src_mac, 0, cmd.data, cmd.len);
+                        // 重放），不会走到这条经主循环的老路径；序号填 0 只为兼容。
+                        // 通道标记照常透传：执行器靠它回答 DAP_Info 的单包尺寸
+                        const esp_err_t ret =
+                            m_wireless_link.dap_execute(rp.src_mac, 0, cmd.data, cmd.len, cmd.channel);
                         if (ret != ESP_OK)
                         {
                             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),

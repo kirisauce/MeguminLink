@@ -219,7 +219,7 @@ u8 Sender::window() const
     return (m_peer_window < m_config.window) ? m_peer_window : m_config.window;
 }
 
-SubmitResult Sender::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq_out)
+SubmitResult Sender::submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out)
 {
     if (payload == nullptr || m_storage == nullptr || len == 0 || len > m_slot_cap)
     {
@@ -240,6 +240,7 @@ SubmitResult Sender::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq_out
     std::memcpy(payload_of(seq), payload, len);
     slot.seq = seq;
     slot.len = len;
+    slot.meta = meta;
     slot.retx = 0;
     slot.backoff_shift = 0;
     slot.used = true;
@@ -256,7 +257,7 @@ SubmitResult Sender::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq_out
     {
         // gap_before 只在"本帧就是最老未确认帧"时置位：此时它之前的序号要么已
         // 确认、要么已被放弃，跳过去不会误伤任何仍在途的帧
-        m_transmit(m_ctx, seq, payload_of(seq), len, false, m_abandoned && seq == m_tx_base);
+        m_transmit(m_ctx, seq, payload_of(seq), len, false, m_abandoned && seq == m_tx_base, slot.meta);
     }
 
     if (seq_out != nullptr)
@@ -383,7 +384,7 @@ void Sender::retransmit(u16 seq, u32 now_ms)
     emit(Event::Retransmit, seq, now_ms);
     if (m_transmit != nullptr)
     {
-        m_transmit(m_ctx, seq, payload_of(seq), slot.len, true, m_abandoned && seq == m_tx_base);
+        m_transmit(m_ctx, seq, payload_of(seq), slot.len, true, m_abandoned && seq == m_tx_base, slot.meta);
     }
 }
 
@@ -504,7 +505,7 @@ size_t ReorderStore::slot_of(u16 seq) const
     return static_cast<size_t>(seq) % m_slot_count;
 }
 
-void ReorderStore::store(u16 seq, const u8 *payload, u16 len)
+void ReorderStore::store(u16 seq, const u8 *payload, u16 len, u8 meta)
 {
     if (m_storage == nullptr || payload == nullptr)
     {
@@ -518,10 +519,11 @@ void ReorderStore::store(u16 seq, const u8 *payload, u16 len)
     const size_t slot = slot_of(seq);
     std::memcpy(m_storage + slot * m_slot_cap, payload, len);
     m_len[slot] = len;
+    m_meta[slot] = meta;
     m_valid[slot] = true;
 }
 
-const u8 *ReorderStore::get(u16 seq, u16 *len) const
+const u8 *ReorderStore::get(u16 seq, u16 *len, u8 *meta) const
 {
     if (m_storage == nullptr)
     {
@@ -537,6 +539,10 @@ const u8 *ReorderStore::get(u16 seq, u16 *len) const
     if (len != nullptr)
     {
         *len = m_len[slot];
+    }
+    if (meta != nullptr)
+    {
+        *meta = m_meta[slot];
     }
     return m_storage + slot * m_slot_cap;
 }

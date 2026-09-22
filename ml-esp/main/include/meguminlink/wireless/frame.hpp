@@ -46,13 +46,17 @@ inline constexpr size_t ARQ_HEADER_SIZE = 0;
 #endif
 
 /**
- * DapCommand/DapResponse 帧格式：[type:1B][扩展头][len:2B 大端][data:len B]。
- * 数据段上限由 ESP-NOW v2 单帧上限（1470B）扣掉公共帧头与扩展头得出，当前为
- * 1459B；ARQ 关闭（扩展头为 0）时回到 1467B。USB 侧命令按 DAP_PACKET_SIZE 分包
- * 到达，接收侧由 dap_request_size() 重组为完整命令后再转发。
+ * DapCommand 帧格式：[type:1B][扩展头][len:2B 大端][channel:1B][data:len B]；
+ * DapResponse 少一个 channel 字段——响应写回哪条 USB 通道由发送侧按在途表决定，
+ * 不需要随帧传递。数据段上限由 ESP-NOW v2 单帧上限（1470B）扣掉公共帧头、扩展头
+ * 与通道标记得出，当前为 1458B；ARQ 关闭（扩展头为 0）时回到 1466B。USB 侧命令按
+ * DAP_PACKET_SIZE 分包到达，接收侧由 dap_request_size() 重组为完整命令后再转发。
  */
 inline constexpr size_t DAP_FRAME_HEADER_SIZE = 3;
-inline constexpr size_t MAX_DAP_PAYLOAD_SIZE = ESP_NOW_MAX_DATA_LEN_V2 - DAP_FRAME_HEADER_SIZE - ARQ_HEADER_SIZE;
+/** DapCommand 帧体里的通道标记字节（见 payload::DapCommand::channel） */
+inline constexpr size_t DAP_CHANNEL_FIELD_SIZE = 1;
+inline constexpr size_t MAX_DAP_PAYLOAD_SIZE =
+    ESP_NOW_MAX_DATA_LEN_V2 - DAP_FRAME_HEADER_SIZE - ARQ_HEADER_SIZE - DAP_CHANNEL_FIELD_SIZE;
 inline constexpr size_t DAP_FRAME_MAX_SIZE = DAP_FRAME_HEADER_SIZE + ARQ_HEADER_SIZE + MAX_DAP_PAYLOAD_SIZE;
 
 /** 执行器请求缓冲（DAP_MAX_REQUEST_SIZE）必须装得下无线单帧能承载的命令 */
@@ -93,6 +97,7 @@ struct PairingAccepted
 struct DapCommand
 {
     u16 len;        /**< 有效数据长度（data[0..len-1]） */
+    u8 channel;     /**< 主机侧 USB 传输通道（DAP_CHANNEL_*）：对端据此回答 Packet Size */
     const u8 *data; /**< 命令字节流（指向调用方存储） */
 };
 

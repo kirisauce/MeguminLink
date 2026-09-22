@@ -23,6 +23,26 @@ namespace mlink
 inline constexpr size_t DAP_REPORTED_PACKET_SIZE_MAX = 1274;
 
 /**
+ * DAP 传输通道：决定"主机↔探针"这一段能承载的单包尺寸，也就是 CMSIS-DAP 的
+ * DAP_Info 查询（0xFF，Packet Size）要回答的东西——主机走 HID 中断端点时单包
+ * 是定长 64B 报告，走 vendor bulk 时是本固件上报的 1274B。
+ *
+ * 无线链路把命令转给对端执行，而对端只看得到命令字节、看不到它从哪条 USB 通道
+ * 进来，因此通道标记必须随每条命令一起过去：对端据此回答 Packet Size，否则主机
+ * 会按 1274 构造装不进 64B HID 报告的命令（实测表现为 DAP_TransferBlock 被截断
+ * 成 64B，对端解析判长度不足而回 Invalid）。
+ */
+inline constexpr u8 DAP_CHANNEL_HID = 0;
+inline constexpr u8 DAP_CHANNEL_VENDOR_BULK = 1;
+
+/**
+ * HID 通道的单包尺寸：中断报告是定长的，等于 CMSIS-DAP 的 DAP_PACKET_SIZE。
+ * 此处只做数值定义，调用方在编译期校验它与 DAP_PACKET_SIZE 一致（见 usb.cc 的
+ * static_assert）——DAP.h 需在 DAP_config.h 之后包含，本头文件不引入它。
+ */
+inline constexpr u16 DAP_HID_PACKET_SIZE = 64;
+
+/**
  * 计算一条 CMSIS-DAP 请求的完整字节数（含命令 ID）。
  *
  * USB bulk 端点小于命令本身时，一条命令会跨多个 USB 包到达；接收侧必须
@@ -51,6 +71,17 @@ size_t dap_request_size(const u8 *request, size_t avail);
  * @return 响应字节数上界；数据不足时返回 0
  */
 size_t dap_response_bound(const u8 *request, size_t avail);
+
+/**
+ * DAP 命令号（CMSIS-DAP 的 ID_DAP_*）→ 可读名称。
+ *
+ * 供命令日志与统计共用：执行器逐命令日志、USB 侧失败销账日志都按同一张表
+ * 打印名称，避免各处各写一份映射。
+ *
+ * @param id 命令号（请求首字节）
+ * @return 静态字符串；未知命令号返回 "unknown"
+ */
+const char *dap_command_name(u8 id);
 } // namespace mlink
 
 #endif

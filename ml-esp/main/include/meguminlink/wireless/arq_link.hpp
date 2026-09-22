@@ -99,7 +99,7 @@ class ArqLink
 
     /** 发一条可靠消息（首传 / 重传 / 重放） */
     using TransmitFn = void (*)(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
-                                u16 ack, u16 sack, u8 window);
+                                u8 meta, u16 ack, u16 sack, u8 window);
 
     /** 发一个纯确认帧（没有数据可捎带时） */
     using AckFn = void (*)(void *ctx, u16 ack, u16 sack, u8 window);
@@ -116,12 +116,13 @@ class ArqLink
 
     /**
      * 按序交付一条可靠消息。对端 MAC 一并给出：本回调是在持锁状态下被调用的，
-     * 再回头调本层的 peer_mac() 会去抢同一把非递归互斥量而死锁。
+     * 再回头调本层的 peer_mac() 会去抢同一把非递归互斥量而死锁。meta 是这条消息
+     * 随帧携带的 1 字节元数据，乱序补齐时按消息逐条还原（见 ReorderStore）。
      *
      * 乱序补齐时它会在同一次 on_message 里按序被连续调用多次（补齐几帧就几次），
      * 实现必须接得住连续交付，不能假设"一次收帧只交付一条"。
      */
-    using DeliverFn = void (*)(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
+    using DeliverFn = void (*)(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 meta);
 
     /** 本层的全部输出 */
     struct Callbacks
@@ -209,7 +210,7 @@ class ArqLink
     void on_ack(u16 ack, u16 sack, u8 window, u32 now_ms);
 
     /** 一条可靠消息（DAP 命令或响应，取决于是链路的哪一端） */
-    void on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now_ms);
+    void on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u8 meta, u32 now_ms);
 
     /** 对端的会话重置请求（携带对端参数） */
     void on_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now_ms);
@@ -226,7 +227,7 @@ class ArqLink
     u32 next_deadline_ms() const;
 
     /** 提交一条可靠消息 */
-    Submit submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq_out);
+    Submit submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out);
 
     /**
      * 无 USB 侧专用：提交一条 DAP 响应，并记下它回应的是哪条命令。
@@ -262,7 +263,8 @@ class ArqLink
 
   private:
     /** 核心的发送回调：补上本端接收侧的确认信息后转交给调用方 */
-    static void core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before);
+    static void core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
+                              u8 meta);
 
     /** 核心的事件回调：打日志（计数直接从核心快照读，不在这里累加） */
     static void core_event(void *raw, arq::Event event, u16 seq, u32 now_ms);
@@ -287,6 +289,7 @@ class ArqLink
         bool reset_echo; /**< 仅重置动作使用：true = 回显，false = 请求 */
         u16 seq;
         u16 len;
+        u8 meta; /**< 消息动作携带的元数据（DAP 命令用它承载主机侧传输通道） */
         u16 ack;
         u16 sack;
         u8 window;
@@ -326,7 +329,7 @@ class ArqLink
      * first 那一帧的载荷由调用方直接给出（就是本次收到的帧），其余从乱序缓冲里
      * 取出并在交付后释放；区间内没有载荷的序号（对端声明放弃的空洞）跳过。
      */
-    void deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u16 last);
+    void deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u8 first_meta, u16 last);
 
     /** 记录一条失败消息的序号（须在持锁时调用，供核心事件回调使用） */
     void record_failed_locked(u16 seq);

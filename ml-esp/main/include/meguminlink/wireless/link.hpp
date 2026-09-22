@@ -78,8 +78,12 @@ class WirelessLink
     /** 向指定对端（可为广播地址）发送一帧协议包 */
     esp_err_t send(const u8 *dest_mac, const Packet &packet);
 
-    /** 打包一条 DAP 命令/响应（原样字节流）为对应帧并发送给对端 */
-    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len);
+    /**
+     * 打包一条 DAP 命令/响应（原样字节流）为对应帧并发送给对端。命令帧额外带上
+     * 主机侧通道标记（channel，见 DAP_CHANNEL_*）：对端据此回答 DAP_Info 的单包
+     * 尺寸；响应帧不需要它。
+     */
+    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel);
     esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
 
     /**
@@ -191,10 +195,12 @@ class WirelessLink
      * 兜底；重传预算在 MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS 之内耗尽则判失败，
      * 那之后由 take_failed_command 上抛给调用方销账。
      *
+     * @param channel 该命令来自哪条主机侧 USB 通道（DAP_CHANNEL_*）：随命令送到对端，
+     *                供它回答 DAP_Info 的单包尺寸
      * @param seq_out 输出：本条命令的可靠传输序号（未启用可靠传输时为 0）
      * @return ESP_OK=已发出；否则失败（未配对 / 会话未对齐 / 发送或提交失败）
      */
-    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u16 *seq_out);
+    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 *seq_out);
 
     /**
      * 取出一条已被可靠传输判定失败的命令序号（重传耗尽）。
@@ -227,8 +233,10 @@ class WirelessLink
      *                对端重传同一条命令时据此重放响应而不是重新执行
      * @param data    DAP 命令原样字节流
      * @param len     命令长度（> MAX_DAP_PAYLOAD_SIZE 时拒绝）
+     * @param channel 该命令来自的主机侧 USB 通道（DAP_CHANNEL_*）：执行器据此回答
+     *                DAP_Info 的单包尺寸
      */
-    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len);
+    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len, u8 channel);
 
   private:
     /** ESP-NOW 接收/发送回调（esp_now 要求 C 函数指针，无 arg；经 Application 访问） */
@@ -251,12 +259,12 @@ class WirelessLink
 
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /** 可靠传输的输出回调：把核心给的消息/确认/重置封成帧送出去 */
-    static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u16 ack,
-                             u16 sack, u8 window);
+    static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u8 meta,
+                             u16 ack, u16 sack, u8 window);
     static void arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window);
     static void arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
                                u8 window);
-    static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len);
+    static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 channel);
 
     /** 本端可靠传输发送的消息类型：USB 侧发命令，无 USB 侧发响应 */
     static constexpr PacketType ARQ_MESSAGE_TYPE =

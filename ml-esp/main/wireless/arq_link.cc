@@ -364,7 +364,7 @@ void ArqLink::dispatch(const Action *actions, size_t count)
             // 有新消息提交——提交只发生在同一个任务里
             const u8 *payload = m_tx_storage + (action.seq % arq::MAX_WINDOW) * m_payload_cap;
             m_callbacks.transmit(m_callbacks.ctx, action.seq, payload, action.len, action.retransmit,
-                                 action.gap_before, action.ack, action.sack, action.window);
+                                 action.gap_before, action.meta, action.ack, action.sack, action.window);
             break;
         }
         case Action::Kind::Ack: {
@@ -508,7 +508,7 @@ void ArqLink::on_ack(u16 ack, u16 sack, u8 window, u32 now_ms)
     unlock();
 }
 
-void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now_ms)
+void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u8 meta, u32 now_ms)
 {
     lock();
 
@@ -522,7 +522,7 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
             {
                 std::memcpy(peer_mac, m_peer_mac, sizeof(peer_mac));
             }
-            m_callbacks.deliver(m_callbacks.ctx, m_peer_known ? peer_mac : nullptr, seq, payload, len);
+            m_callbacks.deliver(m_callbacks.ctx, m_peer_known ? peer_mac : nullptr, seq, payload, len, meta);
         }
         unlock();
         return;
@@ -533,12 +533,12 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     {
         // commit 返回本次连续交付的最后一帧：乱序缓冲补齐时区间会不止一帧
         const u16 last = m_receiver.commit(seq, now_ms);
-        deliver_range_locked(seq, payload, len, last);
+        deliver_range_locked(seq, payload, len, meta, last);
     }
     else if (result == arq::RxResult::Buffered)
     {
         // 判为窗口内的乱序帧：先把载荷收进乱序缓冲，等 commit 的区间把它补出来
-        m_rx_reorder.store(seq, payload, len);
+        m_rx_reorder.store(seq, payload, len, meta);
     }
     else if (result == arq::RxResult::Duplicate)
     {
@@ -556,7 +556,7 @@ void ArqLink::on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u
     unlock();
 }
 
-void ArqLink::deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u16 last)
+void ArqLink::deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u8 first_meta, u16 last)
 {
     u8 peer_mac[6] = {};
     const bool peer_known = m_peer_known;
@@ -569,9 +569,10 @@ void ArqLink::deliver_range_locked(u16 first, const u8 *first_payload, u16 first
     {
         const u8 *payload = first_payload;
         u16 len = first_len;
+        u8 meta = first_meta;
         if (seq != first)
         {
-            payload = m_rx_reorder.get(seq, &len);
+            payload = m_rx_reorder.get(seq, &len, &meta);
             if (payload == nullptr)
             {
                 // 区间内没有载荷：对端声明放弃的空洞，跳过不交付
@@ -585,7 +586,7 @@ void ArqLink::deliver_range_locked(u16 first, const u8 *first_payload, u16 first
 
         if (m_callbacks.deliver != nullptr)
         {
-            m_callbacks.deliver(m_callbacks.ctx, peer_known ? peer_mac : nullptr, seq, payload, len);
+            m_callbacks.deliver(m_callbacks.ctx, peer_known ? peer_mac : nullptr, seq, payload, len, meta);
         }
 
         if (seq != first)
@@ -763,7 +764,7 @@ u32 ArqLink::next_deadline_ms() const
     return best;
 }
 
-ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq_out)
+ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out)
 {
     Action actions[MAX_ACTIONS];
 
@@ -786,6 +787,7 @@ ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq
             action.kind = Action::Kind::Message;
             action.seq = 0;
             action.len = len;
+            action.meta = meta;
             action.ack = m_receiver.ack();
             action.sack = m_receiver.sack_bitmap();
             action.window = m_receiver.window();
@@ -799,7 +801,7 @@ ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq
     }
     else if (m_peer_known && m_established)
     {
-        switch (m_sender.submit(payload, len, now_ms, seq_out))
+        switch (m_sender.submit(payload, len, meta, now_ms, seq_out))
         {
         case arq::SubmitResult::Ok:
             result = Submit::Ok;
@@ -827,7 +829,8 @@ ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u32 now_ms, u16 *seq
 ArqLink::Submit ArqLink::submit_response(u16 cmd_seq, const u8 *payload, u16 len, u32 now_ms)
 {
     u16 resp_seq = 0;
-    const Submit result = submit(payload, len, now_ms, &resp_seq);
+    // 响应帧没有通道字段：meta 只在命令方向有意义，接收侧（USB 侧）忽略它
+    const Submit result = submit(payload, len, 0, now_ms, &resp_seq);
     if (result != Submit::Ok)
     {
         return result;
@@ -874,7 +877,8 @@ ArqLink::Snapshot ArqLink::snapshot() const
 
 // ---- 核心回调 ----
 
-void ArqLink::core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before)
+void ArqLink::core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
+                            u8 meta)
 {
     (void)payload;
     auto *self = static_cast<ArqLink *>(raw);
@@ -884,6 +888,7 @@ void ArqLink::core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool
     action.kind = Action::Kind::Message;
     action.seq = seq;
     action.len = len;
+    action.meta = meta;
     action.retransmit = retransmit;
     action.gap_before = gap_before;
     action.ack = self->m_receiver.ack();

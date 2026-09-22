@@ -140,8 +140,10 @@ constexpr u8 HID_REPORT_DESCRIPTOR[] = {
 };
 
 // HID 报告长度 = DAP_PACKET_SIZE（64）：CMSIS-DAP v1 的一条命令/响应占满一个
-// 定长报告，短数据补零。
-constexpr u16 HID_REPORT_SIZE = DAP_PACKET_SIZE;
+// 定长报告，短数据补零。数值取自公共常量（无线对端回答 DAP_Info 单包尺寸时也用
+// 它），这里在编译期校验它与 CMSIS-DAP 的 DAP_PACKET_SIZE 一致。
+constexpr u16 HID_REPORT_SIZE = DAP_HID_PACKET_SIZE;
+static_assert(HID_REPORT_SIZE == DAP_PACKET_SIZE, "HID report size must match CMSIS-DAP packet size");
 
 // TinyUSB HID 类实例序号（≠ USB 接口号）：本固件只有一个 HID 接口
 constexpr u8 HID_INSTANCE = 0;
@@ -425,6 +427,8 @@ struct PendingWirelessCommand
 {
     bool used = false;
     u16 seq = 0;
+    /** 命令号（请求首字节）：销账日志用它指明失败的是哪条命令 */
+    u8 cmd_id = 0;
     DapSource source = DapSource::VendorBulk;
     u16 request_len = 0;
     TickType_t sent_tick = 0;
@@ -487,6 +491,7 @@ PendingWirelessCommand *find_pending(DapTaskContext &ctx, u16 seq)
 void submit_wireless_command(DapTaskContext &ctx, const u8 *cmd, u16 len)
 {
     auto &app = mlink::Application::get_instance();
+    const u8 cmd_id = (len > 0) ? cmd[0] : 0;
 
     PendingWirelessCommand *slot = nullptr;
     for (PendingWirelessCommand &pending : ctx.pending)
@@ -499,21 +504,26 @@ void submit_wireless_command(DapTaskContext &ctx, const u8 *cmd, u16 len)
     }
     if (slot == nullptr)
     {
-        ESP_LOGW(TAG, "no free in-flight slot, %u-byte wireless DAP command dropped", static_cast<unsigned>(len));
+        ESP_LOGW(TAG, "no free in-flight slot, DAP cmd 0x%02X (%s) len=%u dropped", cmd_id, dap_command_name(cmd_id),
+                 static_cast<unsigned>(len));
         return;
     }
 
     u16 seq = 0;
-    const esp_err_t ret = app.wireless_link().submit_dap_command(cmd, len, &seq);
+    // 通道标记随命令送到对端：对端据此回答 DAP_Info 的单包尺寸，HID 与 bulk 的
+    // 可承载命令大小不同（见 DAP_CHANNEL_*）
+    const u8 channel = (ctx.source == DapSource::Hid) ? DAP_CHANNEL_HID : DAP_CHANNEL_VENDOR_BULK;
+    const esp_err_t ret = app.wireless_link().submit_dap_command(cmd, len, channel, &seq);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "cannot submit %u-byte wireless DAP command: %s", static_cast<unsigned>(len),
-                 esp_err_to_name(ret));
+        ESP_LOGW(TAG, "cannot submit DAP cmd 0x%02X (%s) len=%u: %s", cmd_id, dap_command_name(cmd_id),
+                 static_cast<unsigned>(len), esp_err_to_name(ret));
         return;
     }
 
     slot->used = true;
     slot->seq = seq;
+    slot->cmd_id = cmd_id;
     slot->source = ctx.source;
     slot->request_len = len;
     slot->sent_tick = xTaskGetTickCount();
@@ -563,7 +573,9 @@ void drain_wireless_responses(DapTaskContext &ctx)
         {
             continue;
         }
-        ESP_LOGW(TAG, "wireless DAP command seq=%u failed after all retries, no response sent", failed_seq);
+        ESP_LOGW(TAG, "wireless DAP command seq=%u cmd=0x%02X (%s) len=%u failed after all retries, no response sent",
+                 failed_seq, pending->cmd_id, dap_command_name(pending->cmd_id),
+                 static_cast<unsigned>(pending->request_len));
         pending->used = false;
     }
 
@@ -580,8 +592,9 @@ void drain_wireless_responses(DapTaskContext &ctx)
         {
             continue;
         }
-        ESP_LOGW(TAG, "wireless DAP command seq=%u timed out after %u ms, no response sent", pending.seq,
-                 static_cast<unsigned>(waited_ms));
+        ESP_LOGW(TAG, "wireless DAP command seq=%u cmd=0x%02X (%s) len=%u timed out after %u ms, no response sent",
+                 pending.seq, pending.cmd_id, dap_command_name(pending.cmd_id),
+                 static_cast<unsigned>(pending.request_len), static_cast<unsigned>(waited_ms));
         pending.used = false;
     }
 }
