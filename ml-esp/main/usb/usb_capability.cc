@@ -41,9 +41,16 @@ mlink::NvsKeyString<USB_LANDING_PAGE_MAX_LEN> g_usb_landing_page_key(NVS_KEY_USB
 
 // ---- MS OS 2.0 描述符集（GET_DESCRIPTOR_SET 的响应体）----
 // 布局对齐《Microsoft OS 2.0 Descriptors Specification》：集合头 + 配置/
-// 功能子集头 + Compatible ID("WINUSB")。本设备是复合设备（含 CDC），裸
-// Compatible ID 无接口范围、Windows 不会套用到任何子功能上，必须用子集
-// 圈定到 DAP vendor 接口，才会自动绑定 winusb.sys 且不干扰 CDC。
+// 功能子集头 + Compatible ID("WINUSB") + 注册表属性(DeviceInterfaceGUID) +
+// vendor revision。本设备是复合设备（含 CDC），裸 Compatible ID 无接口范围、
+// Windows 不会套用到任何子功能上，必须用子集圈定到 DAP vendor 接口，才会自动
+// 绑定 winusb.sys 且不干扰 CDC。
+//
+// 注册表属性是另一半：Windows 8+ 免驱只要求 Compatible ID，而调试器（Keil /
+// OpenOCD / pyOCD）是按 DeviceInterfaceGUID **枚举 CMSIS-DAP v2 设备**的。缺了
+// 它，主机侧驱动装上了却没有工具能找到这条通道，主机只能退回 HID——而定长 64B 的
+// HID 报告装不下按 bulk 上限算出来的命令。GUID 与配置方式见 ARM 的 CMSIS-DAP
+// 文档 dap_firmware.md（"Additional settings for Microsoft Windows"）。
 
 /** dwWindowsVersion：声明由 Windows 8.1+ 处理本描述符集（与 BOS 平台能力一致） */
 constexpr u32 MS_OS_20_WINDOWS_VERSION = 0x06030000;
@@ -54,9 +61,21 @@ constexpr size_t MS_OS_20_FUNCTION_SUBSET_HEADER_LEN = 8;
 constexpr size_t MS_OS_20_COMPATIBLE_ID_LEN = 20;
 constexpr size_t MS_OS_20_VENDOR_REVISION_LEN = 6;
 
-/** 功能子集长度：子集头 + Compatible ID + vendor revision */
-constexpr size_t MS_OS_20_FUNCTION_SUBSET_LEN =
-    MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN + MS_OS_20_VENDOR_REVISION_LEN;
+/** 注册表属性描述符（规范 Table 9）：头 8B + 属性名 + 数据长度 2B + 数据 */
+constexpr size_t MS_OS_20_REG_PROPERTY_HEADER_LEN = 8;
+/** PropertyName = "DeviceInterfaceGUID\0"：19 字符 + 结尾 NUL，UTF-16LE 共 40B */
+constexpr size_t MS_OS_20_REG_PROPERTY_NAME_LEN = 40;
+/** PropertyData = GUID 字符串 + 结尾 NUL：38 字符 + 结尾 NUL，UTF-16LE 共 78B */
+constexpr size_t MS_OS_20_REG_PROPERTY_DATA_LEN = 78;
+constexpr size_t MS_OS_20_REG_PROPERTY_LEN = MS_OS_20_REG_PROPERTY_HEADER_LEN + MS_OS_20_REG_PROPERTY_NAME_LEN + 2 +
+                                             MS_OS_20_REG_PROPERTY_DATA_LEN;
+
+/** 注册表属性数据类型：REG_SZ（规范 Table 10） */
+constexpr u16 MS_OS_20_REG_SZ = 0x0001;
+
+/** 功能子集长度：子集头 + Compatible ID + 注册表属性 + vendor revision */
+constexpr size_t MS_OS_20_FUNCTION_SUBSET_LEN = MS_OS_20_FUNCTION_SUBSET_HEADER_LEN + MS_OS_20_COMPATIBLE_ID_LEN +
+                                                MS_OS_20_REG_PROPERTY_LEN + MS_OS_20_VENDOR_REVISION_LEN;
 
 // 零填充辅助
 #define MS_OS_20_PAD_4 0x00, 0x00, 0x00, 0x00
@@ -85,6 +104,25 @@ constexpr size_t MS_OS_20_FUNCTION_SUBSET_LEN =
         'B', 0x00, 0x00, /* CompatibleID */                                                                            \
         MS_OS_20_PAD_8   /* SubCompatibleID */
 
+// 属性名 "DeviceInterfaceGUID\0" 与属性数据（CMSIS-DAP v2 的 WinUSB 接口 GUID）的
+// UTF-16LE 字节：ASCII 字符逐字符后跟 0x00，末尾各带一个 UTF-16 的 NUL
+#define MS_OS_20_UTF16_PROP_NAME_DEVICE_INTERFACE_GUID                                                                  \
+    'D', 0x00, 'e', 0x00, 'v', 0x00, 'i', 0x00, 'c', 0x00, 'e', 0x00, 'I', 0x00, 'n', 0x00, 't', 0x00, 'e', 0x00,         \
+        'r', 0x00, 'f', 0x00, 'a', 0x00, 'c', 0x00, 'e', 0x00, 'G', 0x00, 'U', 0x00, 'I', 0x00, 'D', 0x00, 0x00, 0x00
+
+#define MS_OS_20_UTF16_CMSIS_DAP_V2_GUID                                                                                \
+    '{', 0x00, 'C', 0x00, 'D', 0x00, 'B', 0x00, '3', 0x00, 'B', 0x00, '5', 0x00, 'A', 0x00, 'D', 0x00, '-', 0x00, '2',   \
+        0x00, '9', 0x00, '3', 0x00, 'B', 0x00, '-', 0x00, '4', 0x00, '6', 0x00, '6', 0x00, '3', 0x00, '-', 0x00, 'A',   \
+        0x00, 'A', 0x00, '3', 0x00, '6', 0x00, '-', 0x00, '1', 0x00, 'A', 0x00, 'A', 0x00, 'E', 0x00, '4', 0x00, '6',   \
+        0x00, '4', 0x00, '6', 0x00, '3', 0x00, '7', 0x00, '7', 0x00, '6', 0x00, '}', 0x00, 0x00, 0x00
+
+// 注册表属性描述符：把 CMSIS-DAP v2 的接口 GUID 注册给主机，调试器据此枚举 v2 设备
+#define MS_OS_20_DESC_REG_PROPERTY_DEVICE_INTERFACE_GUID()                                                             \
+    U16_TO_U8S_LE(MS_OS_20_REG_PROPERTY_LEN), U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),                           \
+        U16_TO_U8S_LE(MS_OS_20_REG_SZ), U16_TO_U8S_LE(MS_OS_20_REG_PROPERTY_NAME_LEN),                                 \
+        MS_OS_20_UTF16_PROP_NAME_DEVICE_INTERFACE_GUID, U16_TO_U8S_LE(MS_OS_20_REG_PROPERTY_DATA_LEN),                 \
+        MS_OS_20_UTF16_CMSIS_DAP_V2_GUID
+
 // Vendor revision 描述符：复合设备的每个功能子集都必须携带（规范 Table 19），
 // 其数值变化是主机刷新已缓存 MSOS 属性的依据
 #define MS_OS_20_DESC_VENDOR_REVISION(_revision)                                                                       \
@@ -96,7 +134,8 @@ u8 MS_OS_DESCRIPTOR_SET[] = {
     MS_OS_20_DESC_CONFIG_SUBSET(0, MS_OS_20_CONFIG_SUBSET_HEADER_LEN + MS_OS_20_FUNCTION_SUBSET_LEN),
     MS_OS_20_DESC_FUNCTION_SUBSET(USB_CAPABILITY_INTERFACE, MS_OS_20_FUNCTION_SUBSET_LEN),
     MS_OS_20_DESC_COMPATIBLE_ID_WINUSB(),
-    MS_OS_20_DESC_VENDOR_REVISION(1),
+    MS_OS_20_DESC_REG_PROPERTY_DEVICE_INTERFACE_GUID(),
+    MS_OS_20_DESC_VENDOR_REVISION(2),
 };
 
 // 长度自洽：BOS 平台能力里的 wDescriptorSetLength 与 USB_MS_OS_DESCRIPTOR_SET_LEN 引用同一长度
