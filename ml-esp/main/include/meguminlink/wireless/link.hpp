@@ -101,10 +101,13 @@ class WirelessLink
     esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len);
 
     /**
-     * 打包一段串口数据为 UartData 帧并发送给对端（尽力而为，不重传）。
+     * 打包一段串口数据并发送给对端（尽力而为，不重传）。
+     * @param source 数据来自本机哪个端口：UartSource::Host 封成 UartFromHost 帧
+     *               （对端写它的 UART TX），UartSource::Target 封成 UartFromTarget
+     *               帧（对端写它的 CDC）
      * @param len 数据长度（> MAX_UART_PAYLOAD_SIZE 时拒绝）
      */
-    esp_err_t send_uart_data(const u8 *dest_mac, const u8 *data, size_t len);
+    esp_err_t send_uart_data(const u8 *dest_mac, const u8 *data, size_t len, UartSource source);
 
     /**
      * 打包线编码参数为 UartLineCoding 帧并发送给对端（尽力而为，不重传）。

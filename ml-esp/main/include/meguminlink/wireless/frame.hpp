@@ -110,8 +110,8 @@ struct DapResponse
 
 /**
  * 无线转发的串口数据（尽力而为，不重传）：PC 侧 CDC ↔ 目标侧 UART 双向。
- * 角色天然区分数据方向：发送端（USB 侧）把 CDC RX 打包发送，接收端
- * （无 USB 侧）把收到的帧写入 UART TX；反向同理。数据段上限
+ * 数据方向由帧类型承载（UartFromHost / UartFromTarget），接收方据此决定写本机
+ * UART 还是本机 CDC，两端因此不必约定谁是 PC 侧、谁是目标侧。数据段上限
  * MAX_UART_PAYLOAD_SIZE = 200B，与 DapCommand 同为指针视图。
  */
 struct UartData
@@ -235,6 +235,17 @@ struct ArqReset
 inline constexpr size_t ARQ_RESET_PAYLOAD_SIZE = 4 + 4 + 4 + 10 + 2;
 #endif
 
+/**
+ * 串口数据的来源端口。帧类型由它决定（UartFromHost / UartFromTarget），接收方
+ * 按同一方向把数据写进对侧端口：来自主机的写本机 UART TX，来自目标板的写本机
+ * CDC。两端因此不需要约定谁是 PC 侧、谁是目标侧。
+ */
+enum class UartSource : u8
+{
+    Host,   /**< 来自主机侧 USB CDC */
+    Target, /**< 来自目标侧 UART */
+};
+
 enum class PacketType
 {
     Probe,
@@ -242,7 +253,8 @@ enum class PacketType
     PairingAccepted, /** 接受配对请求，作为对`PairingRequest`的回应 */
     DapCommand,      /** 无线转发的 DAP 命令载荷（USB 收到的 CMSIS-DAP 请求原样打包） */
     DapResponse,     /** 无线回传的 DAP 响应载荷（接收端执行 DAP 命令的结果原样打包） */
-    UartData,        /** 无线转发的串口数据载荷（PC↔目标 UART 双向，尽力而为） */
+    UartFromHost,    /** 串口数据载荷：来源是主机侧 CDC，接收方写本机 UART TX */
+    UartFromTarget,  /** 串口数据载荷：来源是目标侧 UART，接收方写本机 CDC */
     UartLineCoding,  /** 无线同步的 UART 线编码载荷（PC 端 SET_LINE_CODING → 目标侧） */
     Ping,               /** 对端存活探测（定向单播给已配对 peer，对端回 Pong） */
     Pong,               /** 存活探测回显（token 原样带回，探测方据此结算 RTT） */
@@ -350,7 +362,8 @@ struct ReceivedPacket
         case PacketType::DapResponse:
             packet.payload.dap_response.data = storage;
             break;
-        case PacketType::UartData:
+        case PacketType::UartFromHost:
+        case PacketType::UartFromTarget:
             packet.payload.uart_data.data = storage;
             break;
         case PacketType::RelayedUsbControl:

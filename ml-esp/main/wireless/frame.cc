@@ -43,7 +43,8 @@ size_t Packet::serialized_size() const
         body = DAP_FRAME_HEADER_SIZE + payload.dap_response.len;
         break;
     }
-    case PacketType::UartData: {
+    case PacketType::UartFromHost:
+    case PacketType::UartFromTarget: {
         body = UART_FRAME_HEADER_SIZE + payload.uart_data.len;
         break;
     }
@@ -149,7 +150,8 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.data = storage;
         break;
     }
-    case PacketType::UartData: {
+    case PacketType::UartFromHost:
+    case PacketType::UartFromTarget: {
         auto &content = payload.uart_data;
         MLINK_CHECK_SIZE(p, 2);
         const u16 n = p.read_u16();
@@ -302,7 +304,8 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_bytes(content.data, content.len);
         break;
     }
-    case PacketType::UartData: {
+    case PacketType::UartFromHost:
+    case PacketType::UartFromTarget: {
         auto &content = payload.uart_data;
         if (content.data == nullptr || content.len > MAX_UART_PAYLOAD_SIZE)
         {

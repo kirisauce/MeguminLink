@@ -167,13 +167,18 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
 #endif
         return;
     }
-    case PacketType::UartData: {
-        // 串口数据直通投递（不经主循环）：与 DAP 命令同路径优化。接收端
-        // 动作由本机角色决定——USB 侧（S3）写 CDC，无 USB 侧（C3）写 UART
-        // （见 Application::on_uart_data）。入队/拷贝均为轻量操作，可安全
-        // 在 esp_wifi 任务上下文执行。
+    case PacketType::UartFromHost: {
+        // 串口数据直通投递（不经主循环）：与 DAP 命令同路径优化。方向由帧类型
+        // 承载——来自主机侧的写本机 UART TX（见 Application::on_uart_data）。
+        // 入队/拷贝均为轻量操作，可安全在 esp_wifi 任务上下文执行。
         const auto &uart = rp.packet.payload.uart_data;
-        app.on_uart_data(uart.data, uart.len);
+        app.on_uart_data(uart.data, uart.len, UartSource::Host);
+        return;
+    }
+    case PacketType::UartFromTarget: {
+        // 反方向：来自目标侧的串口数据，接收方写本机 CDC
+        const auto &uart = rp.packet.payload.uart_data;
+        app.on_uart_data(uart.data, uart.len, UartSource::Target);
         return;
     }
     case PacketType::UartLineCoding: {
@@ -458,7 +463,8 @@ bool WirelessLink::loss_should_drop(PacketType type)
 {
     // 白名单：只有 DAP 与串口数据帧过这道闸。配对、探测与配置通道控制帧一律
     // 放行，丢包率因此永远丢不掉"改回来"的那条控制请求。
-    if (type != PacketType::DapCommand && type != PacketType::DapResponse && type != PacketType::UartData)
+    if (type != PacketType::DapCommand && type != PacketType::DapResponse && type != PacketType::UartFromHost &&
+        type != PacketType::UartFromTarget)
     {
         return false;
     }
@@ -621,7 +627,7 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
     return send(dest_mac, packet);
 }
 
-esp_err_t WirelessLink::send_uart_data(const u8 *dest_mac, const u8 *data, size_t len)
+esp_err_t WirelessLink::send_uart_data(const u8 *dest_mac, const u8 *data, size_t len, UartSource source)
 {
     if (len > MAX_UART_PAYLOAD_SIZE)
     {
@@ -632,7 +638,7 @@ esp_err_t WirelessLink::send_uart_data(const u8 *dest_mac, const u8 *data, size_
 
     // Packet 为指针视图：data 指向调用方串口缓冲，零拷贝
     Packet packet;
-    packet.packet_type = PacketType::UartData;
+    packet.packet_type = (source == UartSource::Host) ? PacketType::UartFromHost : PacketType::UartFromTarget;
     auto &content = packet.payload.uart_data;
     content.len = static_cast<u16>(len);
     content.data = data;

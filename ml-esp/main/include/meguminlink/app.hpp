@@ -126,18 +126,22 @@ class Application
     ConfigChannel &config_channel();
 
     /**
-     * 本地串口口收到数据 → 打包 UartData 帧发给配对 peer（尽力而为）。
-     * 调用方：S3 侧 CDC RX 回调、C3 侧 UART 桥任务。未配对/发送失败时
-     * 丢弃（与 DAP 转发一致，PC 端串口无重试语义，丢了就是丢了）。
+     * 本机某个串口端口收到数据 → 打包无线帧发给配对 peer（尽力而为）。
+     * 调用方：S3 侧 CDC RX 回调与 UART 桥任务、C3 侧 UART 桥任务。未配对/
+     * 发送失败时丢弃（与 DAP 转发一致，PC 端串口无重试语义，丢了就是丢了）。
+     *
+     * @param source 数据来自哪个端口，决定帧类型：UartSource::Host 来自本机 CDC、
+     *               对端据此写它的 UART TX；UartSource::Target 来自本机 UART、
+     *               对端据此写它的 CDC
      */
-    void send_uart_data(const u8 *data, size_t len);
+    void send_uart_data(const u8 *data, size_t len, UartSource source);
 
     /**
-     * 收到无线 UartData 帧 → 写入本地串口（recv_cb 直通调用，esp_wifi
-     * 任务上下文）。接收端动作由本机角色决定：USB 侧（S3）写 CDC，
-     * 无 USB 侧（C3）写 UART。
+     * 收到无线串口数据帧 → 写入本机对侧端口（recv_cb 直通调用，esp_wifi
+     * 任务上下文）。方向由帧类型给出，与本机是 USB 侧还是目标侧无关：
+     * 来自主机侧的数据写本机 UART TX，来自目标侧的数据写本机 CDC。
      */
-    void on_uart_data(const u8 *data, size_t len);
+    void on_uart_data(const u8 *data, size_t len, UartSource source);
 
     /**
      * 本地串口线编码变化 → 打包 UartLineCoding 帧发给配对 peer（尽力而为）。
@@ -146,8 +150,9 @@ class Application
     void send_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     /**
-     * 收到无线 UartLineCoding 帧 → 应用到本地 UART（recv_cb 直通调用）。
-     * 仅无 USB 侧（C3）处理；USB 侧（S3）不会收到（目标侧不发），防御忽略。
+     * 收到无线 UartLineCoding 帧 → 应用到本机 UART（recv_cb 直通调用）。
+     * 无论本机是 USB 侧还是目标侧，收到就按它配置本地 UART：数据方向同源的
+     * 那块板才是真正驱动目标串口的一块。
      */
     void on_uart_line_coding(const payload::UartLineCoding &lc);
 

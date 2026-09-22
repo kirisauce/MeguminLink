@@ -183,18 +183,24 @@ class CmsisDapUsb
 
   public:
     /**
-     * 无线 UartData 帧到达 → 写入 CDC TX（recv_cb 直通调用，esp_wifi 任务
-     * 上下文；tinyusb_cdcacm_write_queue/flush 为任务安全 API）。
+     * 来自目标侧方向的无线串口帧到达 → 写入 CDC TX（recv_cb 直通调用，
+     * esp_wifi 任务上下文；tinyusb_cdcacm_write_queue/flush 为任务安全 API）。
      * 尽力而为：CDC TX FIFO 满时丢弃多余字节并告警。
      */
     void uart_data_to_cdc(const u8 *data, size_t len);
 
     /**
-     * 本地 UART 桥任务启停（apply_mode 调用）：仅 Local 模式运行，
-     * Wireless 模式下 S3 本地 UART1 无数据流，挂起任务避免空转。
-     * 幂等：重复 suspend/resume 安全。
+     * 来自主机侧方向的无线串口帧到达（或 Local 模式下 CDC 收到数据）→ 写入
+     * 本机 UART TX。尽力而为：TX 环形缓冲满时丢弃多余字节并告警。
      */
-    void set_uart_bridge_active(bool active);
+    void uart_data_to_uart(const u8 *data, size_t len);
+
+    /**
+     * 把一条线编码参数应用到本机 UART1。参数为 CDC 枚举原值，驱动不支持的
+     * 取值告警后跳过该项。调用方：Local 模式下的主机 SET_LINE_CODING，以及
+     * Wireless 模式下来自对端的 UartLineCoding 帧。
+     */
+    void configure_local_uart(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     /**
      * 主机是否已打开 CDC ACM 串口（TinyUSB 的 DTR，且总线就绪）。

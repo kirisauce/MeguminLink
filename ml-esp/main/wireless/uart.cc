@@ -181,7 +181,7 @@ void WirelessUartBridge::bridge_task_fn(void *arg)
                 {
                     break;
                 }
-                Application::get_instance().send_uart_data(buffer, static_cast<size_t>(len));
+                Application::get_instance().send_uart_data(buffer, static_cast<size_t>(len), UartSource::Target);
             }
             break;
         }
