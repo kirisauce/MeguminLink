@@ -226,7 +226,8 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 // 因此只做接收与校验；主机用 0x03 读出草稿状态（合法待应用 / 被拒 + 原因），
 // 合法才发 0x17 落盘生效。载荷格式非法（缺项或 TLV 越界）在 0x16 的 DATA
 // 阶段直接 STALL；内容非法（URL 超长或含非可打印字符、启用编译期未支持的
-// 能力）留在草稿状态里由 0x03 报出。
+// 能力）留在草稿状态里由 0x03 报出。载荷里 WebUSB / WinUSB / landing page
+// 三项必须齐全，HID 兼容模式是可选 tag（缺省沿用当前生效值）。
 namespace
 {
 constexpr u8 VENDOR_CODE = 0x4D;
@@ -486,12 +487,13 @@ enum : u8
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     TAG_CFG_LOSS_PERMILLE = 0x53, // u8：注入丢包率千分比 0-255
 #endif
-    TAG_USB_SUPPORTED = 0x60,    // u8：编译期支持的能力位（bit0 WebUSB / bit1 WinUSB）
+    TAG_USB_SUPPORTED = 0x60,    // u8：编译期支持的能力位（bit0 WebUSB / bit1 WinUSB / bit2 HID 兼容模式）
     TAG_USB_WEBUSB = 0x61,       // u8：WebUSB 生效值 0/1
     TAG_USB_WINUSB = 0x62,       // u8：WinUSB 生效值 0/1
     TAG_USB_LANDING_PAGE = 0x63, // string：landing page URL（生效值）
     TAG_USB_DRAFT = 0x64,        // u8：草稿状态 0=无草稿 1=待应用 2=被拒
     TAG_USB_DRAFT_REASON = 0x65, // u8：被拒原因（UsbConfigReject）
+    TAG_USB_HID_COMPAT = 0x66,   // u8：HID 兼容模式生效值 0/1（提交时可选，缺省沿用当前值）
 };
 
 usize tlv_u8(u8 *out, u8 tag, u8 value)
@@ -561,21 +563,26 @@ u8 pair_state()
 /** SetUsbConfig 载荷的解析结果 */
 struct ParsedUsbConfig
 {
+    /** 以当前生效配置为底：只出现在载荷里的项被覆盖 */
     UsbCapabilitySettings settings;
     /** landing page 的原始长度：超上限时草稿存截断值，但仍按原始长度报 TooLong */
     usize landing_page_len = 0;
-    /** 三项（WebUSB / WinUSB / landing page）是否齐全 */
+    /** 三项（WebUSB / WinUSB / landing page）是否齐全；HID 兼容模式是可选 tag */
     bool complete = false;
 };
 
 /**
- * 解析 SetUsbConfig 的 TLV 载荷（全量语义：三项都必须给出）。
+ * 解析 SetUsbConfig 的 TLV 载荷：WebUSB / WinUSB / landing page 必须给出，
+ * HID 兼容模式可选，缺省沿用 base。
  *
+ * @param[in] base 当前生效配置，作为草稿初值
  * @return true=格式合法；false=TLV 越界/缺项/取值长度不对（调用方在 DATA 阶段
  *         返回 false，由 TinyUSB 在状态阶段 STALL，主机端拿到传输失败）
  */
-bool parse_usb_config(const u8 *data, usize len, ParsedUsbConfig *out)
+bool parse_usb_config(const u8 *data, usize len, const UsbCapabilitySettings &base, ParsedUsbConfig *out)
 {
+    out->settings = base;
+
     bool has_webusb = false;
     bool has_winusb = false;
     bool has_landing_page = false;
@@ -631,6 +638,14 @@ bool parse_usb_config(const u8 *data, usize len, ParsedUsbConfig *out)
             has_landing_page = true;
             break;
         }
+
+        case TAG_USB_HID_COMPAT:
+            if (value_len != 1)
+            {
+                return false;
+            }
+            out->settings.hid_compat = value[0] != 0 ? 1 : 0;
+            break;
 
         default:
             break; // 未知 tag：忽略，便于将来扩展
@@ -788,6 +803,7 @@ u16 ConfigChannel::build_usb_config_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_USB_SUPPORTED, usb_capability_supported_mask());
     p += tlv_u8(m_response + p, TAG_USB_WEBUSB, active.webusb);
     p += tlv_u8(m_response + p, TAG_USB_WINUSB, active.winusb);
+    p += tlv_u8(m_response + p, TAG_USB_HID_COMPAT, active.hid_compat);
     p += tlv_str(m_response + p, TAG_USB_LANDING_PAGE, active.landing_page);
     p += tlv_u8(m_response + p, TAG_USB_DRAFT, usb_draft_state());
 
@@ -1025,7 +1041,8 @@ bool ConfigChannel::handle_link_config_out(u8 rhport, u8 stage, const tusb_contr
 bool ConfigChannel::stage_usb_config_draft(const u8 *data, usize len)
 {
     ParsedUsbConfig parsed;
-    if (!parse_usb_config(data, len, &parsed))
+    const UsbCapabilitySettings &active = Application::get_instance().usb().usb_capability();
+    if (!parse_usb_config(data, len, active, &parsed))
     {
         return false; // 格式非法：不改草稿，交回调用方在状态阶段 STALL
     }

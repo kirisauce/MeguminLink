@@ -12,12 +12,15 @@
 namespace mlink
 {
 /**
- * WebUSB / WinUSB 平台能力的运行时状态与描述符生成。
+ * USB 能力的运行时状态与描述符生成：WebUSB / WinUSB 平台能力，以及 HID 兼容模式。
  *
- * 两个能力各有编译期总开关（见 main/Kconfig.projbuild）：关掉的能力不进 BOS、
- * 不响应其厂商请求，运行时也无法启用。编译期启用时，是否向主机宣告由 NVS 里的
- * 运行时状态决定——配置通道（见 config_channel.cc）0x03 读、0x16 提交草稿、
- * 0x17 应用；应用即重建描述符并重新枚举 USB，主机重新读取 BOS 后才能看到变化。
+ * 每个能力各有编译期总开关（见 main/Kconfig.projbuild）：关掉的能力不进 BOS、
+ * 不响应其厂商请求、不进 USB 配置描述符，运行时也无法启用。编译期启用时，是否
+ * 向主机宣告由 NVS 里的运行时状态决定——配置通道（见 config_channel.cc）0x03 读、
+ * 0x16 提交草稿、0x17 应用；应用即重建描述符并重新枚举 USB。
+ *
+ * HID 兼容模式的总开关是 MEGUMINLINK_USB_HID_DAP_ENABLE（决定 CMSIS-DAP v1 传输
+ * 路径是否编入），运行状态默认关闭，开启后配置描述符里才有 HID 接口。
  *
  * landing page URL 出现在两处，内容始终一致：BOS 里 WebUSB 平台能力引用的
  * 字符串描述符（iLandingPage）与 GET_URL 厂商请求的响应描述符。上限受
@@ -46,6 +49,7 @@ enum : u8
 {
     USB_CAPABILITY_WEBUSB = 0x01,
     USB_CAPABILITY_WINUSB = 0x02,
+    USB_CAPABILITY_HID_COMPAT = 0x04, // HID 兼容模式：配置描述符里含 CMSIS-DAP v1 的 HID 接口
 };
 
 /** 草稿被拒的原因（GetUsbConfig 的 USB_DRAFT_REASON） */
@@ -62,11 +66,13 @@ struct UsbCapabilitySettings
 {
     u8 webusb = 0;
     u8 winusb = 0;
+    u8 hid_compat = 0;
     char landing_page[USB_LANDING_PAGE_MAX_LEN + 1] = {};
 
     bool operator==(const UsbCapabilitySettings &other) const
     {
-        return webusb == other.webusb && winusb == other.winusb && strcmp(landing_page, other.landing_page) == 0;
+        return webusb == other.webusb && winusb == other.winusb && hid_compat == other.hid_compat &&
+               strcmp(landing_page, other.landing_page) == 0;
     }
 };
 

@@ -5,7 +5,7 @@
 
     mlinkctl                     读一次统计快照（cmd 0x01 GET_STATS）
     mlinkctl config              读设备信息与配置项（cmd 0x02 GET_CONFIG）
-    mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / landing page（cmd 0x03）
+    mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / HID 兼容模式 / landing page（cmd 0x03）
     mlinkctl set-usb [...]       设置 USB 能力，保存后设备自动重新枚举（cmd 0x16 + 0x17）
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl set-rate <rate>     设置 ESP-NOW 发送速率档位，两端同时应用（cmd 0x19）
@@ -205,11 +205,13 @@ TAG_USB_WINUSB = 0x62
 TAG_USB_LANDING_PAGE = 0x63
 TAG_USB_DRAFT = 0x64
 TAG_USB_DRAFT_REASON = 0x65
+TAG_USB_HID_COMPAT = 0x66
 
 # landing page 上限 = esp_tinyusb 字符串描述符缓冲（128B）减头与结尾 NUL
 USB_LANDING_PAGE_MAX_LEN = 126
 USB_CAPABILITY_WEBUSB = 0x01
 USB_CAPABILITY_WINUSB = 0x02
+USB_CAPABILITY_HID_COMPAT = 0x04
 DRAFT = {0: "none", 1: "pending", 2: "rejected"}
 REJECT = {1: "too-long", 2: "invalid-char", 3: "unsupported"}
 
@@ -415,7 +417,11 @@ def render_usb(values):
     supported = u8_of(values, TAG_USB_SUPPORTED)
     compiled = [
         name
-        for bit, name in ((USB_CAPABILITY_WEBUSB, "webusb"), (USB_CAPABILITY_WINUSB, "winusb"))
+        for bit, name in (
+            (USB_CAPABILITY_WEBUSB, "webusb"),
+            (USB_CAPABILITY_WINUSB, "winusb"),
+            (USB_CAPABILITY_HID_COMPAT, "hid-compat"),
+        )
         if supported & bit
     ]
     draft = u8_of(values, TAG_USB_DRAFT)
@@ -423,6 +429,7 @@ def render_usb(values):
         f"compiled={','.join(compiled) if compiled else 'none'}",
         f"webusb={'on' if u8_of(values, TAG_USB_WEBUSB) else 'off'}",
         f"winusb={'on' if u8_of(values, TAG_USB_WINUSB) else 'off'}",
+        f"hid_compat={'on' if u8_of(values, TAG_USB_HID_COMPAT) else 'off'}",
         f"landing_page={values.get(TAG_USB_LANDING_PAGE, b'').decode('utf-8', 'replace')}",
         f"draft={DRAFT.get(draft, '?')}",
     ]
@@ -559,30 +566,40 @@ def cmd_set_link(args):
 
 
 def cmd_set_usb(args):
-    if args.webusb is None and args.winusb is None and args.landing_page is None:
-        die("至少要指定 --webusb / --winusb / --landing-page 之一")
+    if (
+        args.webusb is None
+        and args.winusb is None
+        and args.hid_compat is None
+        and args.landing_page is None
+    ):
+        die("至少要指定 --webusb / --winusb / --hid-compat / --landing-page 之一")
 
     dev = find_device()
     current = decode(fetch(dev, CMD_GET_USB_CONFIG))
 
     webusb = u8_of(current, TAG_USB_WEBUSB)
     winusb = u8_of(current, TAG_USB_WINUSB)
+    hid_compat = u8_of(current, TAG_USB_HID_COMPAT)
     landing = current.get(TAG_USB_LANDING_PAGE, b"").decode("utf-8", "replace")
 
     if args.webusb is not None:
         webusb = 1 if args.webusb == "on" else 0
     if args.winusb is not None:
         winusb = 1 if args.winusb == "on" else 0
+    if args.hid_compat is not None:
+        hid_compat = 1 if args.hid_compat == "on" else 0
     if args.landing_page is not None:
         landing = args.landing_page
     check_landing_page(landing)
 
-    # 全量提交：设备端按 WebUSB + WinUSB + landing page 三项整体替换草稿
+    # 全量提交三项；HID 兼容模式只在指定时下发，设备端沿用当前值
     payload = (
         encode_tlv(TAG_USB_WEBUSB, bytes([webusb]))
         + encode_tlv(TAG_USB_WINUSB, bytes([winusb]))
         + encode_tlv(TAG_USB_LANDING_PAGE, landing.encode("utf-8"))
     )
+    if args.hid_compat is not None:
+        payload += encode_tlv(TAG_USB_HID_COMPAT, bytes([hid_compat]))
     try:
         dev.ctrl_transfer(0x40, VENDOR_CODE, CMD_SET_USB_CONFIG, 0, payload, TIMEOUT_MS)
     except usb.core.USBError as err:
@@ -597,7 +614,10 @@ def cmd_set_usb(args):
         die("设备端没有待应用的草稿（可能被其他客户端清掉了）")
 
     decode(fetch(dev, CMD_APPLY_USB_CONFIG))
-    print(f"status=ok webusb={'on' if webusb else 'off'} winusb={'on' if winusb else 'off'} landing_page={landing}")
+    print(
+        f"status=ok webusb={'on' if webusb else 'off'} winusb={'on' if winusb else 'off'} "
+        f"hid_compat={'on' if hid_compat else 'off'} landing_page={landing}"
+    )
     print("mlinkctl: 设备正在重新枚举 USB，稍后需要重新识别设备", file=sys.stderr)
 
 
@@ -727,13 +747,18 @@ def build_parser():
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("config", help="读设备信息与配置项").set_defaults(handler=cmd_read_config)
-    subparsers.add_parser("usb", help="读 USB 能力（WebUSB / WinUSB / landing page）").set_defaults(
+    subparsers.add_parser("usb", help="读 USB 能力（WebUSB / WinUSB / HID 兼容模式 / landing page）").set_defaults(
         handler=cmd_read_usb
     )
 
     set_usb = subparsers.add_parser("set-usb", help="设置 USB 能力，保存后设备自动重新枚举")
     set_usb.add_argument("--webusb", choices=("on", "off"), help="WebUSB 能力开关")
     set_usb.add_argument("--winusb", choices=("on", "off"), help="WinUSB 自动识别驱动开关")
+    set_usb.add_argument(
+        "--hid-compat",
+        choices=("on", "off"),
+        help="HID 兼容模式：暴露 CMSIS-DAP v1 的 HID 接口（未编译该功能时设备拒绝开启）",
+    )
     set_usb.add_argument("--landing-page", metavar="URL", help="WebUSB landing page URL（空串回退默认值）")
     set_usb.set_defaults(handler=cmd_set_usb)
 

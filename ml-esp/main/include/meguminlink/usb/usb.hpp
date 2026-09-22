@@ -5,6 +5,7 @@
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
+#include <tusb.h>
 
 #include <array>
 
@@ -35,6 +36,79 @@ enum class UsbStringIndex
 };
 
 /**
+ * USB 配置描述符构建器：接口段按插入顺序拼装、接口号顺延，配置头在收尾时回填。
+ *
+ * 缓冲常驻：esp_tinyusb 安装时取走它的地址，主机按描述符自身的 wTotalLength
+ * 读取，因此重建只改内容、不改地址。重建在 USB 断开窗口内进行（见
+ * CmsisDapUsb::apply_usb_capability）。
+ */
+class UsbConfigurationDescriptor
+{
+  public:
+    /** 描述符首地址 */
+    const u8 *data() const
+    {
+        return m_buffer;
+    }
+
+    /** 按生效的 USB 能力重建：HID 兼容模式决定是否插入 HID 接口 */
+    void rebuild(const UsbCapabilitySettings &settings);
+
+  private:
+    // 端点地址（方向位在最高位）：各接口段的端点不得与其它接口冲突
+    static constexpr u8 EP_DAP_OUT = 0x02; // Bulk OUT：命令
+    static constexpr u8 EP_DAP_IN = 0x83;  // Bulk IN ：响应
+
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    static constexpr u8 EP_CDC_NOTIF = 0x84; // Interrupt IN：CDC 通知
+    static constexpr u8 EP_CDC_OUT = 0x03;   // Bulk OUT：CDC 数据
+    static constexpr u8 EP_CDC_IN = 0x81;    // Bulk IN ：CDC 数据
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    static constexpr u8 EP_HID_OUT = 0x01; // Interrupt OUT：命令
+    static constexpr u8 EP_HID_IN = 0x82;  // Interrupt IN ：响应
+#endif
+
+    /** 缓冲容量：编译期最长布局（HID 接口段计入上界，按需插入的接口不会更长） */
+    static constexpr usize CAPACITY = TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+                                      + TUD_CDC_DESC_LEN
+#endif
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+                                      + TUD_HID_INOUT_DESC_LEN
+#endif
+        ;
+
+    /** 写入配置头并复位接口号 */
+    void begin();
+
+    /** 追加 CMSIS-DAP v2 的 vendor specific 接口（bulk 端点对） */
+    void add_dap_interface();
+
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    /** 追加 UART 透传的 CDC ACM 接口组（IAD + 通信接口 + 数据接口） */
+    void add_uart_bridge_interface();
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    /** 追加 CMSIS-DAP v1 的 HID 接口（中断端点对） */
+    void add_hid_interface();
+#endif
+
+    /** 回填配置头的 bNumInterfaces 与 wTotalLength */
+    void finish();
+
+    /** 追加一段描述符字节 */
+    void append(const u8 *bytes, usize len);
+
+    u8 m_buffer[CAPACITY] = {};
+    usize m_len = 0;
+    /** 下一个待分配的接口号（连续分配，收尾时即接口数） */
+    u8 m_next_interface = 0;
+};
+
+/**
  * CMSIS-DAP USB 设备（复合设备）。
  *
  * 仅负责描述符与 TinyUSB 驱动初始化；DAP 命令处理在 usb.cc 的 dap_task 中。
@@ -60,10 +134,16 @@ class CmsisDapUsb
      */
     void set_enabled(bool enabled);
 
-    /** 当前生效的 USB 能力配置（BOS 描述符据此构造） */
+    /** 当前生效的 USB 能力配置（BOS 与配置描述符据此构造） */
     const UsbCapabilitySettings &usb_capability() const
     {
         return m_usb_capability;
+    }
+
+    /** HID 接口当前是否对主机暴露（HID 兼容模式开启时才在配置描述符里） */
+    bool hid_exposed() const
+    {
+        return m_usb_capability.hid_compat != 0;
     }
 
     /** 描述符访问器：TinyUSB 的 BOS / GET_URL / GET_DESCRIPTOR_SET 回调用它取数据 */
@@ -74,7 +154,7 @@ class CmsisDapUsb
 
     /**
      * 应用新的 USB 能力配置：断开总线 → 重建描述符（BOS、GET_URL、iLandingPage
-     * 字符串指向的内容）→ 重新连接，主机重新读取描述符后新配置才可见。
+     * 字符串与 USB 配置描述符）→ 重新连接，主机重新读取描述符后新配置才可见。
      *
      * 重建放在断开窗口内：此时主机已停止请求描述符，描述符缓冲与字符串内容
      * 不会被 TinyUSB 任务并发读取。NVS 落盘由调用方负责（见 app.cc）。
@@ -136,6 +216,8 @@ class CmsisDapUsb
      */
     UsbCapabilitySettings m_usb_capability;
     UsbCapabilityDescriptors m_usb_descriptors;
+    /** 配置描述符（HID 兼容模式决定是否含 HID 接口），按上面的能力状态构建 */
+    UsbConfigurationDescriptor m_config_descriptor;
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
     QueueHandle_t m_uart_queue;

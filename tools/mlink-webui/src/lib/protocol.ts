@@ -149,10 +149,12 @@ const TAG_USB_WINUSB = 0x62;
 const TAG_USB_LANDING_PAGE = 0x63;
 const TAG_USB_DRAFT = 0x64;
 const TAG_USB_DRAFT_REASON = 0x65;
+const TAG_USB_HID_COMPAT = 0x66;
 
 /** 编译期支持的能力位（UsbConfig.supported）。 */
 export const USB_CAPABILITY_WEBUSB = 0x01;
 export const USB_CAPABILITY_WINUSB = 0x02;
+export const USB_CAPABILITY_HID_COMPAT = 0x04;
 /** landing page 字符上限，与固件 usb_capability.hpp 一致。 */
 export const USB_LANDING_PAGE_MAX_LEN = 126;
 /** 草稿状态（UsbConfig.draft）：0 无草稿、1 合法待应用、2 被拒。 */
@@ -384,14 +386,15 @@ export type DeviceConfig = {
 /**
  * USB 能力快照（GetUsbConfig）。
  *
- * supported 是编译期支持位（bit0 WebUSB / bit1 WinUSB）：未编译进来的能力在
- * 界面上置灰。landingPage 为生效值（设备端已把空串解析成默认 URL），draft 为
- * 草稿状态，draftReason 只在被拒时有值。
+ * supported 是编译期支持位（bit0 WebUSB / bit1 WinUSB / bit2 HID 兼容模式）：
+ * 未编译进来的能力在界面上置灰。landingPage 为生效值（设备端已把空串解析成默认
+ * URL），draft 为草稿状态，draftReason 只在被拒时有值。
  */
 export type UsbConfig = {
 	supported: number;
 	webusb: number;
 	winusb: number;
+	hidCompat: number;
 	landingPage: string;
 	draft: number;
 	draftReason: number | null;
@@ -401,6 +404,7 @@ export type UsbConfig = {
 export type UsbCapability = {
 	webusb: number;
 	winusb: number;
+	hidCompat: number;
 	landingPage: string;
 };
 
@@ -580,6 +584,7 @@ export function decodeUsbConfig(frame: DataView): UsbConfig {
 		supported: readValue(tags.get(TAG_USB_SUPPORTED), false),
 		webusb: readValue(tags.get(TAG_USB_WEBUSB), false),
 		winusb: readValue(tags.get(TAG_USB_WINUSB), false),
+		hidCompat: readValue(tags.get(TAG_USB_HID_COMPAT), false),
 		landingPage: readText(tags.get(TAG_USB_LANDING_PAGE)),
 		draft: readValue(tags.get(TAG_USB_DRAFT), false),
 		draftReason: reason === undefined ? null : readValue(reason, false),
@@ -739,6 +744,7 @@ export async function writeUsbConfig(device: USBDevice, seq: number, config: Usb
 	const payload = concatBytes([
 		encodeTlv(TAG_USB_WEBUSB, new Uint8Array([config.webusb & 1])),
 		encodeTlv(TAG_USB_WINUSB, new Uint8Array([config.winusb & 1])),
+		encodeTlv(TAG_USB_HID_COMPAT, new Uint8Array([config.hidCompat & 1])),
 		encodeTlv(TAG_USB_LANDING_PAGE, encoder.encode(config.landingPage)),
 	]);
 

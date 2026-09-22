@@ -19,6 +19,7 @@ constexpr char TAG[] = "mlink::usb_capability";
 
 constexpr char NVS_KEY_USB_WEBUSB[] = "usb_webusb";
 constexpr char NVS_KEY_USB_WINUSB[] = "usb_winusb";
+constexpr char NVS_KEY_USB_HID_COMPAT[] = "usb_hid_compat";
 constexpr char NVS_KEY_USB_LANDING_PAGE[] = "usb_landing";
 
 #if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
@@ -34,9 +35,12 @@ static_assert(sizeof(LANDING_PAGE_DEFAULT) - 1 <= USB_LANDING_PAGE_MAX_LEN,
 /** WebUSB/WinUSB 默认启用；NVS 无记录时按此初始化，恢复出厂设置后回到这里 */
 constexpr u8 USB_WEBUSB_DEFAULT = 1;
 constexpr u8 USB_WINUSB_DEFAULT = 1;
+/** HID 兼容模式默认关闭：只有需要 CMSIS-DAP v1 的工具才打开 */
+constexpr u8 USB_HID_COMPAT_DEFAULT = 0;
 
 mlink::NvsKeyU8 g_usb_webusb_key(NVS_KEY_USB_WEBUSB, USB_WEBUSB_DEFAULT);
 mlink::NvsKeyU8 g_usb_winusb_key(NVS_KEY_USB_WINUSB, USB_WINUSB_DEFAULT);
+mlink::NvsKeyU8 g_usb_hid_compat_key(NVS_KEY_USB_HID_COMPAT, USB_HID_COMPAT_DEFAULT);
 mlink::NvsKeyString<USB_LANDING_PAGE_MAX_LEN> g_usb_landing_page_key(NVS_KEY_USB_LANDING_PAGE, LANDING_PAGE_DEFAULT);
 
 // ---- MS OS 2.0 描述符集（GET_DESCRIPTOR_SET 的响应体）----
@@ -154,6 +158,10 @@ u8 mlink::usb_capability_supported_mask()
     mask |= USB_CAPABILITY_WINUSB;
 #endif
 
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    mask |= USB_CAPABILITY_HID_COMPAT;
+#endif
+
     return mask;
 }
 
@@ -194,6 +202,10 @@ UsbConfigReject mlink::usb_capability_check(const UsbCapabilitySettings &setting
     {
         return UsbConfigReject::Unsupported;
     }
+    if (settings.hid_compat != 0 && (supported & USB_CAPABILITY_HID_COMPAT) == 0)
+    {
+        return UsbConfigReject::Unsupported;
+    }
 
     return usb_landing_page_check(settings.landing_page);
 }
@@ -208,6 +220,10 @@ UsbCapabilitySettings mlink::usb_capability_load()
 
 #if CONFIG_MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE
     settings.winusb = g_usb_winusb_key.get();
+#endif
+
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    settings.hid_compat = g_usb_hid_compat_key.get();
 #endif
 
     g_usb_landing_page_key.get(settings.landing_page, sizeof(settings.landing_page));
@@ -230,6 +246,13 @@ esp_err_t mlink::usb_capability_store(const UsbCapabilitySettings &settings)
     }
 #endif
 
+#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
+    if (ret == ESP_OK)
+    {
+        ret = g_usb_hid_compat_key.set(settings.hid_compat);
+    }
+#endif
+
     if (ret == ESP_OK)
     {
         ret = g_usb_landing_page_key.set(settings.landing_page);
@@ -243,6 +266,10 @@ esp_err_t mlink::usb_capability_erase()
     if (ret == ESP_OK)
     {
         ret = g_usb_winusb_key.erase();
+    }
+    if (ret == ESP_OK)
+    {
+        ret = g_usb_hid_compat_key.erase();
     }
     if (ret == ESP_OK)
     {

@@ -47,12 +47,13 @@ bun run preview
 - **WebUSB 能力**：是否在 BOS 描述符里宣告 WebUSB 平台能力，并提供 landing page 提示
 - **WinUSB 自动识别驱动**：是否宣告 Microsoft OS 2.0 能力，让 Windows 自动给 CMSIS-DAP 接口绑定 winusb.sys（免装驱动）
 - **WebUSB landing page**：BOS 里 `iLandingPage` 与 `GET_URL` 响应的 URL，最多 126 字符、只能是可打印 ASCII；留空表示回退固件里的默认值
+- **HID 兼容模式**：是否在配置描述符里插入 CMSIS-DAP v1 的 HID 接口，默认停用。只认 CMSIS-DAP v1 的调试器需要它，比如部分版本的 Keil；打开后设备会多出一个 HID 接口
 
-三项是 **草稿式** 编辑：点「保存并重新枚举」后设备先接收并校验草稿，页面再读一次校验结果，通过才让设备落盘生效。生效需要重新枚举 USB（BOS 描述符只在枚举时被主机读取），所以设备会软断开再连回来，页面在此期间显示「设备正在重新枚举 USB」并自动接回，正在进行的 OpenOCD / pyOCD 调试会断开。
+这些项是 **草稿式** 编辑：点「保存并重新枚举」后设备先接收并校验草稿，页面再读一次校验结果，通过才让设备落盘生效。生效需要重新枚举 USB（BOS 与配置描述符只在枚举时被主机读取），所以设备会软断开再连回来，页面在此期间显示「设备正在重新枚举 USB」并自动接回，正在进行的 OpenOCD / pyOCD 调试会断开。
 
-两项能力的**编译期总开关**在固件的 `MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE` / `MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE`：没编译进来的能力在界面上置灰，设备端也会拒绝启用。Windows 上把 WinUSB 关掉后，已经绑定过 winusb.sys 的设备实例要「卸载设备」再重新插拔才会彻底解除绑定。
+WebUSB / WinUSB 两项能力的**编译期总开关**在固件的 `MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE` / `MEGUMINLINK_USB_WINUSB_CAPABILITY_ENABLE`，HID 兼容模式的总开关是 `MEGUMINLINK_USB_HID_DAP_ENABLE`（决定 CMSIS-DAP v1 传输路径是否编入）：没编译进来的能力在界面上置灰，设备端也会拒绝启用。Windows 上把 WinUSB 关掉后，已经绑定过 winusb.sys 的设备实例要「卸载设备」再重新插拔才会彻底解除绑定。
 
-对应命令行工具是 `mlinkctl usb`（读）与 `mlinkctl set-usb [--webusb on|off] [--winusb on|off] [--landing-page URL]`。
+对应命令行工具是 `mlinkctl usb`（读）与 `mlinkctl set-usb [--webusb on|off] [--winusb on|off] [--hid-compat on|off] [--landing-page URL]`；`--hid-compat` 不带时设备沿用当前值。
 
 ## 显示约定
 

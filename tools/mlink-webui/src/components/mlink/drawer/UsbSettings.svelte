@@ -1,5 +1,10 @@
 <script lang="ts">
-	import { USB_CAPABILITY_WEBUSB, USB_CAPABILITY_WINUSB, landingPageError } from '../../../lib/protocol';
+	import {
+		USB_CAPABILITY_HID_COMPAT,
+		USB_CAPABILITY_WEBUSB,
+		USB_CAPABILITY_WINUSB,
+		landingPageError,
+	} from '../../../lib/protocol';
 	import type { MlinkSession } from '../../../lib/session.svelte';
 	import SegmentedControl from '../../ui/SegmentedControl.svelte';
 
@@ -10,6 +15,7 @@
 	/** 编译期未启用的能力置灰：设备端也拒绝把这类项置为启用。 */
 	const webusbSupported = $derived(((config?.supported ?? 0) & USB_CAPABILITY_WEBUSB) !== 0);
 	const winusbSupported = $derived(((config?.supported ?? 0) & USB_CAPABILITY_WINUSB) !== 0);
+	const hidCompatSupported = $derived(((config?.supported ?? 0) & USB_CAPABILITY_HID_COMPAT) !== 0);
 
 	const onOff = [
 		{ value: 1, label: '启用' },
@@ -19,6 +25,7 @@
 	/** 界面草稿：设备值每次刷新（首次读、保存后重读）都重置，未保存的编辑不跨刷新保留。 */
 	let webusb = $state(0);
 	let winusb = $state(0);
+	let hidCompat = $state(0);
 	let landingPage = $state('');
 
 	$effect(() => {
@@ -26,17 +33,22 @@
 		if (current === null) return;
 		webusb = current.webusb;
 		winusb = current.winusb;
+		hidCompat = current.hidCompat;
 		landingPage = current.landingPage;
 	});
 
 	const urlError = $derived(landingPageError(landingPage));
 	const dirty = $derived(
-		config !== null && (webusb !== config.webusb || winusb !== config.winusb || landingPage !== config.landingPage)
+		config !== null &&
+			(webusb !== config.webusb ||
+				winusb !== config.winusb ||
+				hidCompat !== config.hidCompat ||
+				landingPage !== config.landingPage)
 	);
 	const reconnecting = $derived(session.state === 'connecting' && session.device === null);
 
 	async function save(): Promise<void> {
-		await session.saveUsbConfig({ webusb, winusb, landingPage });
+		await session.saveUsbConfig({ webusb, winusb, hidCompat, landingPage });
 	}
 </script>
 
@@ -66,6 +78,17 @@
 	</div>
 
 	<div class="field">
+		<span class="label">HID 兼容模式</span>
+		<SegmentedControl
+			options={onOff}
+			value={hidCompat}
+			disabled={busy || !hidCompatSupported}
+			label="HID 兼容模式"
+			onchange={(value) => (hidCompat = value)}
+		/>
+	</div>
+
+	<div class="field">
 		<label class="label" for="usb-landing-page">WebUSB landing page</label>
 		<input
 			id="usb-landing-page"
@@ -78,8 +101,8 @@
 		/>
 	</div>
 
-	{#if !webusbSupported && !winusbSupported}
-		<p class="hint">当前固件未编译 WebUSB / WinUSB 能力，没有可调项。</p>
+	{#if !webusbSupported && !winusbSupported && !hidCompatSupported}
+		<p class="hint">当前固件未编译 WebUSB / WinUSB / HID 兼容模式，没有可调项。</p>
 	{/if}
 
 	{#if urlError !== null}
