@@ -141,9 +141,10 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     case PacketType::DapCommand: {
         const auto &cmd = rp.packet.payload.dap_command;
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-        // 可靠消息先过适配层：新帧才交付执行，重复帧只记下待重放，绝不重新执行
+        // 可靠消息先过适配层：新帧才交付执行，重复帧只记下待重放，绝不重新执行。
+        // 通道标记走 meta 的低 7 位，类型位留空（这条是命令）
         link.m_arq.on_message(rp.packet.arq.seq, (rp.packet.arq.flags & ARQ_FLAG_GAP_BEFORE) != 0, cmd.data, cmd.len,
-                              cmd.channel, arq_now);
+                              cmd.channel & ARQ_META_CHANNEL_MASK, arq_now);
 #else
         const esp_err_t ret = app.wireless_link().dap_execute(rp.src_mac, 0, cmd.data, cmd.len, cmd.channel);
         if (ret != ESP_OK)
@@ -157,9 +158,10 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
     case PacketType::DapResponse: {
         const auto &resp = rp.packet.payload.dap_response;
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-        // 响应帧没有通道字段：通道标记只在命令方向有意义，接收侧（USB 侧）忽略它
+        // 响应帧的线格式里没有通道字段，但类型位必须在适配层补上：ARQ 消息的去向
+        // 由 meta 的类型位决定，缺了它这条响应会被对端当成命令送进执行器
         link.m_arq.on_message(rp.packet.arq.seq, (rp.packet.arq.flags & ARQ_FLAG_GAP_BEFORE) != 0, resp.data,
-                              resp.len, 0, arq_now);
+                              resp.len, ARQ_META_RESPONSE, arq_now);
 #else
         app.push_wireless_response(0, resp.data, resp.len);
 #endif
@@ -811,8 +813,10 @@ void WirelessLink::dap_resp_sink(const u8 *data, u16 len, void *arg)
 
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     // 响应走可靠传输：序号与确认由适配层给，并记下它回的是哪条命令——对端重传
-    // 那条命令时据此重放这条响应，而不是把命令再执行一遍
-    const ArqLink::Submit result = link->m_arq.submit_response(link->m_dap_cmd_seq, data, len, now_ms());
+    // 那条命令时据此重放这条响应，而不是把命令再执行一遍。类型位标明这是响应，
+    // 对端据此把它交回 USB 转发路径
+    const ArqLink::Submit result =
+        link->m_arq.submit_response(link->m_dap_cmd_seq, data, len, ARQ_META_RESPONSE, now_ms());
     if (result != ArqLink::Submit::Ok)
     {
         ESP_LOGE(TAG, "Failed to submit DAP response: result %d", static_cast<int>(result));
@@ -928,7 +932,6 @@ void WirelessLink::arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, 
 
     // 本函数在适配层持锁时被调用，因此只能走 send_raw（它只取发送锁）
     Packet packet;
-    packet.packet_type = ARQ_MESSAGE_TYPE;
     packet.arq.seq = seq;
     packet.arq.ack = ack;
     packet.arq.sack = sack;
@@ -943,16 +946,21 @@ void WirelessLink::arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, 
         packet.arq.flags |= ARQ_FLAG_GAP_BEFORE;
     }
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-    // USB 侧发送的是命令
-    packet.payload.dap_command.len = len;
-    packet.payload.dap_command.channel = meta;
-    packet.payload.dap_command.data = payload;
-#else
-    // 无 USB 侧发送的是响应
-    packet.payload.dap_response.len = len;
-    packet.payload.dap_response.data = payload;
-#endif
+    // 类型位决定封成命令帧还是响应帧：命令帧多带一个主机侧通道标记（低 7 位），
+    // 响应帧不需要它——响应写回哪条 USB 通道由发送侧按在途表决定
+    if ((meta & ARQ_META_RESPONSE) != 0)
+    {
+        packet.packet_type = PacketType::DapResponse;
+        packet.payload.dap_response.len = len;
+        packet.payload.dap_response.data = payload;
+    }
+    else
+    {
+        packet.packet_type = PacketType::DapCommand;
+        packet.payload.dap_command.len = len;
+        packet.payload.dap_command.channel = meta & ARQ_META_CHANNEL_MASK;
+        packet.payload.dap_command.data = payload;
+    }
 
     const esp_err_t ret = self->send_raw(peer_mac, packet);
     if (ret != ESP_OK)
@@ -1013,33 +1021,31 @@ void WirelessLink::arq_send_reset(void *ctx, u32 epoch, const ArqSettings &setti
     }
 }
 
-void WirelessLink::arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 channel)
+void WirelessLink::arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 meta)
 {
     auto *self = static_cast<WirelessLink *>(ctx);
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-    // USB 侧收到的是响应：交给正在等待的转发路径。写缓冲 + give 信号量都是
-    // 非阻塞操作，因此在适配层持锁时调用是安全的。通道标记是命令侧的概念，
-    // 响应路径按在途表自己知道回哪条通道，这里用不上。
-    (void)self;
-    (void)peer_mac;
-    (void)seq;
-    (void)channel;
-    Application::get_instance().push_wireless_response(seq, payload, len);
-#else
-    // 无 USB 侧收到的是命令：入执行队列，序号与来源通道一并带上（序号用于回响应
-    // 时记账，通道决定执行器回答 DAP_Info 的单包尺寸）
+    // 类型位决定这条消息往哪送：响应交给正在等待的转发路径（写缓冲 + give
+    // 信号量都是非阻塞操作，因此在适配层持锁时调用是安全的；通道标记是命令侧
+    // 的概念，响应路径按在途表自己知道回哪条通道），命令入执行队列。
+    if ((meta & ARQ_META_RESPONSE) != 0)
+    {
+        Application::get_instance().push_wireless_response(seq, payload, len);
+        return;
+    }
+
+    // 命令：序号与来源通道一并带上（序号用于回响应时记账，通道决定执行器回答
+    // DAP_Info 的单包尺寸）
     if (peer_mac == nullptr)
     {
         ESP_LOGW(TAG, "ARQ command seq=%u dropped: peer unknown", seq);
         return;
     }
-    const esp_err_t ret = self->dap_execute(peer_mac, seq, payload, len, channel);
+    const esp_err_t ret = self->dap_execute(peer_mac, seq, payload, len, meta & ARQ_META_CHANNEL_MASK);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to enqueue ARQ DAP command seq=%u: %s", seq, esp_err_to_name(ret));
     }
-#endif
 }
 
 #endif // CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE

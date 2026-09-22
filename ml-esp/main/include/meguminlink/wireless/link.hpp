@@ -61,6 +61,20 @@ inline constexpr u8 DEFAULT_LOSS_PERMILLE = 0;
 inline constexpr u8 MAX_LOSS_PERMILLE = 255;
 #endif
 
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+/**
+ * 可靠传输消息的类型位：命令与响应走同一条 ARQ 实例，两端的角色（USB 转发侧 /
+ * 目标执行侧）由运行时接线决定，帧类型因此随消息走，而不是按本端编译配置一刀切。
+ *
+ * meta 是 arq 核心原样保存、重传与重放时原样带回的 1 字节（见 arq.hpp 的
+ * TransmitFn 与 ReorderStore），最高位在这里作类型标记，低 7 位继续承载主机侧
+ * USB 通道标记（DAP_CHANNEL_*，现值只占 0/1）。
+ */
+inline constexpr u8 ARQ_META_RESPONSE = 0x80;
+/** meta 里的通道标记掩码（去掉类型位） */
+inline constexpr u8 ARQ_META_CHANNEL_MASK = 0x7F;
+#endif
+
 /**
  * 无线链路：ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，状态全在对象内。
  * 与 usb.cc 的 dap_task（USB 侧执行接线）对称：无线传输层负责把收到的
@@ -258,21 +272,17 @@ class WirelessLink
     esp_err_t set_peer_rate(const u8 *peer_mac);
 
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    /** 可靠传输的输出回调：把核心给的消息/确认/重置封成帧送出去 */
+    /**
+     * 可靠传输的输出回调：把核心给的消息/确认/重置封成帧送出去。
+     * meta 的类型位决定本条消息封成命令帧还是响应帧（见 ARQ_META_RESPONSE）。
+     */
     static void arq_transmit(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before, u8 meta,
                              u16 ack, u16 sack, u8 window);
     static void arq_send_ack(void *ctx, u16 ack, u16 sack, u8 window);
     static void arq_send_reset(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
                                u8 window);
-    static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 channel);
-
-    /** 本端可靠传输发送的消息类型：USB 侧发命令，无 USB 侧发响应 */
-    static constexpr PacketType ARQ_MESSAGE_TYPE =
-#if CONFIG_MEGUMINLINK_USB_SUPPORT
-        PacketType::DapCommand;
-#else
-        PacketType::DapResponse;
-#endif
+    /** 一条按序交付的可靠消息：meta 的类型位决定它交给执行器还是入响应队列 */
+    static void arq_deliver(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 meta);
 #endif
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE

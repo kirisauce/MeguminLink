@@ -826,11 +826,11 @@ ArqLink::Submit ArqLink::submit(const u8 *payload, u16 len, u8 meta, u32 now_ms,
     return result;
 }
 
-ArqLink::Submit ArqLink::submit_response(u16 cmd_seq, const u8 *payload, u16 len, u32 now_ms)
+ArqLink::Submit ArqLink::submit_response(u16 cmd_seq, const u8 *payload, u16 len, u8 meta, u32 now_ms)
 {
     u16 resp_seq = 0;
-    // 响应帧没有通道字段：meta 只在命令方向有意义，接收侧（USB 侧）忽略它
-    const Submit result = submit(payload, len, 0, now_ms, &resp_seq);
+    // meta 由调用方给定：类型位标明这是响应，接收侧据此把它交给转发路径而不是执行器
+    const Submit result = submit(payload, len, meta, now_ms, &resp_seq);
     if (result != Submit::Ok)
     {
         return result;

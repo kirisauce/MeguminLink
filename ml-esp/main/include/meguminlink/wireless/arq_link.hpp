@@ -230,10 +230,13 @@ class ArqLink
     Submit submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out);
 
     /**
-     * 无 USB 侧专用：提交一条 DAP 响应，并记下它回应的是哪条命令。
+     * 提交一条 DAP 响应，并记下它回应的是哪条命令。
      * 对端重传那条命令时据此找回这条响应重放，从而不必重新执行命令。
+     *
+     * @param meta 随响应携带的 1 字节元数据；类型位须标明这是响应
+     *             （见 link.hpp 的 ARQ_META_RESPONSE），接收侧靠它分派去向
      */
-    Submit submit_response(u16 cmd_seq, const u8 *payload, u16 len, u32 now_ms);
+    Submit submit_response(u16 cmd_seq, const u8 *payload, u16 len, u8 meta, u32 now_ms);
 
     /** 会话重置：清窗口、重置序号基准，重新开始握手 */
     void reset_session(u32 now_ms);
