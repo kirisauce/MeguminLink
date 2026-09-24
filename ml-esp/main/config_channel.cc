@@ -197,14 +197,14 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 // 命令表（0x01-0x0F 只读，0x10-0x1F 动作）：
 //   0x01 GetStats       读统计快照
 //   0x02 GetConfig      读设备身份与配置项
-//   0x03 GetUsbConfig   读 USB 能力（生效值 + 草稿状态）
+//   0x03 GetUsbConfig   读 USB 能力与设备名（生效值 + 草稿状态）
 //   0x10 SetMode        参数 0=Local 1=Wireless，其他值回 malformed
 //   0x11 EnterPairing   进入配对流程（无线模式下有效，Local 记日志忽略）
 //   0x12 ClearPair      清除配对记录并进入配对流程
 //   0x13 Reset          恢复出厂设置：清除配对、模式与 USB 能力记录后重启
 //   0x14 Reboot         立即重启
 //   0x15 ExitPairing    退出配对流程（无线模式且配对进行中有效）
-//   0x16 SetUsbConfig   OUT：提交 USB 能力草稿，只校验不落盘不生效
+//   0x16 SetUsbConfig   OUT：提交 USB 能力与设备名草稿，只校验不落盘不生效
 //   0x17 ApplyUsbConfig 落盘草稿并应用（重建描述符 + 重新枚举 USB）
 //   0x18 Ping           探测已配对对端（存活与往返时延，结果走 GetStats）
 //   0x19 SetWifiRate    参数 = wifi_phy_rate_t 原值，ESP-NOW 发送速率档位
@@ -225,9 +225,9 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 // USB 能力三阶段（0x16 → 0x03 → 0x17）：0x16 是 OUT 请求、回不了状态帧，
 // 因此只做接收与校验；主机用 0x03 读出草稿状态（合法待应用 / 被拒 + 原因），
 // 合法才发 0x17 落盘生效。载荷格式非法（缺项或 TLV 越界）在 0x16 的 DATA
-// 阶段直接 STALL；内容非法（URL 超长或含非可打印字符、启用编译期未支持的
-// 能力）留在草稿状态里由 0x03 报出。载荷里 WebUSB / WinUSB / landing page
-// 三项必须齐全，HID 兼容模式是可选 tag（缺省沿用当前生效值）。
+// 阶段直接 STALL；内容非法（URL 或设备名超长、含非可打印字符、启用编译期未
+// 支持的能力）留在草稿状态里由 0x03 报出。载荷里 WebUSB / WinUSB / landing
+// page 三项必须齐全，HID 兼容模式与设备名是可选 tag（缺省沿用当前生效值）。
 namespace
 {
 constexpr u8 VENDOR_CODE = 0x4D;
@@ -494,6 +494,7 @@ enum : u8
     TAG_USB_DRAFT = 0x64,        // u8：草稿状态 0=无草稿 1=待应用 2=被拒
     TAG_USB_DRAFT_REASON = 0x65, // u8：被拒原因（UsbConfigReject）
     TAG_USB_HID_COMPAT = 0x66,   // u8：HID 兼容模式生效值 0/1（提交时可选，缺省沿用当前值）
+    TAG_USB_DEVICE_NAME = 0x67,  // string：自定义设备名（生效值，空串=不用自定义名；提交时可选）
 };
 
 usize tlv_u8(u8 *out, u8 tag, u8 value)
@@ -567,13 +568,15 @@ struct ParsedUsbConfig
     UsbCapabilitySettings settings;
     /** landing page 的原始长度：超上限时草稿存截断值，但仍按原始长度报 TooLong */
     usize landing_page_len = 0;
-    /** 三项（WebUSB / WinUSB / landing page）是否齐全；HID 兼容模式是可选 tag */
+    /** 设备名的原始长度：同样是超上限时按原始长度报 TooLong */
+    usize device_name_len = 0;
+    /** 三项（WebUSB / WinUSB / landing page）是否齐全；HID 兼容模式与设备名是可选 tag */
     bool complete = false;
 };
 
 /**
  * 解析 SetUsbConfig 的 TLV 载荷：WebUSB / WinUSB / landing page 必须给出，
- * HID 兼容模式可选，缺省沿用 base。
+ * HID 兼容模式与设备名可选，缺省沿用 base。
  *
  * @param[in] base 当前生效配置，作为草稿初值
  * @return true=格式合法；false=TLV 越界/缺项/取值长度不对（调用方在 DATA 阶段
@@ -646,6 +649,16 @@ bool parse_usb_config(const u8 *data, usize len, const UsbCapabilitySettings &ba
             }
             out->settings.hid_compat = value[0] != 0 ? 1 : 0;
             break;
+
+        case TAG_USB_DEVICE_NAME: {
+            // 空串是合法取值：表示不用自定义名。超长时草稿只留截断值，
+            // 原始长度另记（见 stage_usb_config_draft 的 TooLong 判定）
+            out->device_name_len = value_len;
+            const usize copy_len = std::min(value_len, USB_DEVICE_NAME_MAX_LEN);
+            memcpy(out->settings.device_name, value, copy_len);
+            out->settings.device_name[copy_len] = '\0';
+            break;
+        }
 
         default:
             break; // 未知 tag：忽略，便于将来扩展
@@ -805,6 +818,7 @@ u16 ConfigChannel::build_usb_config_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_USB_WINUSB, active.winusb);
     p += tlv_u8(m_response + p, TAG_USB_HID_COMPAT, active.hid_compat);
     p += tlv_str(m_response + p, TAG_USB_LANDING_PAGE, active.landing_page);
+    p += tlv_str(m_response + p, TAG_USB_DEVICE_NAME, active.device_name);
     p += tlv_u8(m_response + p, TAG_USB_DRAFT, usb_draft_state());
 
     const UsbConfigReject reason = usb_draft_reject();
@@ -1055,8 +1069,15 @@ bool ConfigChannel::stage_usb_config_draft(const u8 *data, usize len)
     }
 
     // 超长按原始长度判定：草稿里只留得下截断值，不能拿它比较
-    const UsbConfigReject reject =
-        parsed.landing_page_len > USB_LANDING_PAGE_MAX_LEN ? UsbConfigReject::TooLong : usb_capability_check(draft);
+    UsbConfigReject reject = UsbConfigReject::None;
+    if (parsed.landing_page_len > USB_LANDING_PAGE_MAX_LEN || parsed.device_name_len > USB_DEVICE_NAME_MAX_LEN)
+    {
+        reject = UsbConfigReject::TooLong;
+    }
+    else
+    {
+        reject = usb_capability_check(draft);
+    }
 
     portENTER_CRITICAL(&m_usb_draft_lock);
     m_usb_draft = draft;

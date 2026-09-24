@@ -213,8 +213,20 @@ export class MlinkSession {
 	get deviceLabel(): string {
 		const device = this.device;
 		if (device === null) return '—';
+
+		// 设过名字就显示名字（重新枚举接回后随 usbConfig 刷新），否则维持序列号
+		const name = this.usbConfig?.deviceName ?? '';
+		if (name !== '') return name;
+
 		const serial = device.serialNumber;
 		return serial ? `${serial}` : `${device.vendorId.toString(16)}:${device.productId.toString(16)}`;
+	}
+
+	/** 顶栏「设备」的悬停说明：USB 描述符里的产品名与序列号，不受自定义名影响 */
+	get deviceDetail(): string {
+		const device = this.device;
+		if (device === null) return '';
+		return [device.productName ?? '', device.serialNumber ?? ''].filter((part) => part !== '').join(' · ');
 	}
 
 	/** 页面加载时尝试静默接回本 origin 已授权过的设备，省掉每次刷新都要重新选设备。 */

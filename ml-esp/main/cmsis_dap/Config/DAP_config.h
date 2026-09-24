@@ -218,13 +218,34 @@ __STATIC_INLINE uint8_t DAP_GetVendorString (char *str) {
   return ((uint8_t)(strlen("MeguminLink") + 1U));
 }
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+#ifdef __cplusplus
+extern "C" {
+#endif
+/** Product name assembled by the firmware from the custom device name (usb.cc). */
+const char *mlink_dap_product_name (void);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 /** Get Product Name string.
+
+The string comes from the firmware: "<custom name>(MeguminLink CMSIS-DAP)", or
+the plain "MeguminLink CMSIS-DAP" when no custom name is set. The CMSIS-DAP
+keyword is always present, because debuggers match on it.
+
 \param str Pointer to buffer to store the string (max 60 characters).
 \return String length (including terminating NULL character) or 0 (no string).
 */
 __STATIC_INLINE uint8_t DAP_GetProductString (char *str) {
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+  strcpy(str, mlink_dap_product_name());
+  return ((uint8_t)(strlen(str) + 1U));
+#else
   strcpy(str, "MeguminLink CMSIS-DAP");
   return ((uint8_t)(strlen("MeguminLink CMSIS-DAP") + 1U));
+#endif
 }
 
 /** Get Serial Number string.

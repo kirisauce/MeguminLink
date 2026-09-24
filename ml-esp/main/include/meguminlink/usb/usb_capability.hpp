@@ -25,10 +25,35 @@ namespace mlink
  * landing page URL 出现在两处，内容始终一致：BOS 里 WebUSB 平台能力引用的
  * 字符串描述符（iLandingPage）与 GET_URL 厂商请求的响应描述符。上限受
  * esp_tinyusb 字符串描述符缓冲（128 字节）约束。
+ *
+ * 设备名（device_name）同样走这条通道，但改的是产品名字符串本身，且一律
+ * 附加在 CMSIS-DAP 关键字之外（见 USB_PRODUCT_SUFFIX / DAP_PRODUCT_SUFFIX）：
+ * 主机的 CMSIS-DAP 自动识别依赖名字里的这个关键字，因此它永远不被自定义名
+ * 替换掉。
  */
 
 /** landing page URL 的字符上限（esp_tinyusb 字符串缓冲 128 字节 - 2 字节头 - 结尾 NUL） */
 inline constexpr usize USB_LANDING_PAGE_MAX_LEN = 126;
+
+/**
+ * 自定义设备名的字符上限。
+ *
+ * 由产品名描述符倒推：名字拼上固定后缀后必须落在 esp_tinyusb 的单字符串缓冲内
+ * （MAX_DESC_BUF_SIZE = 32 字节，含 2 字节描述符头，即最多 31 字符）。
+ */
+inline constexpr usize USB_DEVICE_NAME_MAX_LEN = 20;
+
+/** 产品名里的固定后缀：CMSIS-DAP 关键字保留在括号内，是主机自动识别的依据 */
+inline constexpr char USB_PRODUCT_SUFFIX[] = "(CMSIS-DAP)";
+
+/** DAP_Info 产品名的固定后缀（DAP 规范给的产品名上限是 60 字符，远未触及） */
+inline constexpr char DAP_PRODUCT_SUFFIX[] = "(MeguminLink CMSIS-DAP)";
+
+/** esp_tinyusb 单字符串描述符的字符上限（缓冲 32 字节 - 2 字节描述符头） */
+inline constexpr usize USB_STRING_DESC_MAX_CHARS = 31;
+
+static_assert(USB_DEVICE_NAME_MAX_LEN + sizeof(USB_PRODUCT_SUFFIX) - 1 <= USB_STRING_DESC_MAX_CHARS,
+              "device name plus product suffix exceeds the esp_tinyusb string descriptor limit");
 
 /** BOS 平台能力对应的厂商请求码 */
 enum : u8
@@ -68,11 +93,13 @@ struct UsbCapabilitySettings
     u8 winusb = 0;
     u8 hid_compat = 0;
     char landing_page[USB_LANDING_PAGE_MAX_LEN + 1] = {};
+    /** 自定义设备名（可打印 ASCII）；空串 = 不用自定义名，产品名回到编译期默认值 */
+    char device_name[USB_DEVICE_NAME_MAX_LEN + 1] = {};
 
     bool operator==(const UsbCapabilitySettings &other) const
     {
         return webusb == other.webusb && winusb == other.winusb && hid_compat == other.hid_compat &&
-               strcmp(landing_page, other.landing_page) == 0;
+               strcmp(landing_page, other.landing_page) == 0 && strcmp(device_name, other.device_name) == 0;
     }
 };
 
@@ -93,6 +120,25 @@ const char *usb_landing_page_default();
 
 /** URL 校验：非空、不超上限、全部为可打印 ASCII；返回拒绝原因，None 表示合法 */
 UsbConfigReject usb_landing_page_check(const char *url);
+
+/**
+ * 设备名校验：不超 USB_DEVICE_NAME_MAX_LEN 字符、全部为可打印 ASCII。
+ *
+ * 空串合法（表示不用自定义名），nullptr 按空串处理。返回拒绝原因。
+ */
+UsbConfigReject usb_device_name_check(const char *name);
+
+/**
+ * 生成 USB 产品名字符串：有名字时 "<名字>(CMSIS-DAP)"，无名字时回退
+ * "CMSIS-DAP on <目标芯片>"。
+ *
+ * 写入 out（容量 cap，含结尾 NUL），返回写入的字符数（不含 NUL）。CMSIS-DAP
+ * 关键字在任何情况下都在结果里。
+ */
+usize usb_product_string(const char *name, char *out, usize cap);
+
+/** 生成 DAP_Info 的产品名字符串：有名字时 "<名字>(MeguminLink CMSIS-DAP)"，无名字时回退常量 */
+usize dap_product_string(const char *name, char *out, usize cap);
 
 /** 整份配置校验（含"该能力编译期是否启用"）：返回拒绝原因 */
 UsbConfigReject usb_capability_check(const UsbCapabilitySettings &settings);

@@ -22,7 +22,7 @@
 
 	<div class="device">
 		<span class="device-label">设备</span>
-		<code>{session.deviceLabel}</code>
+		<code title={session.deviceDetail}>{session.deviceLabel}</code>
 	</div>
 
 	<div class="actions">

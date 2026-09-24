@@ -3,6 +3,8 @@
 		USB_CAPABILITY_HID_COMPAT,
 		USB_CAPABILITY_WEBUSB,
 		USB_CAPABILITY_WINUSB,
+		USB_DEVICE_NAME_MAX_LEN,
+		deviceNameError,
 		landingPageError,
 	} from '../../../lib/protocol';
 	import type { MlinkSession } from '../../../lib/session.svelte';
@@ -27,6 +29,7 @@
 	let winusb = $state(0);
 	let hidCompat = $state(0);
 	let landingPage = $state('');
+	let deviceName = $state('');
 
 	$effect(() => {
 		const current = config;
@@ -35,20 +38,23 @@
 		winusb = current.winusb;
 		hidCompat = current.hidCompat;
 		landingPage = current.landingPage;
+		deviceName = current.deviceName;
 	});
 
 	const urlError = $derived(landingPageError(landingPage));
+	const nameError = $derived(deviceNameError(deviceName));
 	const dirty = $derived(
 		config !== null &&
 			(webusb !== config.webusb ||
 				winusb !== config.winusb ||
 				hidCompat !== config.hidCompat ||
-				landingPage !== config.landingPage)
+				landingPage !== config.landingPage ||
+				deviceName !== config.deviceName)
 	);
 	const reconnecting = $derived(session.state === 'connecting' && session.device === null);
 
 	async function save(): Promise<void> {
-		await session.saveUsbConfig({ webusb, winusb, hidCompat, landingPage });
+		await session.saveUsbConfig({ webusb, winusb, hidCompat, landingPage, deviceName });
 	}
 </script>
 
@@ -101,12 +107,30 @@
 		/>
 	</div>
 
+	<div class="field">
+		<label class="label" for="usb-device-name">设备名称</label>
+		<input
+			id="usb-device-name"
+			type="text"
+			bind:value={deviceName}
+			disabled={busy}
+			maxlength={USB_DEVICE_NAME_MAX_LEN}
+			spellcheck="false"
+			autocomplete="off"
+			placeholder="留空以使用默认设备名称"
+		/>
+	</div>
+
 	{#if !webusbSupported && !winusbSupported && !hidCompatSupported}
 		<p class="hint">当前固件未编译 WebUSB / WinUSB / HID 兼容模式，没有可调项。</p>
 	{/if}
 
 	{#if urlError !== null}
 		<p class="error">{urlError}</p>
+	{/if}
+
+	{#if nameError !== null}
+		<p class="error">{nameError}</p>
 	{/if}
 
 	{#if session.commandError !== null}
@@ -117,7 +141,12 @@
 		<p class="hint">设备正在重新枚举 USB，稍后自动接回。</p>
 	{/if}
 
-	<button class="button" type="button" disabled={busy || !dirty || urlError !== null} onclick={save}>
+	<button
+		class="button"
+		type="button"
+		disabled={busy || !dirty || urlError !== null || nameError !== null}
+		onclick={save}
+	>
 		保存并重新枚举
 	</button>
 </section>

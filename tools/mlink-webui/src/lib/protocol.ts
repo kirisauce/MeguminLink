@@ -150,6 +150,7 @@ const TAG_USB_LANDING_PAGE = 0x63;
 const TAG_USB_DRAFT = 0x64;
 const TAG_USB_DRAFT_REASON = 0x65;
 const TAG_USB_HID_COMPAT = 0x66;
+const TAG_USB_DEVICE_NAME = 0x67;
 
 /** 编译期支持的能力位（UsbConfig.supported）。 */
 export const USB_CAPABILITY_WEBUSB = 0x01;
@@ -157,13 +158,15 @@ export const USB_CAPABILITY_WINUSB = 0x02;
 export const USB_CAPABILITY_HID_COMPAT = 0x04;
 /** landing page 字符上限，与固件 usb_capability.hpp 一致。 */
 export const USB_LANDING_PAGE_MAX_LEN = 126;
+/** 设备名字符上限，与固件 usb_capability.hpp 一致。 */
+export const USB_DEVICE_NAME_MAX_LEN = 20;
 /** 草稿状态（UsbConfig.draft）：0 无草稿、1 合法待应用、2 被拒。 */
 export const USB_DRAFT_PENDING = 1;
 export const USB_DRAFT_REJECTED = 2;
-/** 被拒原因（UsbConfig.draftReason）的中文说明。 */
+/** 被拒原因（UsbConfig.draftReason）的中文说明：原因码由 URL 与设备名共用。 */
 export const USB_REJECT_TEXT: Readonly<Record<number, string>> = {
-	1: `URL 超过 ${USB_LANDING_PAGE_MAX_LEN} 字符`,
-	2: 'URL 只能包含可打印 ASCII 字符',
+	1: `超过长度上限（URL ${USB_LANDING_PAGE_MAX_LEN} 字符 / 设备名称 ${USB_DEVICE_NAME_MAX_LEN} 字符）`,
+	2: '只能包含可打印 ASCII 字符',
 	3: '该能力在当前固件里未编译进来',
 };
 
@@ -388,7 +391,8 @@ export type DeviceConfig = {
  *
  * supported 是编译期支持位（bit0 WebUSB / bit1 WinUSB / bit2 HID 兼容模式）：
  * 未编译进来的能力在界面上置灰。landingPage 为生效值（设备端已把空串解析成默认
- * URL），draft 为草稿状态，draftReason 只在被拒时有值。
+ * URL），deviceName 是生效的设备名（空串表示不用自定义名），draft 为草稿状态，
+ * draftReason 只在被拒时有值。
  */
 export type UsbConfig = {
 	supported: number;
@@ -396,16 +400,18 @@ export type UsbConfig = {
 	winusb: number;
 	hidCompat: number;
 	landingPage: string;
+	deviceName: string;
 	draft: number;
 	draftReason: number | null;
 };
 
-/** SetUsbConfig（0x16）提交的完整配置；landingPage 传空串表示回退默认值。 */
+/** SetUsbConfig（0x16）提交的完整配置；landingPage 传空串表示回退默认值，deviceName 传空串表示不用自定义名。 */
 export type UsbCapability = {
 	webusb: number;
 	winusb: number;
 	hidCompat: number;
 	landingPage: string;
+	deviceName: string;
 };
 
 /** 字段顺序即 mlinkctl 的打印顺序。 */
@@ -586,6 +592,7 @@ export function decodeUsbConfig(frame: DataView): UsbConfig {
 		winusb: readValue(tags.get(TAG_USB_WINUSB), false),
 		hidCompat: readValue(tags.get(TAG_USB_HID_COMPAT), false),
 		landingPage: readText(tags.get(TAG_USB_LANDING_PAGE)),
+		deviceName: readText(tags.get(TAG_USB_DEVICE_NAME)),
 		draft: readValue(tags.get(TAG_USB_DRAFT), false),
 		draftReason: reason === undefined ? null : readValue(reason, false),
 	};
@@ -687,6 +694,19 @@ export function landingPageError(url: string): string | null {
 }
 
 /**
+ * 设备名的本地预校验：与固件同规则（长度 + 可打印 ASCII）。
+ * 返回 null 表示合法；空串合法（表示不用自定义名）。
+ */
+export function deviceNameError(name: string): string | null {
+	const bytes = new TextEncoder().encode(name);
+	if (bytes.byteLength > USB_DEVICE_NAME_MAX_LEN) return `设备名称超过 ${USB_DEVICE_NAME_MAX_LEN} 字符`;
+	for (const byte of bytes) {
+		if (byte < 0x20 || byte > 0x7e) return '设备名称只能包含可打印 ASCII 字符';
+	}
+	return null;
+}
+
+/**
  * 提交 USB 能力草稿（cmd 0x16，OUT 方向）。
  *
  * 载荷是全量三项的 TLV（WebUSB / WinUSB / landing page），设备端只校验并缓存，
@@ -746,6 +766,7 @@ export async function writeUsbConfig(device: USBDevice, seq: number, config: Usb
 		encodeTlv(TAG_USB_WINUSB, new Uint8Array([config.winusb & 1])),
 		encodeTlv(TAG_USB_HID_COMPAT, new Uint8Array([config.hidCompat & 1])),
 		encodeTlv(TAG_USB_LANDING_PAGE, encoder.encode(config.landingPage)),
+		encodeTlv(TAG_USB_DEVICE_NAME, encoder.encode(config.deviceName)),
 	]);
 
 	const result = await device.controlTransferOut(

@@ -146,6 +146,12 @@ class CmsisDapUsb
         return m_usb_capability.hid_compat != 0;
     }
 
+    /** DAP_Info 的产品名（含自定义设备名；无名字时为 "MeguminLink CMSIS-DAP"） */
+    const char *dap_product_name() const
+    {
+        return m_dap_product_string;
+    }
+
     /** 描述符访问器：TinyUSB 的 BOS / GET_URL / GET_DESCRIPTOR_SET 回调用它取数据 */
     const UsbCapabilityDescriptors &usb_descriptors() const
     {
@@ -214,6 +220,14 @@ class CmsisDapUsb
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
     std::array<const char *, (usize)UsbStringIndex::Max> m_string_descriptors;
+
+    /**
+     * 产品名字符串的常驻缓冲：iProduct 与 DAP_Info 产品名各一份，内容按生效的
+     * 设备名生成（见 usb_product_string / dap_product_string）。设备名变更时在
+     * 断开窗口内重写，指针不变、内容变——与 iLandingPage 同一套做法。
+     */
+    char m_product_string[USB_DEVICE_NAME_MAX_LEN + sizeof(USB_PRODUCT_SUFFIX)] = {};
+    char m_dap_product_string[USB_DEVICE_NAME_MAX_LEN + sizeof(DAP_PRODUCT_SUFFIX)] = {};
 
     /**
      * USB 能力状态与描述符缓冲（构造时从 NVS 载入）。

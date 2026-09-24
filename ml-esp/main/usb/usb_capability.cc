@@ -8,6 +8,7 @@
 #include <tusb.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -21,6 +22,7 @@ constexpr char NVS_KEY_USB_WEBUSB[] = "usb_webusb";
 constexpr char NVS_KEY_USB_WINUSB[] = "usb_winusb";
 constexpr char NVS_KEY_USB_HID_COMPAT[] = "usb_hid_compat";
 constexpr char NVS_KEY_USB_LANDING_PAGE[] = "usb_landing";
+constexpr char NVS_KEY_USB_DEVICE_NAME[] = "usb_name";
 
 #if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
 constexpr char LANDING_PAGE_DEFAULT[] = CONFIG_MEGUMINLINK_USB_WEBUSB_LANDING_PAGE;
@@ -37,11 +39,17 @@ constexpr u8 USB_WEBUSB_DEFAULT = 1;
 constexpr u8 USB_WINUSB_DEFAULT = 1;
 /** HID 兼容模式默认关闭：只有需要 CMSIS-DAP v1 的工具才打开 */
 constexpr u8 USB_HID_COMPAT_DEFAULT = 0;
+/** 设备名默认空：产品名保持编译期的 "CMSIS-DAP on <目标芯片>" */
+constexpr char USB_DEVICE_NAME_DEFAULT[] = "";
+
+/** 无自定义名时的 DAP_Info 产品名（与 DAP_config.h 非 USB 分支的常量同一文案） */
+constexpr char DAP_PRODUCT_FALLBACK[] = "MeguminLink CMSIS-DAP";
 
 mlink::NvsKeyU8 g_usb_webusb_key(NVS_KEY_USB_WEBUSB, USB_WEBUSB_DEFAULT);
 mlink::NvsKeyU8 g_usb_winusb_key(NVS_KEY_USB_WINUSB, USB_WINUSB_DEFAULT);
 mlink::NvsKeyU8 g_usb_hid_compat_key(NVS_KEY_USB_HID_COMPAT, USB_HID_COMPAT_DEFAULT);
 mlink::NvsKeyString<USB_LANDING_PAGE_MAX_LEN> g_usb_landing_page_key(NVS_KEY_USB_LANDING_PAGE, LANDING_PAGE_DEFAULT);
+mlink::NvsKeyString<USB_DEVICE_NAME_MAX_LEN> g_usb_device_name_key(NVS_KEY_USB_DEVICE_NAME, USB_DEVICE_NAME_DEFAULT);
 
 // ---- MS OS 2.0 描述符集（GET_DESCRIPTOR_SET 的响应体）----
 // 布局对齐《Microsoft OS 2.0 Descriptors Specification》：集合头 + 配置/
@@ -190,6 +198,83 @@ UsbConfigReject mlink::usb_landing_page_check(const char *url)
     return UsbConfigReject::None;
 }
 
+UsbConfigReject mlink::usb_device_name_check(const char *name)
+{
+    if (name == nullptr)
+    {
+        return UsbConfigReject::None; // 没给名字 == 空名字 == 用默认产品名
+    }
+
+    const usize len = strlen(name);
+    if (len > USB_DEVICE_NAME_MAX_LEN)
+    {
+        return UsbConfigReject::TooLong;
+    }
+
+    for (usize i = 0; i < len; i++)
+    {
+        const u8 c = static_cast<u8>(name[i]);
+        if (c < 0x20 || c > 0x7E)
+        {
+            // esp_tinyusb 逐字节把字符串塞进 UTF-16 码元：非 ASCII 会显示成乱码，
+            // 因此名字只收可打印 ASCII
+            return UsbConfigReject::InvalidChar;
+        }
+    }
+
+    return UsbConfigReject::None;
+}
+
+usize mlink::usb_product_string(const char *name, char *out, usize cap)
+{
+    if (cap == 0)
+    {
+        return 0;
+    }
+
+    int written = 0;
+    if (name != nullptr && name[0] != '\0')
+    {
+        written = snprintf(out, cap, "%s%s", name, USB_PRODUCT_SUFFIX);
+    }
+    else
+    {
+        written = snprintf(out, cap, "CMSIS-DAP on %s", CONFIG_IDF_TARGET);
+    }
+
+    if (written < 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+    return std::min(static_cast<usize>(written), cap - 1);
+}
+
+usize mlink::dap_product_string(const char *name, char *out, usize cap)
+{
+    if (cap == 0)
+    {
+        return 0;
+    }
+
+    int written = 0;
+    if (name != nullptr && name[0] != '\0')
+    {
+        written = snprintf(out, cap, "%s%s", name, DAP_PRODUCT_SUFFIX);
+    }
+    else
+    {
+        written = snprintf(out, cap, "%s", DAP_PRODUCT_FALLBACK);
+    }
+
+    if (written < 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+    return std::min(static_cast<usize>(written), cap - 1);
+}
+
 UsbConfigReject mlink::usb_capability_check(const UsbCapabilitySettings &settings)
 {
     const u8 supported = usb_capability_supported_mask();
@@ -207,7 +292,13 @@ UsbConfigReject mlink::usb_capability_check(const UsbCapabilitySettings &setting
         return UsbConfigReject::Unsupported;
     }
 
-    return usb_landing_page_check(settings.landing_page);
+    const UsbConfigReject landing_page = usb_landing_page_check(settings.landing_page);
+    if (landing_page != UsbConfigReject::None)
+    {
+        return landing_page;
+    }
+
+    return usb_device_name_check(settings.device_name);
 }
 
 UsbCapabilitySettings mlink::usb_capability_load()
@@ -227,6 +318,7 @@ UsbCapabilitySettings mlink::usb_capability_load()
 #endif
 
     g_usb_landing_page_key.get(settings.landing_page, sizeof(settings.landing_page));
+    g_usb_device_name_key.get(settings.device_name, sizeof(settings.device_name));
     return settings;
 }
 
@@ -257,6 +349,10 @@ esp_err_t mlink::usb_capability_store(const UsbCapabilitySettings &settings)
     {
         ret = g_usb_landing_page_key.set(settings.landing_page);
     }
+    if (ret == ESP_OK)
+    {
+        ret = g_usb_device_name_key.set(settings.device_name);
+    }
     return ret;
 }
 
@@ -274,6 +370,10 @@ esp_err_t mlink::usb_capability_erase()
     if (ret == ESP_OK)
     {
         ret = g_usb_landing_page_key.erase();
+    }
+    if (ret == ESP_OK)
+    {
+        ret = g_usb_device_name_key.erase();
     }
 
     if (ret != ESP_OK)

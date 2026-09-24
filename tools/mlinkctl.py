@@ -5,8 +5,8 @@
 
     mlinkctl                     读一次统计快照（cmd 0x01 GET_STATS）
     mlinkctl config              读设备信息与配置项（cmd 0x02 GET_CONFIG）
-    mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / HID 兼容模式 / landing page（cmd 0x03）
-    mlinkctl set-usb [...]       设置 USB 能力，保存后设备自动重新枚举（cmd 0x16 + 0x17）
+    mlinkctl usb                 读 USB 能力：WebUSB / WinUSB / HID 兼容模式 / landing page / 设备名称（cmd 0x03）
+    mlinkctl set-usb [...]       设置 USB 能力与设备名称，保存后设备自动重新枚举（cmd 0x16 + 0x17）
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl set-rate <rate>     设置 ESP-NOW 发送速率档位，两端同时应用（cmd 0x19）
     mlinkctl set-loss <percent>  设置注入丢包率，两端同时应用（cmd 0x1A，需固件编译该功能）
@@ -206,9 +206,12 @@ TAG_USB_LANDING_PAGE = 0x63
 TAG_USB_DRAFT = 0x64
 TAG_USB_DRAFT_REASON = 0x65
 TAG_USB_HID_COMPAT = 0x66
+TAG_USB_DEVICE_NAME = 0x67
 
 # landing page 上限 = esp_tinyusb 字符串描述符缓冲（128B）减头与结尾 NUL
 USB_LANDING_PAGE_MAX_LEN = 126
+# 设备名上限：拼上固定的 "(CMSIS-DAP)" 后正好 31 字符（esp_tinyusb 单字符串上限）
+USB_DEVICE_NAME_MAX_LEN = 20
 USB_CAPABILITY_WEBUSB = 0x01
 USB_CAPABILITY_WINUSB = 0x02
 USB_CAPABILITY_HID_COMPAT = 0x04
@@ -431,6 +434,7 @@ def render_usb(values):
         f"winusb={'on' if u8_of(values, TAG_USB_WINUSB) else 'off'}",
         f"hid_compat={'on' if u8_of(values, TAG_USB_HID_COMPAT) else 'off'}",
         f"landing_page={values.get(TAG_USB_LANDING_PAGE, b'').decode('utf-8', 'replace')}",
+        f"name={values.get(TAG_USB_DEVICE_NAME, b'').decode('utf-8', 'replace')}",
         f"draft={DRAFT.get(draft, '?')}",
     ]
     if draft == 2:
@@ -450,6 +454,14 @@ def check_landing_page(url):
     for byte in url.encode("utf-8"):
         if byte < 0x20 or byte > 0x7E:
             die("landing page 只能是可打印 ASCII 字符")
+
+
+def check_device_name(name):
+    if len(name) > USB_DEVICE_NAME_MAX_LEN:
+        die(f"设备名超过 {USB_DEVICE_NAME_MAX_LEN} 字符")
+    for byte in name.encode("utf-8"):
+        if byte < 0x20 or byte > 0x7E:
+            die("设备名只能是可打印 ASCII 字符")
 
 
 def cmd_read_stats(_args):
@@ -571,8 +583,9 @@ def cmd_set_usb(args):
         and args.winusb is None
         and args.hid_compat is None
         and args.landing_page is None
+        and args.name is None
     ):
-        die("至少要指定 --webusb / --winusb / --hid-compat / --landing-page 之一")
+        die("至少要指定 --webusb / --winusb / --hid-compat / --landing-page / --name 之一")
 
     dev = find_device()
     current = decode(fetch(dev, CMD_GET_USB_CONFIG))
@@ -581,6 +594,7 @@ def cmd_set_usb(args):
     winusb = u8_of(current, TAG_USB_WINUSB)
     hid_compat = u8_of(current, TAG_USB_HID_COMPAT)
     landing = current.get(TAG_USB_LANDING_PAGE, b"").decode("utf-8", "replace")
+    name = current.get(TAG_USB_DEVICE_NAME, b"").decode("utf-8", "replace")
 
     if args.webusb is not None:
         webusb = 1 if args.webusb == "on" else 0
@@ -590,9 +604,12 @@ def cmd_set_usb(args):
         hid_compat = 1 if args.hid_compat == "on" else 0
     if args.landing_page is not None:
         landing = args.landing_page
+    if args.name is not None:
+        name = args.name
     check_landing_page(landing)
+    check_device_name(name)
 
-    # 全量提交三项；HID 兼容模式只在指定时下发，设备端沿用当前值
+    # 全量提交三项；HID 兼容模式与设备名只在指定时下发，设备端沿用当前值
     payload = (
         encode_tlv(TAG_USB_WEBUSB, bytes([webusb]))
         + encode_tlv(TAG_USB_WINUSB, bytes([winusb]))
@@ -600,6 +617,8 @@ def cmd_set_usb(args):
     )
     if args.hid_compat is not None:
         payload += encode_tlv(TAG_USB_HID_COMPAT, bytes([hid_compat]))
+    if args.name is not None:
+        payload += encode_tlv(TAG_USB_DEVICE_NAME, name.encode("utf-8"))
     try:
         dev.ctrl_transfer(0x40, VENDOR_CODE, CMD_SET_USB_CONFIG, 0, payload, TIMEOUT_MS)
     except usb.core.USBError as err:
@@ -616,7 +635,7 @@ def cmd_set_usb(args):
     decode(fetch(dev, CMD_APPLY_USB_CONFIG))
     print(
         f"status=ok webusb={'on' if webusb else 'off'} winusb={'on' if winusb else 'off'} "
-        f"hid_compat={'on' if hid_compat else 'off'} landing_page={landing}"
+        f"hid_compat={'on' if hid_compat else 'off'} landing_page={landing} name={name}"
     )
     print("mlinkctl: 设备正在重新枚举 USB，稍后需要重新识别设备", file=sys.stderr)
 
@@ -747,11 +766,11 @@ def build_parser():
 
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     subparsers.add_parser("config", help="读设备信息与配置项").set_defaults(handler=cmd_read_config)
-    subparsers.add_parser("usb", help="读 USB 能力（WebUSB / WinUSB / HID 兼容模式 / landing page）").set_defaults(
-        handler=cmd_read_usb
-    )
+    subparsers.add_parser(
+        "usb", help="读 USB 能力（WebUSB / WinUSB / HID 兼容模式 / landing page / 设备名称）"
+    ).set_defaults(handler=cmd_read_usb)
 
-    set_usb = subparsers.add_parser("set-usb", help="设置 USB 能力，保存后设备自动重新枚举")
+    set_usb = subparsers.add_parser("set-usb", help="设置 USB 能力与设备名称，保存后设备自动重新枚举")
     set_usb.add_argument("--webusb", choices=("on", "off"), help="WebUSB 能力开关")
     set_usb.add_argument("--winusb", choices=("on", "off"), help="WinUSB 自动识别驱动开关")
     set_usb.add_argument(
@@ -760,6 +779,11 @@ def build_parser():
         help="HID 兼容模式：暴露 CMSIS-DAP v1 的 HID 接口（未编译该功能时设备拒绝开启）",
     )
     set_usb.add_argument("--landing-page", metavar="URL", help="WebUSB landing page URL（空串回退默认值）")
+    set_usb.add_argument(
+        "--name",
+        metavar="NAME",
+        help=f"设备名称：可打印 ASCII、最多 {USB_DEVICE_NAME_MAX_LEN} 字符（空串清除，产品名回到默认）",
+    )
     set_usb.set_defaults(handler=cmd_set_usb)
 
     set_mode = subparsers.add_parser("set-mode", help="切换运行模式")

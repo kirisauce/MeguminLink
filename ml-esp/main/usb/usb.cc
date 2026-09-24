@@ -869,9 +869,17 @@ void UsbConfigurationDescriptor::append(const u8 *bytes, usize len)
 
 CmsisDapUsb::CmsisDapUsb()
 {
+    // 能力状态从 NVS 载入（无记录用编译期默认值），并据此构造 BOS、GET_URL、
+    // 产品名与配置描述符：必须在 tinyusb_driver_install（init）之前完成，主机
+    // 枚举时读到的就是它
+    m_usb_capability = usb_capability_load();
+
+    usb_product_string(m_usb_capability.device_name, m_product_string, sizeof(m_product_string));
+    dap_product_string(m_usb_capability.device_name, m_dap_product_string, sizeof(m_dap_product_string));
+
     m_string_descriptors[(usize)UsbStringIndex::LangId] = LANGID;
     m_string_descriptors[(usize)UsbStringIndex::Manufacturer] = "MeguminLink";
-    m_string_descriptors[(usize)UsbStringIndex::Product] = "CMSIS-DAP on " CONFIG_IDF_TARGET;
+    m_string_descriptors[(usize)UsbStringIndex::Product] = m_product_string;
     m_string_descriptors[(usize)UsbStringIndex::SerialNumber] = m_serial;
     m_string_descriptors[(usize)UsbStringIndex::DapInterfaceName] = "CMSIS-DAP v2";
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
@@ -882,10 +890,6 @@ CmsisDapUsb::CmsisDapUsb()
     m_string_descriptors[(usize)UsbStringIndex::HidInterfaceName] = "CMSIS-DAP v1";
 #endif
 
-    // 能力状态从 NVS 载入（无记录用编译期默认值），并据此构造 BOS、GET_URL 与
-    // 配置描述符：必须在 tinyusb_driver_install（init）之前完成，主机枚举时读到的
-    // 就是它
-    m_usb_capability = usb_capability_load();
 #if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
     m_string_descriptors[(usize)UsbStringIndex::WebUsbLandingPage] = m_usb_capability.landing_page;
 #endif
@@ -1016,6 +1020,8 @@ void CmsisDapUsb::apply_usb_capability(const UsbCapabilitySettings &settings)
     vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
 
     m_usb_capability = settings;
+    usb_product_string(m_usb_capability.device_name, m_product_string, sizeof(m_product_string));
+    dap_product_string(m_usb_capability.device_name, m_dap_product_string, sizeof(m_dap_product_string));
     m_usb_descriptors.rebuild(m_usb_capability, LANDING_PAGE_STRING_INDEX);
     m_config_descriptor.rebuild(m_usb_capability);
 #if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
@@ -1028,3 +1034,13 @@ void CmsisDapUsb::apply_usb_capability(const UsbCapabilitySettings &settings)
              static_cast<unsigned>(m_usb_capability.hid_compat), m_usb_capability.landing_page);
 }
 } // namespace mlink
+
+/**
+ * DAP_Info 的产品名（DAP_config.h 的 DAP_GetProductString 调用它）。
+ *
+ * 声明在 DAP_config.h 里以求 C 链接：DAP.c 是 C 编译单元，拿不到 C++ 对象。
+ */
+extern "C" const char *mlink_dap_product_name(void)
+{
+    return mlink::Application::get_instance().usb().dap_product_name();
+}
