@@ -235,6 +235,12 @@ class WirelessLink
     bool can_submit_command();
 
     /**
+     * 链路被证明可用（收到对端任何帧，例如熔断期探针 Ping 的回显）：请可靠传输清掉
+     * 熔断与连续失败计数。调用方是收包分派的 Pong 分支。
+     */
+    void notify_link_alive();
+
+    /**
      * 响应方向的两个背压计数（统计上报）：队满进入等待的次数，与等待超时最终丢弃的
      * 响应数。它们是"只等不丢"策略的自证手段：正常情况下应保持为 0，非 0 说明窗口
      * 长期没有空位（链路或对端异常）。
@@ -363,6 +369,14 @@ class WirelessLink
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /** 可靠传输适配层（收发状态机 + 会话握手 + 重放排队，见 arq_link.hpp） */
     ArqLink m_arq;
+
+    /**
+     * 上一次熔断探针（Ping）的发出时刻。
+     *
+     * 熔断期间主机可能根本没有命令要提交（空闲），光靠"提交时试探"恢复不了；
+     * arq_poll 按这个时刻周期性地主动打一个探针，把链路状态问回来。
+     */
+    u32 m_arq_probe_tx_ms = 0;
 
     /**
      * 响应待发队列深度。

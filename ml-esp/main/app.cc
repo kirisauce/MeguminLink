@@ -678,6 +678,9 @@ void Application::run()
                         break;
                     }
                     case PacketType::Pong: {
+                        // 任何 Pong 都说明链路双向可用：熔断中的发送侧据此自愈
+                        // （熔断期的探针 Ping 也走这里，token 由配置通道自行判弃）
+                        m_wireless_link.notify_link_alive();
                         m_config_channel.on_pong(rp.src_mac, rp.packet.payload.pong.token);
                         break;
                     }

@@ -253,6 +253,12 @@ class Breaker
     /** 到点即放行一条试探并顺延；未熔断时恒为 true */
     bool allow(u32 now_ms);
 
+    /**
+     * 现在提交是否会被放行：只查询、不顺延试探时刻（allow 的只读版本）。
+     * 未熔断恒为 true，熔断时只有到试探时刻才为 true。
+     */
+    bool submit_allowed(u32 now_ms) const;
+
     /** 一条消息重传耗尽；返回 true 表示本次调用触发了熔断 */
     bool on_failure(u32 now_ms);
 
@@ -395,6 +401,20 @@ class Sender
     u8 window() const;
 
     SenderSnapshot snapshot() const;
+
+    /**
+     * 现在提交是否可能产生流量：窗口有空位，且熔断时只在试探时刻为真。
+     *
+     * 与 submit() 里的 allow() 判断同源。调用方（USB 侧的背压）据此决定取不取命令：
+     * 熔断时若一律返回 false，就永远不会有试探提交，熔断再也恢复不了。
+     */
+    bool can_submit(u32 now_ms) const;
+
+    /**
+     * 链路被证明可用（收到对端任何帧，例如探针 Ping 的 Pong）：清掉熔断与连续失败计数。
+     * @return true = 刚从熔断恢复
+     */
+    bool notify_link_alive();
 
   private:
     /** 一条在途消息的状态 */

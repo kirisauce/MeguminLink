@@ -79,17 +79,25 @@ void Breaker::init(u8 threshold, u16 probe_ms)
     m_probe_at_ms = 0;
 }
 
-bool Breaker::allow(u32 now_ms)
+bool Breaker::submit_allowed(u32 now_ms) const
 {
     if (!m_tripped || m_threshold == 0)
     {
-        return true;
+        return true; // 没熔断：提交不受限制
     }
-    if (static_cast<i32>(now_ms - m_probe_at_ms) < 0)
+    return static_cast<i32>(now_ms - m_probe_at_ms) >= 0;
+}
+
+bool Breaker::allow(u32 now_ms)
+{
+    if (!submit_allowed(now_ms))
     {
         return false; // 未到试探时刻：熔断期间的提交一律快速失败
     }
-    m_probe_at_ms = now_ms + m_probe_ms;
+    if (m_tripped && m_threshold != 0)
+    {
+        m_probe_at_ms = now_ms + m_probe_ms; // 放行一次试探，顺延下一个试探点
+    }
     return true;
 }
 
@@ -217,6 +225,16 @@ void Sender::emit(Event event, u16 seq, u32 now_ms) const
 u8 Sender::window() const
 {
     return (m_peer_window < m_config.window) ? m_peer_window : m_config.window;
+}
+
+bool Sender::can_submit(u32 now_ms) const
+{
+    return in_flight() < window() && m_breaker.submit_allowed(now_ms);
+}
+
+bool Sender::notify_link_alive()
+{
+    return m_breaker.on_success();
 }
 
 SubmitResult Sender::submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out)

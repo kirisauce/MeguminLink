@@ -937,7 +937,7 @@ bool ArqLink::take_failed(u16 *seq_out)
     return true;
 }
 
-bool ArqLink::can_submit() const
+bool ArqLink::can_submit(u32 now_ms) const
 {
     lock();
 
@@ -949,12 +949,19 @@ bool ArqLink::can_submit() const
     }
     else if (m_peer_known && m_established)
     {
-        const arq::SenderSnapshot snap = m_sender.snapshot();
-        value = !snap.breaker_open && snap.in_flight < m_sender.window();
+        value = m_sender.can_submit(now_ms);
     }
 
     unlock();
     return value;
+}
+
+bool ArqLink::notify_link_alive()
+{
+    lock();
+    const bool recovered = m_sender.notify_link_alive();
+    unlock();
+    return recovered;
 }
 
 void ArqLink::core_event(void *raw, arq::Event event, u16 seq, u32 now_ms)

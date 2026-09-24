@@ -37,6 +37,9 @@ namespace
  */
 constexpr size_t DAP_QUEUE_DEPTH = 32;
 
+/** 熔断期探针 Ping 的 token：只用于自证链路可用，与配置通道的探测 token 互不干扰 */
+constexpr u32 ARQ_PROBE_TOKEN = 0x4D4C5052; // "MLPR"
+
 /** 一条待执行的 DAP 命令：命令来源（响应回发）+ 可靠传输序号 + 原样命令字节流 */
 struct DapExecuteRequest
 {
@@ -764,9 +767,19 @@ bool WirelessLink::take_failed_command(u16 *seq_out)
 bool WirelessLink::can_submit_command()
 {
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    return m_arq.can_submit();
+    return m_arq.can_submit(now_ms());
 #else
     return true; // 未启用可靠传输：没有窗口可等
+#endif
+}
+
+void WirelessLink::notify_link_alive()
+{
+#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
+    if (m_arq.notify_link_alive())
+    {
+        ESP_LOGW(TAG, "ARQ breaker recovered: link is alive again");
+    }
 #endif
 }
 
@@ -902,6 +915,24 @@ void WirelessLink::arq_poll(u32 now)
         // 稍后也会做同样的事（幂等），但握手帧排在它前面，这里补一次免得白等一轮
         (void)peer_add(peer_mac);
         m_arq.set_peer(peer_mac, now);
+
+        // 熔断期的主动探针：主机可能根本没有命令可提交（空闲），光靠"提交时试探"
+        // 恢复不了。发一个 Ping——不走 ARQ、不占窗口、不动会话，对端回 Pong 就证明
+        // 链路双向可用；收包分派的 Pong 分支会调 notify_link_alive 清掉熔断。
+        const ArqSettings settings = m_arq.settings();
+        if (m_arq.snapshot().breaker_open && static_cast<i32>(now - m_arq_probe_tx_ms) >= 0)
+        {
+            m_arq_probe_tx_ms = now + settings.breaker_probe_ms;
+            const esp_err_t ret = send_ping(peer_mac, ARQ_PROBE_TOKEN);
+            if (ret != ESP_OK)
+            {
+                ESP_LOGW(TAG, "ARQ probe ping failed: %s", esp_err_to_name(ret));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "ARQ breaker open: probe ping sent");
+            }
+        }
     }
     m_arq.poll(now);
 
