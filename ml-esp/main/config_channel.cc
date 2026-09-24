@@ -464,6 +464,9 @@ enum : u8
     TAG_ARQ_SRTT_MS = 0x7A,       // u32：平滑往返时延（毫秒）
     TAG_ARQ_RTO_MS = 0x7B,        // u32：当前基础 RTO（毫秒）
     TAG_ARQ_BREAKER_TRIPS = 0x7C, // u32：熔断触发次数
+    TAG_ARQ_RESP_WAITS = 0x7D,    // u32：响应队满进入等待窗口的次数
+    TAG_ARQ_RESP_DROPPED = 0x7E,  // u32：等待窗口超时仍被丢弃的响应数
+    TAG_ARQ_CMD_DROPPED = 0x7F,   // u32：执行队列满被丢弃的命令数
 #endif
     TAG_UPTIME = 0x40,           // u32：上电毫秒数（49.7 天回绕）
     TAG_FW_VERSION = 0x41,       // string：应用版本（esp_app_desc.version）
@@ -734,6 +737,13 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
         p += tlv_u32(m_response + p, TAG_ARQ_SRTT_MS, arq.srtt_ms);
         p += tlv_u32(m_response + p, TAG_ARQ_RTO_MS, arq.rto_ms);
         p += tlv_u32(m_response + p, TAG_ARQ_BREAKER_TRIPS, arq.breaker_trips);
+
+        // 响应方向的背压证据：这三个数在正常链路上应当为 0——非 0 说明响应被丢或
+        // 命令没进执行队列，主机那条命令只能等自己的超时
+        const WirelessLink &link = Application::get_instance().wireless_link();
+        p += tlv_u32(m_response + p, TAG_ARQ_RESP_WAITS, link.resp_slot_waits());
+        p += tlv_u32(m_response + p, TAG_ARQ_RESP_DROPPED, link.resp_dropped());
+        p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED, link.cmd_queue_dropped());
     }
 #endif
 

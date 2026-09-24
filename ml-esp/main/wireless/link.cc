@@ -818,15 +818,10 @@ void WirelessLink::dap_resp_sink(const u8 *data, u16 len, void *arg)
     auto *link = static_cast<WirelessLink *>(arg);
 
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    // 响应走可靠传输：序号与确认由适配层给，并记下它回的是哪条命令——对端重传
-    // 那条命令时据此重放这条响应，而不是把命令再执行一遍。类型位标明这是响应，
-    // 对端据此把它交回 USB 转发路径
-    const ArqLink::Submit result =
-        link->m_arq.submit_response(link->m_dap_cmd_seq, data, len, ARQ_META_RESPONSE, now_ms());
-    if (result != ArqLink::Submit::Ok)
-    {
-        ESP_LOGE(TAG, "Failed to submit DAP response: result %d", static_cast<int>(result));
-    }
+    // 响应走可靠传输，且不丢弃：窗口满时先入队、队满才等窗口（见 submit_response_or_queue）。
+    // 序号与确认由适配层给，并记下它回的是哪条命令——对端重传那条命令时据此重放这条
+    // 响应，而不是把命令再执行一遍。类型位标明这是响应，对端据此把它交回 USB 转发路径。
+    link->submit_response_or_queue(link->m_dap_cmd_seq, data, len, ARQ_META_RESPONSE);
 #else
     const esp_err_t ret = link->send_dap_response(link->m_dap_src_mac, data, len);
     if (ret != ESP_OK)
@@ -867,10 +862,26 @@ esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *da
 
     if (xQueueSend(m_dap_queue, &req, 0) != pdTRUE)
     {
+        m_cmd_queue_dropped = m_cmd_queue_dropped + 1;
         ESP_LOGW(TAG, "DAP command queue full, command dropped");
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+u32 WirelessLink::resp_slot_waits() const
+{
+    return m_resp_slot_waits;
+}
+
+u32 WirelessLink::resp_dropped() const
+{
+    return m_resp_dropped;
+}
+
+u32 WirelessLink::cmd_queue_dropped() const
+{
+    return m_cmd_queue_dropped;
 }
 
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
@@ -893,6 +904,147 @@ void WirelessLink::arq_poll(u32 now)
         m_arq.set_peer(peer_mac, now);
     }
     m_arq.poll(now);
+
+    // 窗口可能刚被确认推进：把排队的响应补发出去
+    flush_pending_responses();
+}
+
+// ---- 响应方向的背压 ----
+// 丢一条响应等于丢一条命令的结果：对端那条命令的确认早已发出，它不会重传，主机只能
+// 等满自己的超时（USB 侧的 MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS），压测/烧录就
+// 断在这一条上。窗口为 1 时"上一条响应还在等确认、下一条已经执行完"是常态，所以这条
+// 路径必须能等：窗口满先入队，队满才等窗口（等待期间自己驱动 arq_poll 推进确认）。
+
+void WirelessLink::submit_response_or_queue(u16 cmd_seq, const u8 *data, u16 len, u8 meta)
+{
+    if (len > MAX_DAP_PAYLOAD_SIZE)
+    {
+        // 响应缓冲本身按这个上限分配，走到这里只可能是接线错误
+        ESP_LOGE(TAG, "DAP response too large (%u bytes, max %u)", static_cast<unsigned>(len),
+                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
+        return;
+    }
+
+    // 先把积压的送出去：窗口可能已经空出来了
+    flush_pending_responses();
+
+    if (pending_response_count() == 0)
+    {
+        const ArqLink::Submit result = m_arq.submit_response(cmd_seq, data, len, meta, now_ms());
+        if (result == ArqLink::Submit::Ok)
+        {
+            return;
+        }
+        if (result == ArqLink::Submit::Invalid)
+        {
+            // 载荷非法：重试没有意义，也不能让它占着队列
+            ESP_LOGE(TAG, "DAP response rejected as invalid (%u bytes, cmd seq=%u)", static_cast<unsigned>(len),
+                     cmd_seq);
+            return;
+        }
+    }
+
+    while (!enqueue_response(cmd_seq, data, len, meta))
+    {
+        m_resp_slot_waits = m_resp_slot_waits + 1;
+        if (!wait_for_response_slot())
+        {
+            m_resp_dropped = m_resp_dropped + 1;
+            ESP_LOGE(TAG, "DAP response queue stuck %u ms, response for cmd seq=%u dropped",
+                     static_cast<unsigned>(RESPONSE_SLOT_WAIT_MS), cmd_seq);
+            return;
+        }
+    }
+
+    flush_pending_responses();
+}
+
+void WirelessLink::flush_pending_responses()
+{
+    portENTER_CRITICAL(&m_pending_lock);
+    if (m_flushing)
+    {
+        // 另一个上下文正在发（主循环与执行任务都会驱动 flush）：别抢队首
+        portEXIT_CRITICAL(&m_pending_lock);
+        return;
+    }
+    m_flushing = true;
+    portEXIT_CRITICAL(&m_pending_lock);
+
+    for (;;)
+    {
+        portENTER_CRITICAL(&m_pending_lock);
+        if (m_pending_count == 0)
+        {
+            portEXIT_CRITICAL(&m_pending_lock);
+            break;
+        }
+        // 队首在本轮 flush 期间不会被别人动：入队只碰队尾，出队只有这里做
+        const PendingResponse &head = m_pending_responses[m_pending_head];
+        const u16 cmd_seq = head.cmd_seq;
+        const u16 len = head.len;
+        const u8 meta = head.meta;
+        const u8 *data = head.data;
+        portEXIT_CRITICAL(&m_pending_lock);
+
+        // 提交在临界区外做：适配层内部会取自己的锁，并把帧直接交给 ESP-NOW
+        if (m_arq.submit_response(cmd_seq, data, len, meta, now_ms()) != ArqLink::Submit::Ok)
+        {
+            break; // 窗口又满了：剩下的留给下一次 flush
+        }
+
+        portENTER_CRITICAL(&m_pending_lock);
+        m_pending_head = static_cast<u8>((m_pending_head + 1) % PENDING_RESPONSE_DEPTH);
+        m_pending_count--;
+        portEXIT_CRITICAL(&m_pending_lock);
+    }
+
+    portENTER_CRITICAL(&m_pending_lock);
+    m_flushing = false;
+    portEXIT_CRITICAL(&m_pending_lock);
+}
+
+bool WirelessLink::enqueue_response(u16 cmd_seq, const u8 *data, u16 len, u8 meta)
+{
+    portENTER_CRITICAL(&m_pending_lock);
+    if (m_pending_count >= PENDING_RESPONSE_DEPTH)
+    {
+        portEXIT_CRITICAL(&m_pending_lock);
+        return false;
+    }
+
+    PendingResponse &item = m_pending_responses[(m_pending_head + m_pending_count) % PENDING_RESPONSE_DEPTH];
+    item.cmd_seq = cmd_seq;
+    item.len = len;
+    item.meta = meta;
+    std::memcpy(item.data, data, len);
+    m_pending_count++;
+    portEXIT_CRITICAL(&m_pending_lock);
+    return true;
+}
+
+u8 WirelessLink::pending_response_count()
+{
+    portENTER_CRITICAL(&m_pending_lock);
+    const u8 count = m_pending_count;
+    portEXIT_CRITICAL(&m_pending_lock);
+    return count;
+}
+
+bool WirelessLink::wait_for_response_slot()
+{
+    const TickType_t start = xTaskGetTickCount();
+    while (xTaskGetTickCount() - start < pdMS_TO_TICKS(RESPONSE_SLOT_WAIT_MS))
+    {
+        // 自己驱动一次可靠传输：窗口靠确认推进，而确认与重传都在 arq_poll 里发出
+        arq_poll(now_ms());
+        if (pending_response_count() < PENDING_RESPONSE_DEPTH)
+        {
+            return true;
+        }
+        vTaskDelay(1);
+    }
+    return pending_response_count() < PENDING_RESPONSE_DEPTH;
 }
 
 bool WirelessLink::arq_established() const

@@ -34,7 +34,10 @@ ArqSettings mlink::arq_default_settings()
     ArqSettings out = {};
     out.generation = 0;
     out.enable = 1;
-    out.window = 8;
+    // 窗口 4：无线 DAP 的响应方向是瓶颈（写命令对读响应），窗口 1 时"上一条响应还在
+    // 等确认、下一条已经执行完"是常态，响应只能排队等；4 条在途实测把响应吞吐抬起来，
+    // 同时远低于编译期上限（arq::MAX_WINDOW = 8），重排缓冲本来就按上限分配
+    out.window = 4;
     out.max_retx = 6;
     out.breaker_failures = 3;
     out.rto_min_ms = 60;

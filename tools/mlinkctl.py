@@ -333,13 +333,16 @@ def render_peer_state(values):
     return parts
 
 
-# 可靠传输（GetStats 的 0x70-0x7C、GetConfig 的 0x54-0x5D，与固件 config_channel.cc 一致）
+# 可靠传输（GetStats 的 0x70-0x7F、GetConfig 的 0x54-0x5D，与固件 config_channel.cc 一致）
 TAG_ARQ_STATE = 0x70
 TAG_ARQ_ACKED = 0x73
 TAG_ARQ_REPLAYED = 0x78
 TAG_ARQ_REPLAY_MISS = 0x79
 TAG_ARQ_SRTT_MS = 0x7A
 TAG_ARQ_RTO_MS = 0x7B
+TAG_ARQ_RESP_WAITS = 0x7D
+TAG_ARQ_RESP_DROPPED = 0x7E
+TAG_ARQ_CMD_DROPPED = 0x7F
 TAG_ARQ_ENABLE = 0x55
 TAG_ARQ_GENERATION = 0x54
 TAG_ARQ_RTO_INIT_MS = 0x5A
@@ -355,7 +358,7 @@ def render_arq_state(values):
     tx = u32_of(values, 0x71)
     retx = u32_of(values, 0x72)
     rate = f"{retx / tx * 100:.1f}%" if tx else "—"
-    return [
+    parts = [
         f"arq={'off' if u8_of(values, TAG_ARQ_ENABLE) == 0 else 'on'}",
         f"arq_window={state & 0x0F}",
         f"arq_in_flight={(state >> 4) & 0x07}",
@@ -366,6 +369,16 @@ def render_arq_state(values):
         f"arq_replayed={u32_of(values, TAG_ARQ_REPLAYED)}",
         f"arq_replay_miss={u32_of(values, TAG_ARQ_REPLAY_MISS)}",
     ]
+    # 丢弃类计数：老固件不上报整组跳过；正常链路上这三个数应恒为 0
+    if TAG_ARQ_RESP_DROPPED in values:
+        parts.extend(
+            (
+                f"arq_resp_waits={u32_of(values, TAG_ARQ_RESP_WAITS)}",
+                f"arq_resp_dropped={u32_of(values, TAG_ARQ_RESP_DROPPED)}",
+                f"arq_cmd_dropped={u32_of(values, TAG_ARQ_CMD_DROPPED)}",
+            )
+        )
+    return parts
 
 
 def render_config(values):
@@ -516,6 +529,12 @@ def cmd_arq(_args):
         f" replayed={u32_of(stats, TAG_ARQ_REPLAYED)}"
         f" replay_miss={u32_of(stats, TAG_ARQ_REPLAY_MISS)}"
     )
+    if TAG_ARQ_RESP_DROPPED in stats:
+        print(
+            f"resp_waits={u32_of(stats, TAG_ARQ_RESP_WAITS)}"
+            f" resp_dropped={u32_of(stats, TAG_ARQ_RESP_DROPPED)}"
+            f" cmd_dropped={u32_of(stats, TAG_ARQ_CMD_DROPPED)}"
+        )
 
 
 def cmd_set_link(args):
@@ -792,7 +811,7 @@ def build_parser():
 
     set_link = subparsers.add_parser("set-link", help="设置可靠传输参数（随即生效并同步给对端）")
     set_link.add_argument("--enable", choices=("on", "off"), help="运行时开关：off = 不等确认、不重传")
-    set_link.add_argument("--window", type=int, metavar="N", help="发送窗口（本固件上限 1）")
+    set_link.add_argument("--window", type=int, metavar="N", help="发送窗口（本固件上限 8，默认 4）")
     set_link.add_argument("--rto-min", type=int, metavar="MS", help="RTO 下限（毫秒）")
     set_link.add_argument("--rto-init", type=int, metavar="MS", help="还没有 RTT 样本时的初始 RTO（毫秒）")
     set_link.add_argument("--rto-max", type=int, metavar="MS", help="RTO 上限（毫秒，退避到此为止）")

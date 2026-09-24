@@ -235,6 +235,19 @@ class WirelessLink
     bool can_submit_command();
 
     /**
+     * 响应方向的两个背压计数（统计上报）：队满进入等待的次数，与等待超时最终丢弃的
+     * 响应数。它们是"只等不丢"策略的自证手段：正常情况下应保持为 0，非 0 说明窗口
+     * 长期没有空位（链路或对端异常）。
+     */
+    u32 resp_slot_waits() const;
+
+    /** 等待超时仍放不下、最终被丢弃的响应数 */
+    u32 resp_dropped() const;
+
+    /** 执行队列满被丢弃的命令数（接收侧跟不上时才会增长） */
+    u32 cmd_queue_dropped() const;
+
+    /**
      * 登记一个对端 peer（encrypt=false）。仅登记尚未存在于 peer list 的地址，
      * 重复调用是安全的。广播地址已由 init() 常驻登记，无需也不应重复登记。
      */
@@ -350,7 +363,53 @@ class WirelessLink
 #if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /** 可靠传输适配层（收发状态机 + 会话握手 + 重放排队，见 arq_link.hpp） */
     ArqLink m_arq;
+
+    /**
+     * 响应待发队列深度。
+     *
+     * 执行任务串行产出响应：窗口满时先入队、队满才阻塞等窗口，队列只是"窗口短暂
+     * 堵塞"的缓冲而不是吞吐通道，够吸收一个窗口的抖动即可。
+     */
+    static constexpr u8 PENDING_RESPONSE_DEPTH = 4;
+
+    /** 队满等待窗口的上限：超过就丢弃并计数——宁可丢也不能让执行任务无限阻塞 */
+    static constexpr u32 RESPONSE_SLOT_WAIT_MS = 500;
+
+    struct PendingResponse
+    {
+        u16 cmd_seq;
+        u16 len;
+        u8 meta;
+        u8 data[MAX_DAP_PAYLOAD_SIZE];
+    };
+
+    /** 提交一条响应：窗口可用就直发，否则入队，队满时等窗口（详见 .cc 顶部注释） */
+    void submit_response_or_queue(u16 cmd_seq, const u8 *data, u16 len, u8 meta);
+
+    /** 把队首响应依次交给可靠传输：窗口空出来就继续下一条 */
+    void flush_pending_responses();
+
+    /** 入队一条待发响应；队满返回 false */
+    bool enqueue_response(u16 cmd_seq, const u8 *data, u16 len, u8 meta);
+
+    /** 当前待发响应条数 */
+    u8 pending_response_count();
+
+    /** 队满时等窗口空位：期间驱动 arq_poll；返回 false = 超时仍无空位 */
+    bool wait_for_response_slot();
+
+    PendingResponse m_pending_responses[PENDING_RESPONSE_DEPTH] = {};
+    u8 m_pending_head = 0;
+    u8 m_pending_count = 0;
+    /** flush 串行化标记：主循环与执行任务都会驱动 flush，同一时刻只允许一个在跑 */
+    bool m_flushing = false;
+    portMUX_TYPE m_pending_lock = portMUX_INITIALIZER_UNLOCKED;
 #endif
+
+    /** 丢弃类计数：与可靠传输开关无关地存在（关闭时恒为 0），由统计通道上报 */
+    volatile u32 m_resp_slot_waits = 0;
+    volatile u32 m_resp_dropped = 0;
+    volatile u32 m_cmd_queue_dropped = 0;
 };
 } // namespace mlink
 
