@@ -98,7 +98,6 @@ export const PEER_OFFLINE = 2;
  * 固件未编译该功能时整组不下发，界面显示「—」。
  */
 const TAG_ARQ_GENERATION = 0x54;
-const TAG_ARQ_ENABLE = 0x55;
 const TAG_ARQ_WINDOW = 0x56;
 const TAG_ARQ_MAX_RETX = 0x57;
 const TAG_ARQ_BREAKER = 0x58;
@@ -123,7 +122,7 @@ const TAG_ARQ_RTO_MS = 0x7b;
 const TAG_ARQ_BREAKER_TRIPS = 0x7c;
 
 /** SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，与响应帧的 tag 无关。 */
-const LINK_TAG_ENABLE = 0x01;
+// 0x01 未分配（保留号位）
 const LINK_TAG_WINDOW = 0x02;
 const LINK_TAG_MAX_RETX = 0x03;
 const LINK_TAG_BREAKER = 0x04;
@@ -249,7 +248,6 @@ export type ArqStateKey =
 
 /** SetLinkConfig 的载荷：只带要改的字段，undefined = 保持设备当前值。 */
 export type LinkConfigPatch = {
-	enable?: number;
 	window?: number;
 	maxRetx?: number;
 	breaker?: number;
@@ -376,7 +374,6 @@ export type DeviceConfig = {
 	lossPermille: number | null;
 	/** 可靠传输参数（0x54-0x5D）；固件未编译该功能时为 null。 */
 	arqGeneration: number | null;
-	arqEnable: number | null;
 	arqWindow: number | null;
 	arqMaxRetx: number | null;
 	arqBreaker: number | null;
@@ -572,7 +569,6 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
 		lossPermille: readOptional(tags.get(TAG_CONFIG_LOSS_PERMILLE)),
 		arqGeneration: readOptional(tags.get(TAG_ARQ_GENERATION)),
-		arqEnable: readOptional(tags.get(TAG_ARQ_ENABLE)),
 		arqWindow: readOptional(tags.get(TAG_ARQ_WINDOW)),
 		arqMaxRetx: readOptional(tags.get(TAG_ARQ_MAX_RETX)),
 		arqBreaker: readOptional(tags.get(TAG_ARQ_BREAKER)),
@@ -730,7 +726,6 @@ export async function writeLinkConfig(
 		encodeTlv(tag, new Uint8Array([(value >> 8) & 0xff, value & 0xff]));
 
 	const parts: Uint8Array[] = [];
-	if (patch.enable !== undefined) parts.push(u8(LINK_TAG_ENABLE, patch.enable));
 	if (patch.window !== undefined) parts.push(u8(LINK_TAG_WINDOW, patch.window));
 	if (patch.maxRetx !== undefined) parts.push(u8(LINK_TAG_MAX_RETX, patch.maxRetx));
 	if (patch.breaker !== undefined) parts.push(u8(LINK_TAG_BREAKER, patch.breaker));

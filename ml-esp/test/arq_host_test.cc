@@ -161,10 +161,16 @@ struct Sim
     /** 按应用层载荷大小提交一条消息；窗口满或熔断时记数并返回 false */
     bool try_submit(u32 id)
     {
+        return try_submit(id, 0);
+    }
+
+    /** retx_limit = 0 表示用配置里的重传上限 */
+    bool try_submit(u32 id, u8 retx_limit)
+    {
         u8 buf[4];
         std::memcpy(buf, &id, sizeof(id));
         u16 seq = 0;
-        const SubmitResult r = ep[0].tx.submit(buf, sizeof(buf), now, &seq);
+        const SubmitResult r = ep[0].tx.submit(buf, sizeof(buf), now, retx_limit, &seq);
         if (r == SubmitResult::WindowFull)
         {
             ep[0].window_full++;
@@ -615,6 +621,41 @@ void test_failure_budget()
     CHECK(sim.ep[0].tx.idle());
 }
 
+void test_retx_limit_override()
+{
+    // 单条消息的重传上限覆盖配置值：上限 1 时首传 + 一次重传就判死（≈180ms），
+    // 而默认预算（6 次）要 ≈1.4s
+    Link link;
+    link.blackout = true;
+
+    Sim sim;
+    sim.init(Config{}, link);
+
+    u8 buf[4] = {1, 2, 3, 4};
+    u16 seq = 0;
+    CHECK(sim.ep[0].tx.submit(buf, sizeof(buf), sim.now, 1, &seq) == SubmitResult::Ok);
+    CHECK_EQ(seq, 0u);
+
+    u32 failed_at = 0;
+    for (u32 ms = 0; ms < 3000 && sim.ep[0].tx.snapshot().failed_frames == 0; ++ms)
+    {
+        sim.step();
+        sim.now++;
+        failed_at = sim.now;
+    }
+
+    CHECK_EQ(sim.ep[0].tx.snapshot().failed_frames, 1u);
+    CHECK(failed_at >= 150 && failed_at <= 250);
+    CHECK(sim.ep[0].tx.idle());
+
+    // 覆盖只作用于那一条：链路恢复后不带覆盖的消息照常按配置预算跑完并送达
+    sim.link.blackout = false;
+    sim.outbox.push_back(42);
+    CHECK(sim.run_until_done(5000));
+    CHECK_EQ(sim.got.size(), 1u);
+    CHECK_EQ(sim.got[0], 42u);
+}
+
 void test_breaker_and_recovery()
 {
     Config cfg;
@@ -837,6 +878,7 @@ const TestCase kTests[] = {
     {"窗口 8 流水线", test_window_pipelining},
     {"序号回绕 70000 条", test_sequence_wraparound},
     {"重传预算与失败时刻", test_failure_budget},
+    {"单条消息覆盖重传上限", test_retx_limit_override},
     {"熔断与恢复", test_breaker_and_recovery},
     {"放弃后空洞可跳过、流继续走", test_gap_skip_after_give_up},
     {"对端窗口为 0 时流控", test_flow_control_blocks_on_zero_window},

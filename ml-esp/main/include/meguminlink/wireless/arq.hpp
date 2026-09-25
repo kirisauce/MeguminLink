@@ -99,7 +99,8 @@ struct Config
      * 超时之外（当前取值下最坏 1.42s，仍在 1.8s 之内）。
      */
     u16 initial_rto_ms = 60;
-    /** 单条消息的重传次数上限（首传不计）；超限即判定失败并丢弃 */
+    /** 单条消息的重传次数上限（首传不计）；超限即判定失败并丢弃。单条消息可用
+     *  submit 的 retx_limit 覆盖它 */
     u8 max_retx = 6;
     /** 连续多少条消息重传耗尽后熔断（快速失败），0 = 不熔断 */
     u8 breaker_failures = 3;
@@ -155,11 +156,8 @@ using EventFn = void (*)(void *ctx, Event event, u16 seq, u32 now_ms);
  *                   未确认帧"时置位，因此语义是精确的：此前要么已确认、要么已
  *                   放弃，不存在仍在途的帧。接收端若不处理这个标记，一次放弃就
  *                   会在流里留下永久空洞，后续帧全被判成超窗而整条链路僵死。
- * @param meta        随消息携带的 1 字节元数据；重传与重放时原样带回（DAP 命令用
- *                    它承载主机侧 USB 传输通道，见 DAP_CHANNEL_*）
  */
-using TransmitFn = void (*)(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
-                            u8 meta);
+using TransmitFn = void (*)(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before);
 
 /**
  * 序号模比较：seq 是否落在 ref 之前（累积确认覆盖的范围）。
@@ -350,9 +348,10 @@ class Sender
 
     /**
      * 提交一条消息：分配序号、拷进窗口、立即首次发送。
+     * @param retx_limit 本条消息的重传次数上限；0 = 用 Config::max_retx
      * @param seq_out 可选，成功时回填本条消息的序号
      */
-    SubmitResult submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out = nullptr);
+    SubmitResult submit(const u8 *payload, u16 len, u32 now_ms, u8 retx_limit, u16 *seq_out = nullptr);
 
     /**
      * 重放一条仍在窗内的消息（接收端再次索要同一响应时用）。
@@ -422,7 +421,7 @@ class Sender
     {
         u16 seq;
         u16 len;
-        u8 meta;          /**< 随消息携带的 1 字节元数据，重传时原样带回 */
+        u8 retx_limit;    /**< 本条消息的重传次数上限（0 = 用配置值），重传时读它算预算 */
         u8 retx;          /**< 已重传次数（首传不计） */
         u8 backoff_shift; /**< 本条消息的退避指数 */
         bool used;
@@ -501,15 +500,14 @@ class ReorderStore
     void init(u8 *storage, size_t slot_cap, size_t slot_count);
 
     /** 存一帧乱序载荷（仅在 on_frame 返回 Buffered 后调用）；超长按 slot_cap 截断 */
-    void store(u16 seq, const u8 *payload, u16 len, u8 meta);
+    void store(u16 seq, const u8 *payload, u16 len);
 
     /**
      * 取一帧载荷。
      * @param len  可选，回填该帧的载荷长度
-     * @param meta 可选，回填该帧随消息携带的 1 字节元数据
      * @return 载荷指针；该序号没有有效载荷时返回 nullptr
      */
-    const u8 *get(u16 seq, u16 *len, u8 *meta) const;
+    const u8 *get(u16 seq, u16 *len) const;
 
     /** 释放一帧（交付完成或确认丢弃后调用） */
     void release(u16 seq);
@@ -524,7 +522,6 @@ class ReorderStore
     size_t m_slot_cap = 0;
     size_t m_slot_count = 1;
     u16 m_len[MAX_WINDOW] = {};
-    u8 m_meta[MAX_WINDOW] = {};
     bool m_valid[MAX_WINDOW] = {};
 };
 

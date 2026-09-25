@@ -104,6 +104,8 @@ STATS_FIELDS = [
     (0x74, "arq_failed"),
     (0x75, "arq_dup"),
     (0x7C, "arq_breaker_trips"),
+    (0x7D, "arq_tx_dropped"),
+    (0x7E, "arq_rx_dropped"),
     (0x40, "uptime_ms"),
 ]
 
@@ -119,7 +121,6 @@ CONFIG_FIELDS = [
     (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
     (TAG_CONFIG_LOSS_PERMILLE, "loss_percent"),
     (0x54, "arq_generation"),
-    (0x55, "arq_enable"),
     (0x56, "arq_window"),
     (0x57, "arq_max_retx"),
     (0x58, "arq_breaker"),
@@ -340,10 +341,9 @@ TAG_ARQ_REPLAYED = 0x78
 TAG_ARQ_REPLAY_MISS = 0x79
 TAG_ARQ_SRTT_MS = 0x7A
 TAG_ARQ_RTO_MS = 0x7B
-TAG_ARQ_RESP_WAITS = 0x7D
-TAG_ARQ_RESP_DROPPED = 0x7E
+TAG_ARQ_TX_DROPPED = 0x7D
+TAG_ARQ_RX_DROPPED = 0x7E
 TAG_ARQ_CMD_DROPPED = 0x7F
-TAG_ARQ_ENABLE = 0x55
 TAG_ARQ_GENERATION = 0x54
 TAG_ARQ_RTO_INIT_MS = 0x5A
 TAG_ARQ_PROBE_MS = 0x5D
@@ -359,7 +359,6 @@ def render_arq_state(values):
     retx = u32_of(values, 0x72)
     rate = f"{retx / tx * 100:.1f}%" if tx else "—"
     parts = [
-        f"arq={'off' if u8_of(values, TAG_ARQ_ENABLE) == 0 else 'on'}",
         f"arq_window={state & 0x0F}",
         f"arq_in_flight={(state >> 4) & 0x07}",
         f"arq_broken={'yes' if state & 0x80 else 'no'}",
@@ -370,11 +369,11 @@ def render_arq_state(values):
         f"arq_replay_miss={u32_of(values, TAG_ARQ_REPLAY_MISS)}",
     ]
     # 丢弃类计数：老固件不上报整组跳过；正常链路上这三个数应恒为 0
-    if TAG_ARQ_RESP_DROPPED in values:
+    if TAG_ARQ_TX_DROPPED in values:
         parts.extend(
             (
-                f"arq_resp_waits={u32_of(values, TAG_ARQ_RESP_WAITS)}",
-                f"arq_resp_dropped={u32_of(values, TAG_ARQ_RESP_DROPPED)}",
+                f"arq_tx_dropped={u32_of(values, TAG_ARQ_TX_DROPPED)}",
+                f"arq_rx_dropped={u32_of(values, TAG_ARQ_RX_DROPPED)}",
                 f"arq_cmd_dropped={u32_of(values, TAG_ARQ_CMD_DROPPED)}",
             )
         )
@@ -402,12 +401,9 @@ def render_config(values):
             code = int.from_bytes(raw, "big") if raw else None
             value = "?" if code is None else f"{code / 10:.1f}%"
         elif name.startswith("arq_"):
-            # 可靠传输参数都是整数；开关单独译成人看得懂的 on/off
+            # 可靠传输参数都是整数
             code = int.from_bytes(raw, "big") if raw else None
-            if name == "arq_enable":
-                value = "?" if code is None else ("on" if code else "off")
-            else:
-                value = "?" if code is None else code
+            value = "?" if code is None else code
         else:
             value = raw.decode("utf-8", "replace") if raw is not None else ""
         parts.append(f"{name}={value}")
@@ -502,8 +498,7 @@ def cmd_arq(_args):
     tx = u32_of(stats, 0x71)
     retx = u32_of(stats, 0x72)
     print(
-        f"arq={'off' if u8_of(config, TAG_ARQ_ENABLE) == 0 else 'on'}"
-        f" window={state & 0x0F}"
+        f"window={state & 0x0F}"
         f" in_flight={(state >> 4) & 0x07}"
         f" broken={'yes' if state & 0x80 else 'no'}"
         f" generation={u32_of(config, TAG_ARQ_GENERATION)}"
@@ -529,10 +524,10 @@ def cmd_arq(_args):
         f" replayed={u32_of(stats, TAG_ARQ_REPLAYED)}"
         f" replay_miss={u32_of(stats, TAG_ARQ_REPLAY_MISS)}"
     )
-    if TAG_ARQ_RESP_DROPPED in stats:
+    if TAG_ARQ_TX_DROPPED in stats:
         print(
-            f"resp_waits={u32_of(stats, TAG_ARQ_RESP_WAITS)}"
-            f" resp_dropped={u32_of(stats, TAG_ARQ_RESP_DROPPED)}"
+            f"tx_dropped={u32_of(stats, TAG_ARQ_TX_DROPPED)}"
+            f" rx_dropped={u32_of(stats, TAG_ARQ_RX_DROPPED)}"
             f" cmd_dropped={u32_of(stats, TAG_ARQ_CMD_DROPPED)}"
         )
 
@@ -540,7 +535,6 @@ def cmd_arq(_args):
 def cmd_set_link(args):
     """下发可靠传输参数：只覆盖指定的字段，代数由设备自己 +1。"""
     u8_items = [
-        ("enable", 0x01, None if args.enable is None else (1 if args.enable == "on" else 0)),
         ("window", 0x02, args.window),
         ("max-retx", 0x03, args.max_retx),
         ("breaker", 0x04, args.breaker),
@@ -568,7 +562,7 @@ def cmd_set_link(args):
         payload += encode_tlv(tag, value.to_bytes(2, "big"))
 
     if not payload:
-        die("至少要指定一个参数（--enable / --window / --rto-min / --max-retx / …）")
+        die("至少要指定一个参数（--window / --rto-min / --max-retx / …）")
 
     dev = find_device()
     generation = u32_of(decode(fetch(dev, CMD_GET_CONFIG)), TAG_ARQ_GENERATION)
@@ -810,7 +804,6 @@ def build_parser():
     set_mode.set_defaults(handler=cmd_set_mode)
 
     set_link = subparsers.add_parser("set-link", help="设置可靠传输参数（随即生效并同步给对端）")
-    set_link.add_argument("--enable", choices=("on", "off"), help="运行时开关：off = 不等确认、不重传")
     set_link.add_argument("--window", type=int, metavar="N", help="发送窗口（本固件上限 8，默认 4）")
     set_link.add_argument("--rto-min", type=int, metavar="MS", help="RTO 下限（毫秒）")
     set_link.add_argument("--rto-init", type=int, metavar="MS", help="还没有 RTT 样本时的初始 RTO（毫秒）")

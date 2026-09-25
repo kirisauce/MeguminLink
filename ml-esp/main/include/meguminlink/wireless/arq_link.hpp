@@ -3,16 +3,73 @@
 #define __MEGUMINLINK_ARQ_LINK_HPP__
 
 #include "esp_err.h"
-#include "meguminlink/wireless/arq.hpp"
 #include "meguminlink/common.hpp"
+#include "meguminlink/wireless/arq.hpp"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include <cstddef>
 
 namespace mlink
 {
+/**
+ * 单调毫秒时基：ARQ 层与链路层共用同一个时间口径（FreeRTOS tick 换算）。
+ *
+ * 放在这里而不是 common.hpp：那个头被纯算法核心 arq.hpp include，必须保持零
+ * ESP-IDF 依赖（宿主机单测要能直接编它）。
+ */
+inline u32 now_ms()
+{
+    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+// ---- 线格式 ----
+
+/**
+ * ARQ 帧：无线链路上只有这一种帧。头部 8 字节固定，之后是载荷，字段一律大端。
+ * 载荷形态由 flags 的形态位决定：数据帧的载荷是一个业务包（[type:1B][body]），
+ * 纯确认帧没有载荷，会话重置帧的载荷是本层的 23 字节重置信息。
+ *
+ * 业务包对本层是不透明字节：本层不解析它，只负责可靠地把它送到对面。
+ * 单帧上限是 ESP-NOW v2 的 1470B，扣掉头部即本层能承载的载荷上限。
+ */
+inline constexpr size_t ARQ_HEADER_SIZE = 8;
+
+/** ARQ 帧 flags 位 */
+inline constexpr u8 ARQ_FLAG_RELIABLE = 0x01;   /**< 载荷是可靠消息（占序号、进窗口、可按序交付） */
+inline constexpr u8 ARQ_FLAG_RETRANSMIT = 0x02; /**< 本帧是重传 */
+inline constexpr u8 ARQ_FLAG_GAP_BEFORE = 0x04; /**< 本序号之前的空洞已被发送端放弃 */
+inline constexpr u8 ARQ_FLAG_ACK_ONLY = 0x08;   /**< 无载荷的纯确认 */
+inline constexpr u8 ARQ_FLAG_RESET = 0x10;      /**< 载荷是会话重置信息 */
+
+/** 载荷形态位：两位都不置 = 载荷是业务包 */
+inline constexpr u8 ARQ_FLAG_KIND_MASK = ARQ_FLAG_ACK_ONLY | ARQ_FLAG_RESET;
+
+/** 只对数据帧有意义的位（与形态位互斥） */
+inline constexpr u8 ARQ_FLAG_MESSAGE_MASK = ARQ_FLAG_RELIABLE | ARQ_FLAG_RETRANSMIT | ARQ_FLAG_GAP_BEFORE;
+
+/** 本层能承载的单条载荷上限（单帧上限 1470B 减去头部） */
+inline constexpr size_t ARQ_MAX_PAYLOAD = 1462;
+
+/** 一整帧的上限（含头部），接收通道按它开槽 */
+inline constexpr size_t ARQ_FRAME_MAX_SIZE = ARQ_HEADER_SIZE + ARQ_MAX_PAYLOAD;
+
+/** 会话重置载荷的线格式长度：epoch 4 + 代数 4 + 三个 1B 参数 + 五个 u16 参数 + 标志 2 */
+inline constexpr size_t ARQ_RESET_PAYLOAD_SIZE = 4 + 4 + 3 + 10 + 2;
+
+/** ARQ 帧头：线格式的头 8 个字节 */
+struct ArqHeader
+{
+    u16 seq;    /**< 本帧序号（可靠消息有效） */
+    u16 ack;    /**< 累积确认号：已连续收到 < ack 的全部帧 */
+    u16 sack;   /**< 选择确认位图：第 i 位对应 seq == ack + 1 + i */
+    u8 window;  /**< 本端接收窗口通告（0 = 请对端暂停发送） */
+    u8 flags;   /**< ARQ_FLAG_* */
+};
+
 /**
  * 可靠传输参数。整份参数两端必须一致，否则窗口、重传预算这些会各按各的算，
  * 测出来的行为解释不了。
@@ -24,9 +81,8 @@ namespace mlink
 struct ArqSettings
 {
     u32 generation;       /**< 参数代数：每次主机下发 +1（落 NVS） */
-    u8 enable;            /**< 运行时开关：0 = 绕过核心，等价尽力而为（帧格式不变） */
-    u8 window;            /**< 发送窗口（本批固定 1） */
-    u8 max_retx;          /**< 单条消息重传次数上限 */
+    u8 window;            /**< 发送窗口 */
+    u8 max_retx;          /**< 单条消息重传次数上限（单条消息可单独覆盖） */
     u8 breaker_failures;  /**< 连续多少条重传耗尽后熔断，0 = 不熔断 */
     u16 rto_min_ms;       /**< RTO 下限 */
     u16 initial_rto_ms;   /**< 还没有 RTT 样本时的初始 RTO */
@@ -51,32 +107,83 @@ ArqSettings arq_settings_load();
 esp_err_t arq_settings_store(const ArqSettings &settings);
 
 /**
- * 无线链路的可靠传输适配层：把 arq::Sender / arq::Receiver 接到实际的收发上，
- * 并管理会话握手、待发确认与重复帧重放的排队。
+ * 无线链路的 ARQ 层：把 arq::Sender / arq::Receiver 接到实际的收发上，并管理
+ * 会话握手、待发确认与重复帧重放。
  *
- * 它与帧的编解码无关——只认"载荷 + 序号 + 标志"，帧封成什么样、扩展头怎么排由
- * wireless_link 决定。因此它既不需要认识 Packet，也不会和 wireless/link.hpp 互相
- * 包含。
+ * 它独占一个任务：全部 ARQ 状态只在那个任务里被读写，因此核心与状态机不需要
+ * 互斥量。外部只有三件事：
+ * 1. 提交——业务包字节 + 目标 MAC + 可靠性等级（见 submit），投进待发环即返回；
+ * 2. 入向——ESP-NOW 回调把原始帧投进接收环（见 on_frame）；
+ * 3. 查询——会话是否对齐、能不能提交、失败序号、累计计数（走对外缓存）。
  *
- * 上下文约定是本层最要紧的一条：
- * - on_ack / on_message / on_reset 由 ESP-NOW 接收回调调用（esp_wifi 任务），**只
- *   更新状态与待发标记，绝不发送**——接收回调里发帧会重入 WiFi 驱动；
- * - poll / submit / reset_session 由任务上下文调用（USB 侧 dap_task、主循环），
- *   所有出向帧都只在这里发出。
- * 核心状态由一把互斥量串行化，两个上下文因此可以并存。
+ * 与帧的编解码无关：只认"载荷 + 序号 + 标志"，业务包封成什么样由 wireless_link
+ * 决定。因此它既不需要认识 Packet，也不会和 wireless/link.hpp 互相包含。
  *
- * 输出全部走回调：可靠消息、纯确认、会话重置、按序交付各一个。回调在持锁状态下
- * 被调用，因此它们必须只做非阻塞的事（送空口、入队、写响应缓冲），且不得回调本层。
+ * 可靠性由提交方给出（见 Reliability），本层不按载荷内容猜：可靠消息占序号、
+ * 进窗口、按重传预算保达并按序交付；不可靠消息直接发、收到即交付，只借用数据帧
+ * 捎带确认。
+ *
+ * 输出全部走回调，且都在任务上下文里被调用：裸发送与按序交付各一个。交付回调
+ * 必须只做非阻塞的事（入队、写缓冲），它有可能会推迟重传定时器。
  */
 class ArqLink
 {
   public:
+    /** 一条消息的可靠性等级，由提交方给出 */
+    enum class Reliability : u8
+    {
+        Unreliable, /**< 不占序号、不进窗口：直接发，收到即交付 */
+        Reliable,   /**< 占序号、进窗口：按重传预算保达，接收端按序交付 */
+    };
+
+    /** 提交时携带的传输属性（与载荷内容无关） */
+    struct TxOptions
+    {
+        Reliability reliable = Reliability::Reliable;
+        /** 本条消息的重传次数上限；0 = 用配置里的 max_retx */
+        u8 retx_limit = 0;
+        /** 是否参与注入丢帧（配对、探测、控制帧应当置 false） */
+        bool loss_injectable = true;
+    };
+
+    /** 提交结果 */
+    enum class Submit : u8
+    {
+        Ok,             /**< 已进入待发环 */
+        Invalid,        /**< 载荷为空或超过本层上限 */
+        NoPeer,         /**< 还没有会话对端 */
+        NotEstablished, /**< 可靠消息且会话尚未对齐 */
+        BreakerOpen,    /**< 熔断中，此刻提交会被快速失败 */
+        QueueFull,      /**< 待发环已满，调用方应稍后重试或按自己的策略丢弃 */
+    };
+
+    /** 本层的全部输出 */
+    struct Callbacks
+    {
+        void *ctx = nullptr;
+
+        /**
+         * 裸发送：把这段缓冲发给这个 MAC。本层不解释缓冲内容，链路侧的发送
+         * 原语同样只看缓冲区。
+         *
+         * @param reliable        本帧是否承载可靠消息（链路据此让路与退避）
+         * @param loss_injectable 本帧是否参与注入丢帧（测试设施）
+         */
+        void (*send_raw)(void *ctx, const u8 *dest_mac, const u8 *data, size_t len, bool reliable,
+                         bool loss_injectable) = nullptr;
+
+        /**
+         * 一条消息的载荷：可靠消息按序到达，不可靠消息收到即交付。对端 MAC 一并
+         * 给出（本回调在任务里被调用，回头调本层的 peer 查询没有必要）。
+         */
+        void (*deliver)(void *ctx, const u8 *src_mac, u16 seq, const u8 *payload, u16 len) = nullptr;
+    };
+
     /**
-     * 可靠传输能承载的载荷上限。取"ARQ 关闭时 DAP 单帧载荷"的旧上界，作为本层
-     * 静态缓冲的尺寸依据；实际生效值由 init() 传入（ARQ 打开时更小），调用方用
-     * static_assert 保证传进来的值不超过它。
+     * 本层能承载的单条载荷上限。业务包（含自己的类型与长度字段）必须装得下它，
+     * 否则提交会被判 Invalid；wireless_link 侧用 static_assert 把两者绑住。
      */
-    inline static constexpr size_t MAX_PAYLOAD = 1467;
+    inline static constexpr size_t MAX_PAYLOAD = ARQ_MAX_PAYLOAD;
 
     /** 会话握手超时：超过这么久还没对齐，调用方应把命令按失败处理 */
     inline static constexpr u32 HANDSHAKE_TIMEOUT_MS = 5000;
@@ -87,63 +194,50 @@ class ArqLink
     /** 回应对方重置请求的最小间隔（挡住对端重发造成的回显风暴） */
     inline static constexpr u32 RESET_REPLY_MIN_MS = 200;
 
-    /** 提交结果 */
-    enum class Submit : u8
-    {
-        Ok,             /**< 已进入窗口并发出 */
-        NotEstablished, /**< 会话尚未对齐，调用方应等握手或按失败处理 */
-        WindowFull,     /**< 窗口已满（含对端通告的接收窗口为 0） */
-        BreakerOpen,    /**< 熔断中，快速失败 */
-        Invalid,        /**< 载荷非法 */
-    };
+    /** 待发环深度：可靠方向按窗口上限开槽，不可靠方向只吸收突发 */
+    static constexpr size_t TX_RELIABLE_DEPTH = arq::MAX_WINDOW;
+    static constexpr size_t TX_UNRELIABLE_DEPTH = 4;
 
-    /** 发一条可靠消息（首传 / 重传 / 重放） */
-    using TransmitFn = void (*)(void *ctx, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
-                                u8 meta, u16 ack, u16 sack, u8 window);
+    /** 接收环深度：回调只投递，解析与状态更新都在任务里 */
+    static constexpr size_t RX_DEPTH = 3;
 
-    /** 发一个纯确认帧（没有数据可捎带时） */
-    using AckFn = void (*)(void *ctx, u16 ack, u16 sack, u8 window);
-
-    /**
-     * 发一个会话重置帧。重置帧同时携带本端的参数与确认/窗口通告：参数靠它传给
-     * 对端（请求会周期性重发直到握手完成，因此带重传保证），而扩展头的 window
-     * 在所有帧上的含义都一样（本端还能收多少），漏填会被对端当成"窗口为 0"。
-     *
-     * @param echo true = 对端请求的回显（收到方不再回），false = 本端的重置请求
-     */
-    using ResetFn = void (*)(void *ctx, u32 epoch, const ArqSettings &settings, bool echo, u16 ack, u16 sack,
-                             u8 window);
-
-    /**
-     * 按序交付一条可靠消息。对端 MAC 一并给出：本回调是在持锁状态下被调用的，
-     * 再回头调本层的 peer_mac() 会去抢同一把非递归互斥量而死锁。meta 是这条消息
-     * 随帧携带的 1 字节元数据，乱序补齐时按消息逐条还原（见 ReorderStore）。
-     *
-     * 乱序补齐时它会在同一次 on_message 里按序被连续调用多次（补齐几帧就几次），
-     * 实现必须接得住连续交付，不能假设"一次收帧只交付一条"。
-     */
-    using DeliverFn = void (*)(void *ctx, const u8 *peer_mac, u16 seq, const u8 *payload, u16 len, u8 meta);
-
-    /** 本层的全部输出 */
-    struct Callbacks
-    {
-        void *ctx = nullptr;
-        TransmitFn transmit = nullptr;
-        AckFn send_ack = nullptr;
-        ResetFn send_reset = nullptr;
-        DeliverFn deliver = nullptr;
-    };
+    /** 任务优先级：高于串口/USB 任务（5），低于 dap-wireless（24）与 esp_wifi（23） */
+    static constexpr UBaseType_t TASK_PRIORITY = 6;
+    static constexpr u32 TASK_STACK = 5120;
 
     /**
      * @param settings     参数（通常来自 arq_settings_load()）
-     * @param payload_cap  单条可靠消息的载荷上限（≤ MAX_PAYLOAD）
+     * @param payload_cap  单条载荷上限（≤ MAX_PAYLOAD，由调用方按业务包上限给出）
      */
     esp_err_t init(const ArqSettings &settings, size_t payload_cap);
 
     void set_callbacks(const Callbacks &callbacks);
 
+    /**
+     * 提交一条消息：投进待发环即返回，真正的封帧与发送在任务里做。
+     *
+     * 可靠性由调用方给出，本层不猜。可靠消息在环里排队等窗口：窗口满不会失败，
+     * 只有环满才返回 QueueFull。会话未对齐或熔断中会立即拒绝，让调用方形成背压
+     * 而不是把消息悄悄积压。
+     *
+     * @param dest_mac 目标 MAC（可靠消息必须是会话对端）
+     * @param seq_out  可选：本条可靠消息的序号。可靠消息的序号按提交顺序分配，
+     *                 与核心的发送序号同源同序，调用方据此把响应配回命令
+     */
+    Submit submit(const u8 *payload, u16 len, const u8 *dest_mac, const TxOptions &options,
+                  u16 *seq_out = nullptr);
+
+    /**
+     * 提交一条 DAP 响应，并记下它回应的是哪条命令：对端重传那条命令时据此找回
+     * 这条响应重放，从而不必重新执行命令。
+     */
+    Submit submit_response(u16 cmd_seq, const u8 *payload, u16 len, const u8 *dest_mac, const TxOptions &options);
+
+    /** ESP-NOW 接收回调：只把原始帧投进接收环（环满则丢帧并计数） */
+    void on_frame(const u8 *src_mac, const u8 *data, size_t len);
+
     /** 设定会话对端；对端变化会重置会话（两端序号基准重新对齐） */
-    void set_peer(const u8 *peer_mac, u32 now_ms);
+    void set_peer(const u8 *peer_mac);
 
     /** 清除会话对端（离开无线模式/配对丢失） */
     void clear_peer();
@@ -154,117 +248,55 @@ class ArqLink
     bool established() const;
 
     /**
+     * 现在能不能提交新消息（会话已对齐、窗口还有空位、且不在熔断里）。
+     *
+     * 调用方据此形成背压：不能提交时先别取新命令，让命令留在队列里、由 USB 把主机
+     * 挡回去。取出来再丢弃会让主机那条命令永远等不到响应，只能一路超时。
+     */
+    bool can_submit() const;
+
+    /**
      * 取出一条"重传耗尽、已判定失败"的消息序号。
      *
      * 失败的消息不会再有响应，调用方据此把在途条目销账（策略是不回响应、让主机
-     * 那条命令自己超时）。核心的事件回调跑在持锁上下文里，不能直接回调上层，
-     * 因此这里改成查询式的小队列。
-     * @return false = 当前没有待处理的失败
+     * 那条命令自己超时）。
      */
     bool take_failed(u16 *seq_out);
 
     /**
-     * 现在能不能提交新消息（会话已对齐、窗口还有空位）。
-     *
-     * 调用方据此形成背压：不能提交时先别取新命令，让命令留在队列里、由 USB 把主机
-     * 挡回去。取出来再丢弃会让主机那条命令永远等不到响应，只能一路超时。
-     *
-     * 熔断期间只在试探时刻返回真：那条命令就是试探。若这里一律返回假，调用方永远
-     * 不提交，核心里的试探放行就永远不会被触发——熔断再也恢复不了。
-     * 未启用可靠传输时没有窗口概念，返回真。
+     * 链路被证明可用（主循环收到对端 Pong 一类回显）：登记给任务清掉熔断与连续
+     * 失败计数。任何上下文都可以调用。
      */
-    bool can_submit(u32 now_ms) const;
+    void request_link_alive();
 
     /**
-     * 链路被证明可用（收到对端任何帧，例如熔断期探针 Ping 的回显）：清掉熔断与连续
-     * 失败计数。
-     * @return true = 刚从熔断恢复
+     * 应用一份新参数（主机下发）：立即置为待应用，任务换新 epoch 重置会话并把
+     * 参数随会话重置帧传给对端；参数同时标记为待落盘（NVS 写入由主循环做）。
      */
-    bool notify_link_alive();
+    esp_err_t apply_settings(const ArqSettings &settings);
 
-    /**
-     * 应用一份新参数（主机下发）：立即生效、换新 epoch 重置会话，新参数随会话
-     * 重置帧传给对端；并把参数标记为待落盘（NVS 写入由主循环做）。
-     */
-    esp_err_t apply_settings(const ArqSettings &settings, u32 now_ms);
-
-    /** 当前参数快照（配置读取与落盘用） */
+    /** 当前参数（对外缓存副本） */
     ArqSettings settings() const;
 
     /** 参数被主机或对端改动过：主循环取走并落盘（取走即清标记） */
     bool take_settings_dirty();
 
-    /** 是否还有收到但未确认的帧（调用方据此把 delayed ACK 的到期时刻算进等待超时） */
-    bool ack_pending() const;
-
-    /** 捎带用：出向帧都带扩展头，因此每次发送都会取走一次确认信息 */
-    struct Piggyback
-    {
-        u16 ack;
-        u16 sack;
-        u8 window;
-    };
-
-    /**
-     * 取走本端接收侧的确认信息，供非可靠帧（Ping、串口数据、控制帧）捎带。
-     * 取用即视为确认义务已随该帧完成，因此会清掉待发标记。
-     */
-    Piggyback take_piggyback();
-
-    /** 会话对端 MAC；返回 false 表示当前没有对端 */
-    bool peer_mac(u8 *out) const;
-
-    // ---- 接收路径（ESP-NOW 回调上下文；只置标记，不发送）----
-
-    /** 任意帧捎带的确认信息 */
-    void on_ack(u16 ack, u16 sack, u8 window, u32 now_ms);
-
-    /** 一条可靠消息（DAP 命令或响应，取决于是链路的哪一端） */
-    void on_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u8 meta, u32 now_ms);
-
-    /** 对端的会话重置请求（携带对端参数） */
-    void on_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now_ms);
-
-    // ---- 任务上下文 ----
-
-    /** 驱动重传、纯确认、重放与会话握手；所有出向帧都在这里发出 */
-    void poll(u32 now_ms);
-
-    /**
-     * 下一个需要 poll 的时刻（毫秒绝对值）；没有待办时返回 0。
-     * 调用方据此设置等待超时，空闲时不必轮询。
-     */
-    u32 next_deadline_ms() const;
-
-    /** 提交一条可靠消息 */
-    Submit submit(const u8 *payload, u16 len, u8 meta, u32 now_ms, u16 *seq_out);
-
-    /**
-     * 提交一条 DAP 响应，并记下它回应的是哪条命令。
-     * 对端重传那条命令时据此找回这条响应重放，从而不必重新执行命令。
-     *
-     * @param meta 随响应携带的 1 字节元数据；类型位须标明这是响应
-     *             （见 link.hpp 的 ARQ_META_RESPONSE），接收侧靠它分派去向
-     */
-    Submit submit_response(u16 cmd_seq, const u8 *payload, u16 len, u8 meta, u32 now_ms);
-
-    /** 会话重置：清窗口、重置序号基准，重新开始握手 */
-    void reset_session(u32 now_ms);
-
     /** 累计计数（统计上报与日志用） */
     struct Snapshot
     {
-        u32 tx;              /**< 首次发出的可靠消息数 */
-        u32 retx;            /**< 重传次数 */
-        u32 acked;           /**< 被确认的消息数 */
-        u32 failed;          /**< 重传耗尽被丢弃的消息数 */
-        u32 rx_delivered;    /**< 按序交付的帧数 */
-        u32 rx_duplicate;    /**< 重复帧数 */
-        u32 rx_out_of_window;/**< 超窗被拒的帧数 */
-        u32 rx_skipped;      /**< 因对端放弃空洞而跳过的序号数 */
-        u32 replayed;        /**< 因重复命令而重放响应的次数 */
-        u32 replay_missed;   /**< 重放未命中（响应已被确认或尚未产生）的次数 */
-        u32 breaker_trips;   /**< 熔断触发次数 */
+        u32 tx;               /**< 首次发出的可靠消息数 */
+        u32 retx;             /**< 重传次数 */
+        u32 acked;            /**< 被确认的消息数 */
+        u32 failed;           /**< 重传耗尽被丢弃的消息数 */
+        u32 rx_delivered;     /**< 按序交付的帧数 */
+        u32 rx_duplicate;     /**< 重复帧数 */
+        u32 rx_out_of_window; /**< 超窗被拒的帧数 */
+        u32 rx_skipped;       /**< 因对端放弃空洞而被跳过的序号数 */
+        u32 replayed;         /**< 因重复命令而重放响应的次数 */
+        u32 replay_missed;    /**< 重放未命中（响应已被确认或尚未产生）的次数 */
+        u32 tx_dropped;       /**< 待发环满而拒绝的提交数 */
+        u32 rx_dropped;       /**< 接收环满而丢弃的帧数 */
+        u32 breaker_trips;
         u32 srtt_ms;
         u32 rto_ms;
         u8 in_flight;
@@ -275,83 +307,87 @@ class ArqLink
     Snapshot snapshot() const;
 
   private:
-    /** 核心的发送回调：补上本端接收侧的确认信息后转交给调用方 */
-    static void core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before,
-                              u8 meta);
-
-    /** 核心的事件回调：打日志（计数直接从核心快照读，不在这里累加） */
-    static void core_event(void *raw, arq::Event event, u16 seq, u32 now_ms);
-
-    /**
-     * 一次待发动作。锁内只登记，出锁后才真正发出去——绝不能持着本层的锁去调
-     * WiFi 驱动：ESP-NOW 接收回调跑在 WiFi 任务里、也要抢这把锁，而驱动调用要
-     * 等 WiFi 任务，两边一对上就是整机僵死。
-     */
-    struct Action
+    /** 待发环里的一条消息 */
+    struct TxMessage
     {
-        enum class Kind : u8
-        {
-            Message, /**< 可靠消息（首传 / 重传 / 重放） */
-            Ack,     /**< 纯确认帧 */
-            Reset,   /**< 会话重置帧（请求或回显，见 reset_echo） */
-        };
-
-        Kind kind;
-        bool retransmit;
-        bool gap_before;
-        bool reset_echo; /**< 仅重置动作使用：true = 回显，false = 请求 */
-        u16 seq;
+        u8 dest_mac[6];
         u16 len;
-        u8 meta; /**< 消息动作携带的元数据（DAP 命令用它承载主机侧传输通道） */
-        u16 ack;
-        u16 sack;
-        u8 window;
-        u32 epoch;
-        ArqSettings settings; /**< 仅重置动作使用 */
+        u16 cmd_seq; /**< 响应专用的"回应的是哪条命令" */
+        u16 seq_hint; /**< 本条可靠消息的序号（按提交顺序预留，与核心分配的一致） */
+        u8 retx_limit;
+        bool reliable;
+        bool is_response;
+        bool loss_injectable;
+        u8 data[ARQ_MAX_PAYLOAD];
     };
 
-    static constexpr size_t MAX_ACTIONS = 4;
+    /** 接收环里的一帧 */
+    struct RxFrame
+    {
+        u8 src_mac[6];
+        u16 len;
+        u8 data[ARQ_FRAME_MAX_SIZE];
+    };
 
-    void lock() const;
-    void unlock() const;
+    /** 对外可见的运行状态（m_state_mutex 保护） */
+    struct State
+    {
+        bool peer_known;
+        bool established;
+        bool breaker_open;
+        u8 window;
+        u8 in_flight;
+    };
 
-    /** 锁内登记一次待发动作（队列满则丢弃并告警） */
-    void queue_locked(const Action &action);
+    static void task_fn(void *arg);
 
-    /** 出锁后逐条发出（入参是锁内拷出来的副本，不共享状态） */
-    void dispatch(const Action *actions, size_t count);
+    /** submit 与 submit_response 共用的入环路径 */
+    Submit enqueue(const u8 *payload, u16 len, const u8 *dest_mac, const TxOptions &options, u16 cmd_seq,
+                   bool is_response, u16 *seq_out);
 
-    /** 把到期的纯确认登记成待发动作（须在持锁时调用） */
-    void queue_ack_locked(u32 now_ms);
+    /** 任务主体：排空入向与待发，驱动核心，更新对外缓存，睡到下一个待办时刻 */
+    void run_loop();
+    void drain_rx(u32 now);
+    void drain_tx(u32 now);
+    void handle_frame(const u8 *src_mac, const u8 *data, size_t len, u32 now);
+    void handle_message(u16 seq, bool gap_before, const u8 *payload, u16 len, u32 now);
+    void handle_reset(u32 peer_epoch, const ArqSettings &peer_settings, bool echo, u32 now);
 
-    /** 锁内动作收集完毕：拷出副本、清空队列，调用方随后 dispatch */
-    size_t take_actions_locked(Action *out);
+    /** 按序交付连续区间 [first, last] 的载荷 */
+    void deliver_range(u16 first, const u8 *first_payload, u16 first_len, u16 last);
 
-    /** 造一个会话重置动作（带上本端参数与接收侧的确认、窗口通告）；echo 语义见 ResetFn */
-    Action make_reset_action_locked(bool echo) const;
+    /** 会话握手、重放、重传与纯确认 */
+    void poll_core(u32 now);
+    u32 next_deadline_ms() const;
+
+    /** 封一帧数据帧并发出去（任务上下文） */
+    void emit_message(const u8 *dest_mac, u16 seq, const u8 *payload, u16 len, u8 flags, u16 ack, u16 sack, u8 window,
+                      bool loss_injectable);
+    void emit_ack(u16 ack, u16 sack, u8 window);
+    void emit_reset(bool echo);
+    void send_frame(const u8 *dest_mac, const u8 *payload, u16 len, u8 flags, u16 seq, u16 ack, u16 sack, u8 window,
+                    bool reliable, bool loss_injectable);
+
+    /** 对外缓存：状态、快照与参数副本一起换 */
+    void publish_state();
+
+    void record_failed(u16 seq);
+    void reconfigure(const ArqSettings &settings);
+    void reset_session(u32 now);
 
     /** 参数是否该采纳对端那份：代数大的赢，代数相同用 MAC 做确定性平局 */
-    bool should_adopt_settings_locked(const ArqSettings &peer) const;
+    bool should_adopt_settings(const ArqSettings &peer) const;
 
-    /** 按当前参数重建核心（Sender/Receiver 的配置随之生效） */
-    void reconfigure_locked();
+    /** 标记参数待落盘（NVS 写入由主循环做） */
+    void mark_settings_dirty();
 
-    /**
-     * 按序交付连续区间 [first, last] 的载荷（须在持锁时调用）。
-     *
-     * first 那一帧的载荷由调用方直接给出（就是本次收到的帧），其余从乱序缓冲里
-     * 取出并在交付后释放；区间内没有载荷的序号（对端声明放弃的空洞）跳过。
-     */
-    void deliver_range_locked(u16 first, const u8 *first_payload, u16 first_len, u8 first_meta, u16 last);
-
-    /** 记录一条失败消息的序号（须在持锁时调用，供核心事件回调使用） */
-    void record_failed_locked(u16 seq);
+    static void core_transmit(void *raw, u16 seq, const u8 *payload, u16 len, bool retransmit, bool gap_before);
+    static void core_event(void *raw, arq::Event event, u16 seq, u32 now_ms);
 
     ArqSettings m_settings = {};
     arq::Config m_config = {};
     size_t m_payload_cap = 0;
     u8 m_own_mac[6] = {};
-    bool m_settings_dirty = false;
 
     arq::Sender m_sender;
     arq::Receiver m_receiver;
@@ -361,7 +397,30 @@ class ArqLink
     arq::ReorderStore m_rx_reorder;
     u8 m_rx_storage[static_cast<size_t>(arq::MAX_WINDOW) * MAX_PAYLOAD] = {};
 
-    mutable SemaphoreHandle_t m_mutex = nullptr;
+    /** 出向封帧缓冲（任务独占，不放栈上：一整帧可达 1470B） */
+    u8 m_frame[ARQ_FRAME_MAX_SIZE] = {};
+    /** 接收环取出的帧（任务独占，同上） */
+    RxFrame m_rx_frame = {};
+    /** 投递用的帧缓冲：只在 ESP-NOW 回调里使用（回调单线程串行，与任务各用一份） */
+    RxFrame m_rx_post = {};
+    /** 待发环取出的消息（任务独占，同上） */
+    TxMessage m_tx_msg = {};
+    /** 提交时组帧用的消息缓冲（多上下文共享，由 m_submit_mutex 串行化） */
+    TxMessage m_tx_post = {};
+    /** 会话重置载荷（任务独占，组装好再交给 send_frame） */
+    u8 m_reset_payload[ARQ_RESET_PAYLOAD_SIZE] = {};
+
+    TaskHandle_t m_task = nullptr;
+    QueueHandle_t m_rx_queue = nullptr;
+    QueueHandle_t m_tx_reliable = nullptr;
+    QueueHandle_t m_tx_unreliable = nullptr;
+    /** 有新入向帧或新提交时唤醒任务；信号合并无害，任务醒来会把两个环都排空 */
+    SemaphoreHandle_t m_wake = nullptr;
+    /** 只保护对外缓存与设置副本，与 ARQ 状态无关 */
+    mutable SemaphoreHandle_t m_state_mutex = nullptr;
+    /** 保护提交用的组帧缓冲（提交可能来自多个任务上下文） */
+    SemaphoreHandle_t m_submit_mutex = nullptr;
+
     Callbacks m_callbacks = {};
 
     u8 m_peer_mac[6] = {};
@@ -378,19 +437,15 @@ class ArqLink
     bool m_ack_scheduled = false;
     u32 m_ack_due_ms = 0;
 
-    /** 重复帧触发的重放：接收上下文只记序号，真正的重发在 poll 里做 */
+    /** 重复帧触发的重放：接收路径只记序号，真正的重发在 poll_core 里做 */
     bool m_replay_pending = false;
     u16 m_replay_cmd_seq = 0;
 
-    /** 收到对端的重置请求需要回显：接收上下文只置标记，真正发出在 poll 里做 */
+    /** 收到对端的重置请求需要回显 */
     bool m_reset_reply_pending = false;
     u32 m_reset_reply_due_ms = 0;
 
-    /** 锁内登记、出锁发送的动作队列 */
-    Action m_actions[MAX_ACTIONS] = {};
-    size_t m_action_count = 0;
-
-    /** 命令序号 → 响应序号（无 USB 侧重放用；USB 侧不接收命令，不使用） */
+    /** 命令序号 → 响应序号（对端重传命令时据此重放响应） */
     u16 m_replay_map[arq::MAX_WINDOW] = {};
     bool m_replay_map_valid[arq::MAX_WINDOW] = {};
 
@@ -399,10 +454,36 @@ class ArqLink
     u8 m_failed_head = 0;
     u8 m_failed_count = 0;
 
+    // 对外缓存（m_state_mutex 保护）
+    State m_state = {};
+    Snapshot m_snapshot = {};
+    ArqSettings m_settings_view = {};
+    bool m_settings_dirty = false;
+
+    /** 主机下发的待应用参数：外部只登记，任务里换会话 */
+    bool m_apply_pending = false;
+    ArqSettings m_apply_settings = {};
+
+    /** 外部登记的会话对端变更（m_state_mutex 保护，任务里落实） */
+    bool m_peer_pending = false;
+    bool m_peer_clear_pending = false;
+    u8 m_peer_pending_mac[6] = {};
+
+    /**
+     * 可靠消息的序号预留：按提交顺序递增，与核心分配发送序号同源同序（提交严格
+     * 按 FIFO，因此"第 n 条提交"就是"第 n 个序号"）。会话重置时归零并清空待发环。
+     */
+    u16 m_seq_counter = 0;
+
+    /** 外部登记的"链路仍活着"（Pong 回显）：任务里清熔断 */
+    volatile bool m_link_alive_pending = false;
+
     u32 m_replayed = 0;
     u32 m_replay_missed = 0;
+    /** 环满丢弃计数：提交与接收回调可能来自多个上下文，统计口径允许偶发少记 */
+    volatile u32 m_tx_dropped = 0;
+    volatile u32 m_rx_dropped = 0;
 };
-
 } // namespace mlink
 
 #endif // __MEGUMINLINK_ARQ_LINK_HPP__

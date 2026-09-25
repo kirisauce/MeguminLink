@@ -205,25 +205,6 @@ endmenu
 
 menu "Wireless"
 
-config MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    bool "Enable reliable wireless DAP transport (ARQ)"
-    default y
-    help
-        Compile the reliable transport for the DAP command/response path:
-        sequence numbers, cumulative plus selective ACK, timeout-driven
-        retransmission with exponential backoff, duplicate suppression with
-        response replay, and a consecutive-failure breaker that fails fast
-        instead of stalling every command behind a dead peer.
-
-        While enabled every frame carries an 8-byte extension header, which
-        lowers the DAP payload limit from 1467 to 1459 bytes. The host adapts
-        by itself (DAP_Info reports the per-channel packet size), so no host
-        tool needs changing. While disabled the frame format is byte-for-byte
-        the historic one.
-
-        Enable this on BOTH ends and flash them together: the two ends must
-        agree, otherwise the frame formats differ and nothing gets through.
-
 config MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW
     int "Reliable transport window limit"
     default 8
@@ -248,7 +229,7 @@ config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
     help
         How long the USB-side (sender) waits for a wireless DAP response
         after forwarding a command to the paired peer before giving up. This
-        is the outer wall for the whole attempt: with ARQ enabled the
+        is the outer wall for the whole attempt: the reliable transport's
         retransmission budget (initial RTO plus backoff) elapses inside it,
         and only when that budget is exhausted is the command dropped and the
         PC-side debugger left to see a command timeout and retry on its own.

@@ -461,15 +461,11 @@ void Application::consume_pending_action()
         // 做——命令的接受方既可能是本机 EP0，也可能是转发的对端请求。
         (void)m_wireless_link.set_wifi_rate(arg);
         break;
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     case ConfigChannel::Action::SetLinkConfig: {
         // 参数落盘 + 立即应用。应用会换新 epoch 重置会话，对端据此重新对齐序号并
         // 采纳这份参数——参数因此不必再走那条尽力而为的中继通道。
         ArqSettings settings = {};
-        if (m_config_channel.take_link_config_draft(&settings) &&
-            m_wireless_link.arq_apply_settings(settings, static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS)) ==
-                ESP_OK)
+        if (m_config_channel.take_link_config_draft(&settings) && m_wireless_link.arq_apply_settings(settings) == ESP_OK)
         {
             const esp_err_t ret = arq_settings_store(settings);
             if (ret != ESP_OK)
@@ -482,8 +478,8 @@ void Application::consume_pending_action()
         }
         break;
     }
-#endif
 
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     case ConfigChannel::Action::SetLoss:
         // 注入丢包率（千分比）。只在发送端生效，两端各自由这条命令设置自己的值。
         (void)m_wireless_link.set_loss_permille(arg);
@@ -496,23 +492,8 @@ void Application::run()
 {
     while (true)
     {
-        // 空闲等待按可靠传输的下一个待办时刻收短：纯确认、重传与握手帧都靠主循环
-        // 在空闲时被驱动，睡满 200ms 会让它们迟到（对端会因此白重传一轮）
-        u32 idle_ms = 200;
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-        {
-            const u32 arq_deadline = m_wireless_link.arq_next_deadline_ms();
-            const u32 now = static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (arq_deadline != 0)
-            {
-                const u32 until = static_cast<u32>(static_cast<i32>(arq_deadline - now));
-                if (until < idle_ms)
-                {
-                    idle_ms = (until == 0) ? 1 : until;
-                }
-            }
-        }
-#endif
+        // 主循环只做"每拍一次的杂务"：可靠传输有自己的任务，不需要在这里驱动
+        constexpr u32 idle_ms = 200;
         xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(idle_ms));
 
         // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
@@ -522,12 +503,8 @@ void Application::run()
         // WiFi 驱动），实际应用在这里
         m_wireless_link.poll();
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-        // 可靠传输的空闲驱动：重传、纯确认、响应重放与会话握手帧都在这里发出
-        m_wireless_link.arq_poll(static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS));
-
         // 参数被改动过（主机下发，或按代数/MAC 采纳了对端那份）：落盘。NVS 写入
-        // 只在主循环做，不占 tinyusb 任务，也不占 WiFi 任务（接收回调会改参数）。
+        // 只在主循环做，不占 tinyusb 任务，也不占 ARQ 任务（交付路径会改参数）。
         if (m_wireless_link.arq_take_settings_dirty())
         {
             const esp_err_t persist_ret = arq_settings_store(m_wireless_link.arq_settings());
@@ -536,7 +513,6 @@ void Application::run()
                 ESP_LOGW(TAG, "Failed to persist ARQ settings: %s", esp_err_to_name(persist_ret));
             }
         }
-#endif
 
         // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
         m_config_channel.poll_ping_timeout();

@@ -12,11 +12,10 @@
 	let { session }: { session: MlinkSession } = $props();
 
 	const busy = $derived(session.commandPending || session.device === null);
-	/** 固件未编译可靠传输：既读不到配置项，也不认识 0x1B 命令。 */
-	const unsupported = $derived(session.config !== null && session.config.arqEnable === null);
+	/** 固件上报不出这组参数：既不认识 0x1B 命令，也读不到配置项。 */
+	const unsupported = $derived(session.config !== null && session.config.arqRtoMinMs === null);
 
 	/** 表单绑定值（设备值每次刷新都重置）。参数是数值，undefined = 无值。 */
-	let enabled = $state(true);
 	let rtoMin = $state<number | undefined>(undefined);
 	let rtoMax = $state<number | undefined>(undefined);
 	let maxRetx = $state<number | undefined>(undefined);
@@ -24,7 +23,6 @@
 
 	function syncFromDevice(): void {
 		const config = session.config;
-		enabled = (config?.arqEnable ?? 1) !== 0;
 		rtoMin = config?.arqRtoMinMs ?? undefined;
 		rtoMax = config?.arqRtoMaxMs ?? undefined;
 		maxRetx = config?.arqMaxRetx ?? undefined;
@@ -54,7 +52,6 @@
 		}
 
 		const patch: LinkConfigPatch = {
-			enable: enabled ? 1 : 0,
 			rtoMinMs: rtoMin,
 			rtoMaxMs: rtoMax,
 			maxRetx,
@@ -65,8 +62,7 @@
 
 	const dirty = $derived(
 		session.config !== null &&
-			(enabled !== (session.config.arqEnable !== 0) ||
-				rtoMin !== session.config.arqRtoMinMs ||
+			(rtoMin !== session.config.arqRtoMinMs ||
 				rtoMax !== session.config.arqRtoMaxMs ||
 				maxRetx !== session.config.arqMaxRetx ||
 				breaker !== session.config.arqBreaker)
@@ -94,14 +90,6 @@
 </script>
 
 <div class="link-settings">
-	<div class="field">
-		<label class="label" for="arq-enable">可靠传输</label>
-		<select id="arq-enable" bind:value={enabled} disabled={busy || unsupported}>
-			<option value={true}>开启（丢帧由链路重传补回）</option>
-			<option value={false}>关闭（仅转发，不等确认）</option>
-		</select>
-	</div>
-
 	<div class="grid">
 		<div class="field">
 			<label class="label" for="arq-rto-min">RTO 下限 (ms)</label>

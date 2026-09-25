@@ -6,9 +6,7 @@
 #include "meguminlink/wireless/frame.hpp"
 #include "sdkconfig.h"
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
 #include "meguminlink/wireless/arq_link.hpp"
-#endif
 
 // 存活探测状态用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
@@ -153,9 +151,7 @@ class ConfigChannel
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
         Ping,           // 立即探测已配对对端（存活与往返时延）
         SetWifiRate,    // arg: wifi_phy_rate_t 原值（ESP-NOW 发送速率档位）
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
         SetLinkConfig,  // 落盘并应用可靠传输参数（草稿槽已由 SetLinkConfig 命令填好）
-#endif
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
         SetLoss,        // arg: 千分比（DAP/UART 出向帧的注入丢包率，见 wireless/link.hpp）
 #endif
@@ -175,7 +171,6 @@ class ConfigChannel
      */
     bool take_action(Action *action, u8 *arg = nullptr);
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /**
      * 取走待应用的可靠传输参数草稿并清空槽（主循环执行 SetLinkConfig 时调用）。
      *
@@ -184,7 +179,6 @@ class ConfigChannel
      * 动作分派是共用的。
      */
     bool take_link_config_draft(ArqSettings *settings);
-#endif
 
     /**
      * 收到对端转发的 USB 控制请求（无线接收回调调用）。
@@ -242,7 +236,6 @@ class ConfigChannel
     /** 组装 GetConfig 响应帧到 m_response，返回整帧长度 */
     u16 build_config_response(u8 cmd, u8 seq);
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /**
      * SetLinkConfig（OUT 方向）的处理：SETUP 阶段声明接收缓冲，DATA 阶段解析 TLV
      * 并写入草稿槽 + 投递动作。
@@ -253,7 +246,6 @@ class ConfigChannel
 
     /** 解析 SetLinkConfig 载荷并写入草稿槽（格式非法时不改草稿并返回 false） */
     bool stage_link_config_draft(const u8 *data, usize len);
-#endif
 
     /**
      * SetUsbConfig（OUT 方向）的处理：SETUP 阶段声明接收缓冲，DATA 阶段解析
@@ -332,7 +324,6 @@ class ConfigChannel
      */
     u8 m_response[256];
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     /**
      * 可靠传输参数草稿单槽（EP0 OUT 的 DATA 阶段写、主循环执行 SetLinkConfig 时
      * 取走）。只接受到此为止：参数落盘与应用都在主循环做，不占用 tinyusb 任务。
@@ -343,7 +334,6 @@ class ConfigChannel
 
     /** OUT 载荷接收缓冲：tud_control_xfer 只保存指针，DATA 阶段仍会回写 */
     u8 m_link_draft_buffer[128];
-#endif
 
     /** 待执行动作单槽（请求上下文写、主循环读，portMUX 保护） */
     Action m_pending_action = Action::None;

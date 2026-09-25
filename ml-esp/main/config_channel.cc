@@ -449,7 +449,6 @@ enum : u8
     TAG_UART_DATA_BITS = 0x36,   // u8：数据位 5-8
     TAG_UART_STOP_BITS = 0x37,   // u8：停止位 0=1 1=1.5 2=2
     TAG_UART_PARITY = 0x38,      // u8：校验 0=无 1=奇 2=偶 3=Mark 4=Space
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     // 可靠传输统计：无线段（0x20-0x2F）已排满，单开 0x70-0x7F 一段
     TAG_ARQ_STATE = 0x70,         // u8：bit0-3 生效窗口、bit7 熔断中
     TAG_ARQ_TX = 0x71,            // u32：首次发出的可靠消息数
@@ -464,10 +463,9 @@ enum : u8
     TAG_ARQ_SRTT_MS = 0x7A,       // u32：平滑往返时延（毫秒）
     TAG_ARQ_RTO_MS = 0x7B,        // u32：当前基础 RTO（毫秒）
     TAG_ARQ_BREAKER_TRIPS = 0x7C, // u32：熔断触发次数
-    TAG_ARQ_RESP_WAITS = 0x7D,    // u32：响应队满进入等待窗口的次数
-    TAG_ARQ_RESP_DROPPED = 0x7E,  // u32：等待窗口超时仍被丢弃的响应数
+    TAG_ARQ_TX_DROPPED = 0x7D,    // u32：待发环满被拒的提交数
+    TAG_ARQ_RX_DROPPED = 0x7E,    // u32：接收环满被丢弃的帧数
     TAG_ARQ_CMD_DROPPED = 0x7F,   // u32：执行队列满被丢弃的命令数
-#endif
     TAG_UPTIME = 0x40,           // u32：上电毫秒数（49.7 天回绕）
     TAG_FW_VERSION = 0x41,       // string：应用版本（esp_app_desc.version）
     TAG_CHIP_TARGET = 0x42,      // string：目标芯片（CONFIG_IDF_TARGET）
@@ -475,9 +473,7 @@ enum : u8
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
     TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     TAG_CFG_ARQ_GENERATION = 0x54,  // u32：参数代数（每次下发 +1）
-    TAG_CFG_ARQ_ENABLE = 0x55,      // u8：运行时开关 0=绕过核心 1=可靠传输
     TAG_CFG_ARQ_WINDOW = 0x56,      // u8：发送窗口
     TAG_CFG_ARQ_MAX_RETX = 0x57,    // u8：单条消息重传次数上限
     TAG_CFG_ARQ_BREAKER = 0x58,     // u8：熔断阈值（连续失败条数）
@@ -486,7 +482,7 @@ enum : u8
     TAG_CFG_ARQ_RTO_MAX = 0x5B,     // u16：RTO 上限（毫秒）
     TAG_CFG_ARQ_DELAYED_ACK = 0x5C, // u16：延迟确认（毫秒）
     TAG_CFG_ARQ_PROBE = 0x5D,       // u16：熔断试探间隔（毫秒）
-#endif
+    // 0x55 未分配（保留号位）
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     TAG_CFG_LOSS_PERMILLE = 0x53, // u8：注入丢包率千分比 0-255
 #endif
@@ -713,7 +709,6 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, m_dap_response_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_TX, m_wireless_tx_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_RX, m_wireless_rx_bytes);
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     {
         // 可靠传输的运行状态：丢帧是否被吸收、恢复得多快，全看这几个数
         const ArqLink::Snapshot arq = Application::get_instance().wireless_link().arq_snapshot();
@@ -738,14 +733,13 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
         p += tlv_u32(m_response + p, TAG_ARQ_RTO_MS, arq.rto_ms);
         p += tlv_u32(m_response + p, TAG_ARQ_BREAKER_TRIPS, arq.breaker_trips);
 
-        // 响应方向的背压证据：这三个数在正常链路上应当为 0——非 0 说明响应被丢或
-        // 命令没进执行队列，主机那条命令只能等自己的超时
-        const WirelessLink &link = Application::get_instance().wireless_link();
-        p += tlv_u32(m_response + p, TAG_ARQ_RESP_WAITS, link.resp_slot_waits());
-        p += tlv_u32(m_response + p, TAG_ARQ_RESP_DROPPED, link.resp_dropped());
-        p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED, link.cmd_queue_dropped());
+        // 环满丢弃的证据：这两个数在正常链路上应当为 0——非 0 说明待发方向或接收
+        // 方向跟不上（命令没进执行队列的计数在最后一个）
+        p += tlv_u32(m_response + p, TAG_ARQ_TX_DROPPED, arq.tx_dropped);
+        p += tlv_u32(m_response + p, TAG_ARQ_RX_DROPPED, arq.rx_dropped);
+        p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED,
+                     Application::get_instance().wireless_link().cmd_queue_dropped());
     }
-#endif
 
     // 对端存活探测结果：online 是最近一次的结论，ok/fail 是累计计数（上位机
     // 对两次快照差分即可知道"刚下发的那次探测"是成功还是失败）
@@ -799,11 +793,9 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     p += tlv_u8(m_response + p, TAG_CFG_LOSS_PERMILLE, Application::get_instance().wireless_link().loss_permille());
 #endif
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
     {
         const ArqSettings settings = Application::get_instance().wireless_link().arq_settings();
         p += tlv_u32(m_response + p, TAG_CFG_ARQ_GENERATION, settings.generation);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_ENABLE, settings.enable);
         p += tlv_u8(m_response + p, TAG_CFG_ARQ_WINDOW, settings.window);
         p += tlv_u8(m_response + p, TAG_CFG_ARQ_MAX_RETX, settings.max_retx);
         p += tlv_u8(m_response + p, TAG_CFG_ARQ_BREAKER, settings.breaker_failures);
@@ -813,7 +805,6 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
         p += tlv_u16(m_response + p, TAG_CFG_ARQ_DELAYED_ACK, settings.delayed_ack_ms);
         p += tlv_u16(m_response + p, TAG_CFG_ARQ_PROBE, settings.breaker_probe_ms);
     }
-#endif
 
     return finish_response(cmd, seq, p);
 }
@@ -886,7 +877,6 @@ bool ConfigChannel::take_usb_config_draft(UsbCapabilitySettings *settings)
     return valid;
 }
 
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
 namespace
 {
 /**
@@ -895,7 +885,7 @@ namespace
  */
 enum : u8
 {
-    LINK_TAG_ENABLE = 0x01,      // u8：运行时开关
+    // 0x01 未分配（保留号位）
     LINK_TAG_WINDOW = 0x02,      // u8：发送窗口
     LINK_TAG_MAX_RETX = 0x03,    // u8：重传次数上限
     LINK_TAG_BREAKER = 0x04,     // u8：熔断阈值
@@ -943,13 +933,6 @@ bool parse_link_config(const u8 *data, usize len, ArqSettings *io)
 
         switch (tag)
         {
-        case LINK_TAG_ENABLE:
-            if (value_len != 1)
-            {
-                return false;
-            }
-            io->enable = (value[0] != 0) ? 1 : 0;
-            break;
         case LINK_TAG_WINDOW:
             if (value_len != 1)
             {
@@ -1060,7 +1043,6 @@ bool ConfigChannel::handle_link_config_out(u8 rhport, u8 stage, const tusb_contr
 
     return true; // ACK 阶段：载荷已在 DATA 阶段处理完
 }
-#endif // CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
 
 bool ConfigChannel::stage_usb_config_draft(const u8 *data, usize len)
 {
@@ -1143,11 +1125,7 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         {
             return true;
         }
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
         return handle_link_config_out(rhport, stage, request);
-#else
-        return false;
-#endif
     }
 
     if (stage != CONTROL_STAGE_SETUP)

@@ -17,8 +17,7 @@ Packet::Packet()
 
 size_t Packet::serialized_size() const
 {
-    // 各分支只算"类型 + 帧体"的长度，扩展头长度在末尾统一补上：新增帧体字段时
-    // 只需改一处，不会漏加导致发送被截断
+    // 各分支只算"类型 + 帧体"的长度：业务包不含 ARQ 头，那一层由 arq_link 封装
     size_t body = 0;
     switch (packet_type)
     {
@@ -64,24 +63,13 @@ size_t Packet::serialized_size() const
         body = UART_FRAME_HEADER_SIZE + 2 + payload::RELAYED_CONTROL_HEADER_SIZE + payload.relayed_usb_control.len;
         break;
     }
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    case PacketType::Ack: {
-        body = 1; // 只有类型字节：纯确认帧没有帧体，信息全在扩展头里
-        break;
-    }
-    case PacketType::ArqReset: {
-        // 类型 1B + 数据段；与 Probe 一样不带 len 字段
-        body = 1 + ARQ_RESET_PAYLOAD_SIZE;
-        break;
-    }
-#endif
     default: {
         // 与 serialize() 的 ESP_ERR_NOT_SUPPORTED 对齐：未知类型按非法处理
         return 0;
     }
     }
 
-    return body + ARQ_HEADER_SIZE;
+    return body;
 }
 
 esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t storage_cap)
@@ -90,17 +78,6 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
 
     MLINK_CHECK_SIZE(p, 1);
     packet_type = static_cast<PacketType>(p.read_u8());
-
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    // 扩展头位置固定（紧跟在类型字节之后）、与帧类型无关，因此在 switch 之前
-    // 统一读一次，各分支都不需要感知它
-    MLINK_CHECK_SIZE(p, ARQ_HEADER_SIZE);
-    arq.seq = p.read_u16();
-    arq.ack = p.read_u16();
-    arq.window = p.read_u8();
-    arq.flags = p.read_u8();
-    arq.sack = p.read_u16();
-#endif
 
     switch (packet_type)
     {
@@ -215,29 +192,6 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
         content.data = storage;
         break;
     }
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    case PacketType::Ack: {
-        // 纯确认帧没有帧体：累积确认号、SACK 位图与窗口通告全在扩展头里
-        break;
-    }
-    case PacketType::ArqReset: {
-        auto &content = payload.arq_reset;
-        MLINK_CHECK_SIZE(p, ARQ_RESET_PAYLOAD_SIZE);
-        content.epoch = p.read_u32();
-        content.settings.generation = p.read_u32();
-        content.settings.enable = p.read_u8();
-        content.settings.window = p.read_u8();
-        content.settings.max_retx = p.read_u8();
-        content.settings.breaker_failures = p.read_u8();
-        content.settings.rto_min_ms = p.read_u16();
-        content.settings.initial_rto_ms = p.read_u16();
-        content.settings.rto_max_ms = p.read_u16();
-        content.settings.delayed_ack_ms = p.read_u16();
-        content.settings.breaker_probe_ms = p.read_u16();
-        content.flags = payload::ArqResetFlags::from_raw(p.read_u16());
-        break;
-    }
-#endif
     default: {
         break;
     }
@@ -251,16 +205,6 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
     BinSerializer s(buffer, len);
     MLINK_CHECK_SIZE(s, 1);
     s.write_u8(static_cast<u8>(packet_type));
-
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    // 扩展头写在类型字节之后、帧体之前，所有帧统一携带——各分支都不需要感知它
-    MLINK_CHECK_SIZE(s, ARQ_HEADER_SIZE);
-    s.write_u16(arq.seq);
-    s.write_u16(arq.ack);
-    s.write_u8(arq.window);
-    s.write_u8(arq.flags);
-    s.write_u16(arq.sack);
-#endif
 
     switch (packet_type)
     {
@@ -359,31 +303,6 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         s.write_bytes(content.data, content.len);
         break;
     }
-#if CONFIG_MEGUMINLINK_WIRELESS_ARQ_ENABLE
-    case PacketType::Ack: {
-        // 纯确认帧没有帧体：只发类型与扩展头
-        break;
-    }
-    case PacketType::ArqReset: {
-        // 会话重置帧同时携带参数：这类帧周期性重发直到握手完成，参数因此自带
-        // 重传保证，不用再借那条尽力而为的中继通道
-        auto &content = payload.arq_reset;
-        MLINK_CHECK_SIZE(s, ARQ_RESET_PAYLOAD_SIZE);
-        s.write_u32(content.epoch);
-        s.write_u32(content.settings.generation);
-        s.write_u8(content.settings.enable);
-        s.write_u8(content.settings.window);
-        s.write_u8(content.settings.max_retx);
-        s.write_u8(content.settings.breaker_failures);
-        s.write_u16(content.settings.rto_min_ms);
-        s.write_u16(content.settings.initial_rto_ms);
-        s.write_u16(content.settings.rto_max_ms);
-        s.write_u16(content.settings.delayed_ack_ms);
-        s.write_u16(content.settings.breaker_probe_ms);
-        s.write_u16(content.flags.raw());
-        break;
-    }
-#endif
     default: {
         return ESP_ERR_NOT_SUPPORTED;
     }
