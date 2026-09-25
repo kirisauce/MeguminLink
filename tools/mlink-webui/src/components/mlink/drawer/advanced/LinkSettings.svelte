@@ -156,8 +156,7 @@
 		color: var(--md-sys-color-on-surface);
 	}
 
-	input,
-	select {
+	input {
 		font: inherit;
 		font-family: var(--md-sys-typescale-font-mono);
 		font-size: var(--md-sys-typescale-body-md);
@@ -174,14 +173,11 @@
 	}
 
 	input:hover:not(:disabled),
-	select:hover:not(:disabled),
-	input:focus-visible,
-	select:focus-visible {
+	input:focus-visible {
 		border-color: var(--md-sys-color-outline);
 	}
 
-	input:disabled,
-	select:disabled {
+	input:disabled {
 		opacity: 0.45;
 		cursor: not-allowed;
 	}
