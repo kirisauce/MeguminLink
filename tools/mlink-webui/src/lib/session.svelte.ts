@@ -6,8 +6,14 @@
  * 一旦 claim 接口，Windows 上的 WinUSB 与 Linux 上的 libusb 都会与烧录器互斥。
  *
  * 轮询用「上次请求返回后再排下一次」的方式串行化，天然不会在设备变慢时堆积请求。
+ *
+ * 目标设备按序列号锁定：切换器选中的那台会被记住，拔插、重新枚举与页面刷新都接回
+ * 同一台，而不是「已授权列表里的第一台」。失败由 session_recovery 归因，能自愈的
+ * 按退避继续尝试、期间停在「等待设备」；每次尝试都重新解析设备对象，因为重新枚举
+ * 之后是新的 USBDevice，旧句柄已经作废。
  */
 
+import { deviceEntries, deviceKey, isMlinkDevice, pickKey, type DeviceEntry } from './devices';
 import {
 	CMD_CLEAR_PAIR,
 	CMD_ENTER_PAIRING,
@@ -41,14 +47,22 @@ import {
 	type UsbConfig,
 } from './protocol';
 import { computeRates, type Rates } from './rate';
+import { GONE_MESSAGE, backoffMs, planRecovery, type FailurePhase } from './session_recovery';
 import { diagnoseWebUsb, type UsbDiagnosis } from './usb_diagnosis';
 
 /** 页面在前台时的采样间隔。 */
 const POLL_INTERVAL_MS = 200;
 /** 页面切到后台时降频，避免被浏览器节流后产生无意义的密集唤醒。 */
 const POLL_INTERVAL_HIDDEN_MS = 1000;
-/** 重新枚举后等待设备接回的时长：超时则提示用户手动重新连接。 */
-const RECONNECT_TIMEOUT_MS = 5000;
+/**
+ * 重新枚举的提示升级时长：这么久还没接回就说明设备回来得慢，文案改成「仍在重试」，
+ * 会话本身继续按退避尝试，不需要用户操作。
+ */
+const RECONNECT_NOTICE_MS = 5000;
+/** 应用 USB 配置后的第一次接回尝试：设备软断开到重新枚举完成通常在几百毫秒内。 */
+const REENUMERATE_RETRY_MS = 600;
+/** 设备正在重新枚举 USB：此间轮询失败与断开都是预期的。 */
+const REENUMERATING_MESSAGE = '设备正在重新枚举 USB…';
 /**
  * 对端探测的界面兜底超时：设备端超时窗口（Kconfig，默认 500ms）加上一次轮询
  * 往返还看不到计数变化，就收起「探测中」状态。
@@ -59,6 +73,8 @@ const PING_TIMEOUT_MS = 1500;
  * 驱动刷新（点击状态条是同一路径的立即触发）。
  */
 const PING_INTERVAL_MS = 3000;
+/** 记住上次监控的那台设备（值是设备身份，不含任何敏感信息）。 */
+const STORAGE_KEY = 'mlink-webui.device';
 
 /** 曲线滚动窗口长度。 */
 export const WINDOW_MS = 60_000;
@@ -70,12 +86,20 @@ export const WINDOW_MS = 60_000;
  */
 export type Sample = { t: number; rates: Rates | null };
 
-export type ConnectionState = 'unsupported' | 'disconnected' | 'connecting' | 'streaming' | 'error';
+export type ConnectionState =
+	| 'unsupported'
+	| 'disconnected'
+	| 'connecting'
+	/** 目标设备暂时不可用但已排好重试：被别的程序占着、刚拔掉、正在重新枚举 */
+	| 'waiting'
+	| 'streaming'
+	| 'error';
 
 export const STATE_TEXT: Readonly<Record<ConnectionState, string>> = {
 	unsupported: '浏览器不支持 WebUSB',
 	disconnected: '未连接',
 	connecting: '连接中',
+	waiting: '等待设备',
 	streaming: '监控中',
 	error: '已中断',
 };
@@ -109,7 +133,7 @@ export class MlinkSession {
 	rates = $state<Rates | null>(null);
 	/** 滚动窗口内的采样点，供曲线使用。 */
 	history = $state<Sample[]>([]);
-	/** 最近一次失败的说明；成功读回一帧后清空。 */
+	/** 最近一次的等待说明或失败说明；成功读回一帧后清空。 */
 	error = $state<string | null>(null);
 	device = $state<USBDevice | null>(null);
 	/** 当前采样间隔，切前后台时会变。 */
@@ -129,9 +153,18 @@ export class MlinkSession {
 	 * 静默刷新，文案保持在最近一次结论上，避免每 3 秒闪一下。
 	 */
 	manualPingInFlight = $state(false);
+	/** 本 origin 已授权且当前在线的目标设备，供顶栏切换器列出。 */
+	devices = $state<DeviceEntry[]>([]);
+	/** 用户选中的那台设备的身份；未选过为 null，等待接回期间保持不变。 */
+	currentKey = $state<string | null>(null);
+	/** WebUSB 可用性诊断；未在客户端采集前为 null */
+	usbDiagnosis = $state<UsbDiagnosis | null>(null);
 
 	#timer: ReturnType<typeof setTimeout> | null = null;
-	#reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 退避重试定时器：失败后由自己排下一次尝试，成功或用户断开时清掉。 */
+	#retryTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 重新枚举的提示升级定时器。 */
+	#noticeTimer: ReturnType<typeof setTimeout> | null = null;
 	/** 探测在途时的 ok/fail 计数基线：任一个变化即说明本次探测已结算。 */
 	#pingBaseline: { ok: number; fail: number } | null = null;
 	#pingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -140,12 +173,23 @@ export class MlinkSession {
 	#seq = 0;
 	#listenersBound = false;
 	#destroyed = false;
-	/** 刚应用完 USB 能力、设备正在重新枚举：此间的断开与轮询失败都是预期的 */
-	#expectingReconnect = false;
+	/** 连续失败次数：决定退避节奏，任何一次成功都归零。 */
+	#attempt = 0;
+	/**
+	 * 设备代数：每次换设备、松开句柄、重新打开都自增。异步读回来的结果只在代数
+	 * 未变时写进状态，切换设备后旧设备的迟到响应不会污染新设备的面板。
+	 */
+	#generation = 0;
+	/** 面板里当前这份数据属于哪台设备：换设备才清曲线，同一台重连保留（由断点分段）。 */
+	#shownKey: string | null = null;
+	/** 顶栏最近显示过的名字：句柄不在（等待接回）时沿用，不让文案在序列号与名字之间跳。 */
+	#shownName = $state<string | null>(null);
+	/** 目标设备的条目（产品名与序列号）：等待接回时菜单要按它列出那一行。 */
+	#shownEntry = $state<DeviceEntry | null>(null);
+	/** 设备正在重新枚举 USB：此间的等待文案固定为重枚举说明。 */
+	#reenumerating = false;
 	/** 最近一次打开设备的失败（诊断用）；成功打开后清空 */
 	#openFailure: { name: string; message: string } | null = null;
-	/** WebUSB 可用性诊断；未在客户端采集前为 null */
-	usbDiagnosis = $state<UsbDiagnosis | null>(null);
 	/** 诊断采集的单调序号：只允许最新一次采集写回 */
 	#diagnosisSeq = 0;
 
@@ -188,7 +232,7 @@ export class MlinkSession {
 		if (hasUsbApi) {
 			try {
 				const devices = await navigator.usb.getDevices();
-				granted = devices.filter((item) => item.vendorId === VID && item.productId === PID).length;
+				granted = devices.filter((item) => isMlinkDevice(item)).length;
 			} catch {
 				granted = null;
 			}
@@ -210,26 +254,37 @@ export class MlinkSession {
 		return typeof navigator !== 'undefined' && navigator.usb !== undefined;
 	}
 
+	/**
+	 * 目标设备的条目：等待接回时它已经不在授权列表里，菜单靠这份缓存仍然列出那一行，
+	 * 点它等于立刻重试。没有目标时为 null。
+	 */
+	get currentEntry(): DeviceEntry | null {
+		return this.#shownEntry;
+	}
+
 	get deviceLabel(): string {
 		const device = this.device;
-		if (device === null) return '—';
+		if (device === null) return this.#shownName ?? this.currentKey ?? '—';
 
 		// 设过名字就显示名字（重新枚举接回后随 usbConfig 刷新），否则维持序列号
 		const name = this.usbConfig?.deviceName ?? '';
-		if (name !== '') return name;
-
-		const serial = device.serialNumber;
-		return serial ? `${serial}` : `${device.vendorId.toString(16)}:${device.productId.toString(16)}`;
+		return name === '' ? deviceKey(device) : name;
 	}
 
 	/** 顶栏「设备」的悬停说明：USB 描述符里的产品名与序列号，不受自定义名影响 */
 	get deviceDetail(): string {
 		const device = this.device;
 		if (device === null) return '';
-		return [device.productName ?? '', device.serialNumber ?? ''].filter((part) => part !== '').join(' · ');
+		return [device.productName ?? '', deviceKey(device)].filter((part) => part !== '').join(' · ');
 	}
 
-	/** 页面加载时尝试静默接回本 origin 已授权过的设备，省掉每次刷新都要重新选设备。 */
+	/**
+	 * 页面加载时静默接回记住的那台设备。
+	 *
+	 * 只有「记住的还在」或「没有任何记忆且恰好一台已授权」才自动接；记住的暂时不在时
+	 * 进等待态持续寻找（插回来自动接上），没有记忆却有多台就停在未连接，交给用户从
+	 * 顶栏切换器选 —— 猜错会让人对着另一块板子的数据看。
+	 */
 	async restore(): Promise<void> {
 		void this.refreshDiagnosis();
 		if (!this.supported) {
@@ -238,13 +293,64 @@ export class MlinkSession {
 		}
 		this.#bindListeners();
 		if (this.device !== null) return;
+
+		let granted: USBDevice[];
 		try {
-			const granted = await navigator.usb.getDevices();
-			const device = granted.find((item) => item.vendorId === VID && item.productId === PID);
-			if (device !== undefined) await this.#open(device);
+			granted = await navigator.usb.getDevices();
 		} catch (error) {
-			this.#fail(describeError(error));
+			this.#recover(error, 'open');
+			return;
 		}
+		this.#updateDevices(granted);
+
+		const targets = granted.filter((item) => isMlinkDevice(item));
+		const remembered = this.#readStoredKey();
+		const key = pickKey(deviceEntries(targets), remembered);
+		if (key === null) {
+			if (remembered !== null) {
+				// 记住的那台暂时不在：留着目标按退避找它，插回来自动接上
+				this.currentKey = remembered;
+				this.#attempt = 0;
+				this.#beginWaiting(GONE_MESSAGE);
+				return;
+			}
+			this.state = 'disconnected';
+			return;
+		}
+
+		const device = targets.find((item) => deviceKey(item) === key);
+		if (device === undefined) return;
+		this.currentKey = key;
+		await this.#open(device);
+	}
+
+	/** 重新读取已授权设备列表，供切换器刷新（设备可能刚插上或被拔走）。 */
+	async refreshDevices(): Promise<void> {
+		if (!this.supported) return;
+		try {
+			this.#updateDevices(await navigator.usb.getDevices());
+		} catch {
+			// 列表读不到就保留上一份：切换器最多是陈旧的，不影响当前会话
+		}
+	}
+
+	/**
+	 * 切换到已授权列表里的某台设备。
+	 *
+	 * 已经是当前这台就什么都不做；当前这台正在等待接回时，点一下等于「立刻重试」，
+	 * 不必等退避到点。
+	 */
+	async selectTarget(key: string): Promise<void> {
+		await this.refreshDevices();
+		if (key === this.currentKey) {
+			if (this.device !== null) return;
+			this.#attempt = 0;
+			void this.#retry();
+			return;
+		}
+		const device = await this.#resolveTarget(key);
+		if (device === null) return;
+		await this.#select(device);
 	}
 
 	/** 由用户手势触发：弹出设备选择器。取消选择不是错误。 */
@@ -259,17 +365,26 @@ export class MlinkSession {
 			const device = await navigator.usb.requestDevice({
 				filters: [{ vendorId: VID, productId: PID }],
 			});
-			await this.#open(device);
+			await this.#select(device);
 		} catch (error) {
 			if (error instanceof DOMException && error.name === 'NotFoundError') return;
-			this.#fail(describeError(error));
+			this.#recover(error, 'open');
 		}
 	}
 
+	/** 用户主动断开：停止重试，也不再记住这台设备。 */
 	async close(): Promise<void> {
+		this.#generation++;
 		this.#cancel();
+		this.#forget();
 		const device = this.device;
 		this.device = null;
+		this.currentKey = null;
+		this.#shownKey = null;
+		this.#shownName = null;
+		this.#shownEntry = null;
+		this.#attempt = 0;
+		this.#reenumerating = false;
 		this.stats = null;
 		this.rates = null;
 		this.history = [];
@@ -277,7 +392,7 @@ export class MlinkSession {
 		this.config = null;
 		this.usbConfig = null;
 		this.commandError = null;
-		this.#expectingReconnect = false;
+		this.commandPending = false;
 		this.state = this.supported ? 'disconnected' : 'unsupported';
 		if (device?.opened === true) {
 			try {
@@ -286,6 +401,7 @@ export class MlinkSession {
 				// 设备已经消失时 close 会失败，忽略。
 			}
 		}
+		void this.refreshDevices();
 	}
 
 	destroy(): void {
@@ -293,31 +409,86 @@ export class MlinkSession {
 		this.#cancel();
 	}
 
-	async #open(device: USBDevice): Promise<void> {
-		this.state = 'connecting';
-		this.error = null;
+	/** 换到另一台设备：关旧句柄、清空面板、记住新目标，然后打开。 */
+	async #select(device: USBDevice): Promise<void> {
+		const key = deviceKey(device);
+		if (this.device !== null && key === this.currentKey) return;
+		const previous = this.device;
+		if (previous !== null) {
+			this.#generation++;
+			this.#cancel();
+			try {
+				if (previous.opened) await previous.close();
+			} catch {
+				// 旧设备已经拔走时 close 会失败，忽略。
+			}
+		}
+		this.#shownKey = null;
+		this.#shownName = null;
+		this.#shownEntry = null;
+		this.stats = null;
+		this.rates = null;
+		this.history = [];
+		this.config = null;
+		this.usbConfig = null;
+		this.commandError = null;
+		this.commandPending = false;
+		this.#attempt = 0;
+		this.#reenumerating = false;
+		this.currentKey = key;
+		this.#remember(key);
+		await this.#open(device);
+	}
+
+	/**
+	 * 打开（或重新打开）设备并开始轮询。
+	 *
+	 * @param silent 退避重试路径传 true：不动状态条（停在「等待设备」），失败时同样
+	 *               交给归因逻辑继续排下一次重试
+	 */
+	async #open(device: USBDevice, silent = false): Promise<void> {
+		const generation = ++this.#generation;
+		this.#cancelPoll();
+		this.#cancelRetry();
+		if (!silent) this.state = 'connecting';
 		try {
 			if (!device.opened) await device.open();
 			if (device.configuration === null) await device.selectConfiguration(1);
 		} catch (error) {
+			if (generation !== this.#generation) return;
 			this.#openFailure =
 				error instanceof DOMException
 					? { name: error.name, message: error.message }
 					: { name: 'Error', message: describeError(error) };
 			void this.refreshDiagnosis();
-			this.#fail(`打开设备失败：${describeError(error)}`);
+			this.#recover(error, 'open');
 			return;
 		}
+		if (generation !== this.#generation) return;
+
 		this.#openFailure = null;
+		const key = deviceKey(device);
+		if (this.#shownKey !== key) {
+			// 换了设备：曲线重新开始，不把另一台的采样留在图上
+			this.stats = null;
+			this.rates = null;
+			this.history = [];
+		}
+		this.#shownKey = key;
+		this.#shownName = key;
+		this.#shownEntry = this.devices.find((item) => item.key === key) ?? null;
+		this.currentKey = key;
+		this.#remember(key);
+		this.#attempt = 0;
+		this.#reenumerating = false;
+		this.#cancelNotice();
 		this.device = device;
 		this.#seq = 0;
 		this.#pingProbeAt = 0; // 接上设备即尽快探一次，不必等满一个间隔
-		this.#expectingReconnect = false;
-		if (this.#reconnectTimer !== null) {
-			clearTimeout(this.#reconnectTimer);
-			this.#reconnectTimer = null;
-		}
+		this.commandPending = false;
+		this.error = null;
 		this.state = 'streaming';
+		void this.refreshDevices();
 		void this.refreshConfig();
 		void this.refreshUsbConfig();
 		// 设备已授权并接上，「已授权设备」这项的结论变了，重新采集一次
@@ -334,10 +505,14 @@ export class MlinkSession {
 	async refreshConfig(): Promise<void> {
 		const device = this.device;
 		if (device === null) return;
+		const generation = this.#generation;
 		try {
-			this.config = await readConfig(device, this.#seq);
+			const config = await readConfig(device, this.#seq);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
+			this.config = config;
 		} catch {
+			if (generation !== this.#generation) return;
 			this.config = null;
 		}
 	}
@@ -350,10 +525,15 @@ export class MlinkSession {
 	async refreshUsbConfig(): Promise<void> {
 		const device = this.device;
 		if (device === null) return;
+		const generation = this.#generation;
 		try {
-			this.usbConfig = await readUsbConfig(device, this.#seq);
+			const usbConfig = await readUsbConfig(device, this.#seq);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
+			this.usbConfig = usbConfig;
+			this.#shownName = usbConfig.deviceName === '' ? deviceKey(device) : usbConfig.deviceName;
 		} catch {
+			if (generation !== this.#generation) return;
 			this.usbConfig = null;
 		}
 	}
@@ -362,20 +542,23 @@ export class MlinkSession {
 	 * 保存 USB 能力：提交草稿 → 读校验结果 → 应用（设备随后重新枚举 USB）。
 	 *
 	 * 设备在应用后立刻软断开，这里不等待它回来：主动停掉轮询、清空快照并把
-	 * 状态置为 connecting，等 connect 事件触发 restore() 接回后重读配置。
+	 * 状态置为等待，接回由按序列号的重试链完成，接回后重读配置。
 	 *
 	 * @return true=已应用（设备开始重新枚举）；false=被拒或传输失败（见 commandError）
 	 */
 	async saveUsbConfig(capability: UsbCapability): Promise<boolean> {
 		const device = this.device;
 		if (device === null || this.commandPending) return false;
+		const generation = this.#generation;
 		this.commandPending = true;
 		this.commandError = null;
 		try {
 			await writeUsbConfig(device, this.#seq, capability);
+			if (generation !== this.#generation) return false;
 			this.#seq = (this.#seq + 1) & 0xff;
 
 			const status = await readUsbConfig(device, this.#seq);
+			if (generation !== this.#generation) return false;
 			this.#seq = (this.#seq + 1) & 0xff;
 			if (status.draft !== USB_DRAFT_PENDING) {
 				const reason = status.draftReason === null ? null : USB_REJECT_TEXT[status.draftReason];
@@ -384,23 +567,30 @@ export class MlinkSession {
 			}
 
 			await applyUsbConfig(device, this.#seq);
+			if (generation !== this.#generation) return false;
 			this.#seq = (this.#seq + 1) & 0xff;
 
-			this.#expectingReconnect = true;
-			this.#cancel();
+			this.#generation++;
+			this.#cancelPoll();
+			this.#cancelRetry();
 			this.device = null;
 			this.stats = null;
 			this.rates = null;
 			this.config = null;
-			this.state = 'connecting';
-			this.error = '设备正在重新枚举 USB…';
-			this.#scheduleReconnectTimeout();
+			this.commandPending = false;
+			this.#reenumerating = true;
+			this.#attempt = 0;
+			this.error = REENUMERATING_MESSAGE;
+			this.state = 'waiting';
+			this.#scheduleRetry(REENUMERATE_RETRY_MS);
+			this.#scheduleNotice();
 			return true;
 		} catch (error) {
+			if (generation !== this.#generation) return false;
 			this.commandError = describeCommandError(error);
 			return false;
 		} finally {
-			this.commandPending = false;
+			if (generation === this.#generation) this.commandPending = false;
 		}
 	}
 
@@ -420,20 +610,14 @@ export class MlinkSession {
 	 * 配置快照在抽屉打开时会重新读，因此这里不额外对账。
 	 */
 	async setWifiRate(rate: number): Promise<void> {
+		const generation = this.#generation;
 		await this.#sendCommand(CMD_SET_WIFI_RATE, rate);
+		if (generation !== this.#generation) return;
 		if (this.commandError === null && this.config !== null) {
 			this.config = { ...this.config, wifiRate: rate };
 		}
 	}
 
-	/**
-	 * 设置注入丢包率（设备端单位：千分比）。
-	 *
-	 * 与速率档位同形：设备端把同一条命令转发给对端，两端各按同一个丢包率丢
-	 * 自己发出的 DAP/UART 帧。界面按百分比收输入，换算在调用方完成。
-	 *
-	 * 回显值就地更新，理由同 setWifiRate。
-	 */
 	/**
 	 * 下发可靠传输参数（SetLinkConfig）。
 	 *
@@ -446,24 +630,32 @@ export class MlinkSession {
 	async setLinkConfig(patch: LinkConfigPatch): Promise<void> {
 		const device = this.device;
 		if (device === null || this.commandPending) return;
+		const generation = this.#generation;
 		this.commandPending = true;
 		this.commandError = null;
 		try {
 			await writeLinkConfig(device, this.#seq, patch);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
 			// 设备应用是异步的：给主循环一拍再去读，免得读到旧值
 			await new Promise((resolve) => setTimeout(resolve, 120));
-			this.config = await readConfig(device, this.#seq);
+			if (generation !== this.#generation) return;
+			const config = await readConfig(device, this.#seq);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
+			this.config = config;
 		} catch (error) {
+			if (generation !== this.#generation) return;
 			this.commandError = describeCommandError(error);
 		} finally {
-			this.commandPending = false;
+			if (generation === this.#generation) this.commandPending = false;
 		}
 	}
 
 	async setLossPermille(permille: number): Promise<void> {
+		const generation = this.#generation;
 		await this.#sendCommand(CMD_SET_LOSS, permille);
+		if (generation !== this.#generation) return;
 		if (this.commandError === null && this.config !== null) {
 			this.config = { ...this.config, lossPermille: permille };
 		}
@@ -498,6 +690,7 @@ export class MlinkSession {
 	 */
 	async ping(): Promise<void> {
 		if (this.device === null || this.commandPending) return;
+		const generation = this.#generation;
 		this.commandError = null;
 		this.#pingProbeAt = performance.now(); // 点击也算一次周期节拍，避免紧接着又发一轮
 		this.manualPingInFlight = true;
@@ -506,7 +699,7 @@ export class MlinkSession {
 		try {
 			await this.#probePing(true);
 		} finally {
-			this.commandPending = false;
+			if (generation === this.#generation) this.commandPending = false;
 		}
 	}
 
@@ -522,14 +715,17 @@ export class MlinkSession {
 	async #probePing(report: boolean): Promise<void> {
 		const device = this.device;
 		if (device === null) return;
+		const generation = this.#generation;
 		this.#pingBaseline =
 			this.stats === null ? null : { ok: this.stats.pingOk ?? 0, fail: this.stats.pingFail ?? 0 };
 		this.#pingInFlight = true;
 		this.#schedulePingTimeout();
 		try {
 			await pingPeer(device, this.#seq);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
 		} catch (error) {
+			if (generation !== this.#generation) return;
 			if (report) this.commandError = describeCommandError(error);
 			this.#finishPing();
 		}
@@ -562,15 +758,18 @@ export class MlinkSession {
 	async #sendCommand(cmd: number, arg = 0): Promise<void> {
 		const device = this.device;
 		if (device === null || this.commandPending) return;
+		const generation = this.#generation;
 		this.commandPending = true;
 		this.commandError = null;
 		try {
 			await runCommand(device, cmd, this.#seq, arg);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
 		} catch (error) {
+			if (generation !== this.#generation) return;
 			this.commandError = describeCommandError(error);
 		} finally {
-			this.commandPending = false;
+			if (generation === this.#generation) this.commandPending = false;
 		}
 	}
 
@@ -584,9 +783,11 @@ export class MlinkSession {
 
 	async #poll(): Promise<void> {
 		const device = this.device;
-		if (device === null || this.#expectingReconnect) return;
+		if (device === null) return;
+		const generation = this.#generation;
 		try {
 			const stats = await readStats(device, this.#seq);
+			if (generation !== this.#generation) return;
 			this.#seq = (this.#seq + 1) & 0xff;
 			const previous = this.stats;
 			this.rates = previous === null ? null : computeRates(previous, stats);
@@ -605,14 +806,14 @@ export class MlinkSession {
 			// 定时探测由上位机发起，节拍与轮询同源（见 #schedulePingProbe）
 			this.#schedulePingProbe();
 			this.error = null;
+			this.#attempt = 0;
 			if (this.state !== 'streaming') this.state = 'streaming';
 			this.#appendSample();
 		} catch (error) {
-			if (this.#expectingReconnect) return; // 重枚举中的断开是预期的，交给 connect 事件接回
-			this.#fail(describeError(error));
-			this.device = null;
+			if (generation !== this.#generation) return;
 			this.stats = null;
 			this.rates = null;
+			this.#recover(error, 'transfer');
 			return;
 		}
 		this.#schedule();
@@ -651,38 +852,150 @@ export class MlinkSession {
 		this.history = kept;
 	}
 
-	#cancel(): void {
+	/** 停掉轮询与探测计时：不动等待态自己的重试与提示计时器。 */
+	#cancelPoll(): void {
 		if (this.#timer !== null) {
 			clearTimeout(this.#timer);
 			this.#timer = null;
 		}
-		if (this.#reconnectTimer !== null) {
-			clearTimeout(this.#reconnectTimer);
-			this.#reconnectTimer = null;
-		}
 		this.#finishPing();
 	}
 
-	/**
-	 * 等待重新枚举的设备接回：超时说明 connect 事件没等到（浏览器未自动接回），
-	 * 直接提示用户重新连接，避免页面永远停在"连接中"。
-	 */
-	#scheduleReconnectTimeout(): void {
-		if (this.#reconnectTimer !== null) clearTimeout(this.#reconnectTimer);
-		this.#reconnectTimer = setTimeout(() => {
-			this.#reconnectTimer = null;
-			if (!this.#expectingReconnect) return;
-			this.#expectingReconnect = false;
-			this.state = 'disconnected';
-			this.error = '设备重新枚举后未能自动接回，请重新连接设备';
-			void this.restore();
-		}, RECONNECT_TIMEOUT_MS);
+	#cancelRetry(): void {
+		if (this.#retryTimer !== null) {
+			clearTimeout(this.#retryTimer);
+			this.#retryTimer = null;
+		}
 	}
 
-	#fail(message: string): void {
-		this.#cancel();
-		this.error = message;
-		if (this.state !== 'unsupported') this.state = 'error';
+	#cancelNotice(): void {
+		if (this.#noticeTimer !== null) {
+			clearTimeout(this.#noticeTimer);
+			this.#noticeTimer = null;
+		}
+	}
+
+	/** 会话停下时清掉全部计时器（轮询、重试、提示升级、探测兜底）。 */
+	#cancel(): void {
+		this.#cancelPoll();
+		this.#cancelRetry();
+		this.#cancelNotice();
+	}
+
+	/** 重新枚举后还没接回：只升级文案，重试继续。 */
+	#scheduleNotice(): void {
+		this.#cancelNotice();
+		this.#noticeTimer = setTimeout(() => {
+			this.#noticeTimer = null;
+			if (!this.#reenumerating || this.state !== 'waiting') return;
+			this.error = '设备重新枚举后还没接回，仍在重试~';
+		}, RECONNECT_NOTICE_MS);
+	}
+
+	/**
+	 * 失败归因与处置：区分「被别的程序占着」「驱动没就绪」「设备已经走了」「要用户动手」，
+	 * 能自愈的进等待态并排下一次退避重试，只有不能自愈的才停下并提示。
+	 *
+	 * 重试期间保住 device 句柄（句柄还在就原地重开），句柄已经作废时按序列号重新解析，
+	 * 因此重新枚举后的新对象也能接上。
+	 */
+	#recover(error: unknown, phase: FailurePhase): void {
+		const plan = planRecovery({
+			phase,
+			errorName: error instanceof DOMException ? error.name : null,
+			attempt: this.#attempt + 1,
+		});
+		if (plan.retryAfterMs === null) {
+			this.#generation++;
+			this.#cancel();
+			this.#reenumerating = false;
+			this.device = null;
+			this.stats = null;
+			this.rates = null;
+			this.config = null;
+			this.commandError = null;
+			this.error = plan.message;
+			if (this.state !== 'unsupported') this.state = 'error';
+			return;
+		}
+		this.#beginWaiting(this.#reenumerating ? REENUMERATING_MESSAGE : plan.message);
+	}
+
+	/**
+	 * 进入等待态并排下一次重试。
+	 *
+	 * @param message 本次要显示的等待说明；重试本身失败时不换新文案，保留上一句更有
+	 *                信息量的说明
+	 */
+	#beginWaiting(message?: string): void {
+		this.#attempt++;
+		this.state = 'waiting';
+		if (message !== undefined) this.error = message;
+		this.#scheduleRetry(backoffMs(this.#attempt));
+	}
+
+	#scheduleRetry(delay: number): void {
+		if (this.#retryTimer !== null || this.#destroyed) return;
+		this.#retryTimer = setTimeout(() => {
+			this.#retryTimer = null;
+			void this.#retry();
+		}, delay);
+	}
+
+	/** 退避到点后重试：句柄还在就原地重开，句柄没了就按序列号重新解析。 */
+	async #retry(): Promise<void> {
+		if (this.#destroyed) return;
+		const key = this.currentKey;
+		if (key === null) return;
+
+		const device = this.device ?? (await this.#resolveTarget(key));
+		if (this.#destroyed) return;
+		if (device === null) {
+			// 设备还没回来：保持等待，按退避再看一次
+			this.#beginWaiting();
+			return;
+		}
+		await this.#open(device, true);
+	}
+
+	/** 按身份从已授权列表里找设备；重新枚举后是新的对象，所以每次都重新取。 */
+	async #resolveTarget(key: string): Promise<USBDevice | null> {
+		let granted: USBDevice[];
+		try {
+			granted = await navigator.usb.getDevices();
+		} catch {
+			return null;
+		}
+		this.#updateDevices(granted);
+		return granted.find((item) => isMlinkDevice(item) && deviceKey(item) === key) ?? null;
+	}
+
+	#updateDevices(granted: USBDevice[]): void {
+		this.devices = deviceEntries(granted);
+	}
+
+	#readStoredKey(): string | null {
+		try {
+			return localStorage.getItem(STORAGE_KEY);
+		} catch {
+			return null;
+		}
+	}
+
+	#remember(key: string): void {
+		try {
+			localStorage.setItem(STORAGE_KEY, key);
+		} catch {
+			// 无存储可用（隐私模式、file:// 被拒）时不记住，功能不受影响
+		}
+	}
+
+	#forget(): void {
+		try {
+			localStorage.removeItem(STORAGE_KEY);
+		} catch {
+			// 同上：清不掉也不影响本次断开
+		}
 	}
 
 	#bindListeners(): void {
@@ -690,24 +1003,45 @@ export class MlinkSession {
 		this.#listenersBound = true;
 
 		navigator.usb.addEventListener('disconnect', (event) => {
-			if (event.device !== this.device) return;
-			this.device = null;
-			this.stats = null;
-			this.rates = null;
-			this.config = null;
-			this.commandError = null;
-			this.#cancel();
-			this.state = 'disconnected';
-			this.error = '设备已断开';
+			void this.refreshDevices();
+			this.#onDeviceGone(event.device);
 		});
 
 		navigator.usb.addEventListener('connect', () => {
-			if (this.device === null) void this.restore();
+			void this.refreshDevices();
+			// 目标设备回来了：不必等退避到点，立刻试一次
+			if (this.device === null && this.currentKey !== null) {
+				this.#attempt = 0;
+				this.#cancelRetry();
+				void this.#retry();
+			}
 		});
 
 		document.addEventListener('visibilitychange', () => {
 			this.intervalMs = document.hidden ? POLL_INTERVAL_HIDDEN_MS : POLL_INTERVAL_MS;
 		});
+	}
+
+	/** 本会话的设备被拔掉：松开句柄、清空面板，按身份继续找它。 */
+	#onDeviceGone(device: USBDevice): void {
+		// 按身份字段比对，而不是对象同一性：$state 会把设备对象包成 Proxy，事件里带的
+		// 原始对象与状态里读到的不可能是同一个引用
+		if (this.device === null || deviceKey(device) !== this.currentKey) return;
+		this.#generation++;
+		this.#cancelPoll();
+		this.#cancelRetry();
+		this.device = null;
+		this.stats = null;
+		this.rates = null;
+		this.config = null;
+		this.commandError = null;
+		this.commandPending = false;
+		this.#attempt = 0;
+		if (this.currentKey === null) {
+			this.state = 'disconnected';
+			return;
+		}
+		this.#beginWaiting(GONE_MESSAGE);
 	}
 }
 

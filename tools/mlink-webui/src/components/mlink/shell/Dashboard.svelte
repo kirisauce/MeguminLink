@@ -107,9 +107,15 @@
 		<UsbDiagnosisAlert {session} />
 
 		{#if session.error !== null}
-			<p class="alert">{session.error}</p>
+			<p class="alert" data-tone={session.state === 'waiting' ? 'busy' : 'error'}>{session.error}</p>
 		{:else if session.state === 'disconnected' && session.usbDiagnosis?.status === 'ok'}
-			<p class="hint">点右上角「连接设备」，在选择器里选 MeguminLink（303a:4020）即可开始监控。</p>
+			<p class="hint">
+				{#if session.devices.length > 0}
+					点顶栏的「选择设备 ▾」，挑一台开始监控~
+				{:else}
+					点右上角「连接设备」，在选择器里选 MeguminLink（303a:4020）~
+				{/if}
+			</p>
 		{/if}
 
 		<StatusStrip
@@ -192,6 +198,12 @@
 		background: var(--md-sys-color-error-container);
 		color: var(--md-sys-color-on-error-container);
 		font-size: var(--md-sys-typescale-body-md);
+	}
+
+	/* 等待设备是可自愈的中间态，用提示色而不是报错色 */
+	.alert[data-tone='busy'] {
+		background: var(--mlink-status-busy-container);
+		color: var(--mlink-status-busy);
 	}
 
 	.hint {

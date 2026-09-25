@@ -28,7 +28,11 @@ bun run preview
 
 顶栏「设备」显示设过的设备名称，没设过就显示设备序列号（MAC）；悬停能看到 USB 产品名与序列号。
 
-页面刷新后会自动接回本 origin 已授权过的设备，不必重新点选。
+本 origin 授权过多台 MeguminLink 时，点顶栏那个设备按钮（还没选设备时它写着「选择设备 ▾」）在下拉里选一台，同一时刻只监控一台（切走的那台会松开句柄、曲线重新开始）；菜单底部的「连接其它设备…」是浏览器设备选择器，用于授权新设备。
+
+选中的那台会被记住，页面刷新、拔插、设备重新枚举、设备重启都自动接回**同一台**，不再抓授权列表里的第一台。记住的是设备序列号（MAC），只存在浏览器本地。
+
+**设备暂时不可用不会中断会话**：被烧录器之类的程序占着（`AccessDeniedError`）、传输被打断、或者设备刚拔掉，都会进入「等待设备」态并按 1s → 2s → 5s 封顶的节奏自动重试，占用解除或插回后自动接回，不需要手动重连。只有浏览器要求用户手势（`SecurityError`）才会停下并提示点「连接设备」。点顶栏「断开」是明确不要了：停止重试，也不再记住这台。
 
 **监控与烧录可以并存**：页面只发送 EP0 的 device recipient 控制传输，不 claim 任何接口，所以 OpenOCD / pyOCD 可以同时使用同一台设备。
 
@@ -65,6 +69,7 @@ WebUSB / WinUSB 两项能力的**编译期总开关**在固件的 `MEGUMINLINK_U
 - 数据不连续时（设备重启、断开重连、页面长时间挂起）曲线在该处断开，不会把两侧连成一条假直线。
 - 曲线两张：USB-DAP 一张常驻；另一张跟随链路模式 —— `local` 显示 CDC ↔ 片上 UART，`wireless` 显示 CDC ↔ 无线桥与空口共四条线。
 - 状态条的**串口**是 CDC ACM 的打开状态（TinyUSB 的 DTR，主机打开 `/dev/ttyACMx` 时置位），由固件在 `GET_STATS` 里实时查询而非缓存，拔插后不会停在过期的「已打开」；**UART 卡片副标题**里的线编码（如 `115200 8N1`）是主机 `SET_LINE_CODING` 下发、固件记录的值。老固件不上报这两项时显示「—」。
+- 等待接回期间的提示条用提示色而不是报错色：那是可自愈的中间态；真正需要用户动手的失败（`SecurityError`）才落报错色并停住。
 
 ## Linux 权限
 
@@ -78,11 +83,13 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="303a", ATTR{idProduct}=="4020", TAG+="uaccess
 
 ```
 src/lib/protocol.ts           EP0 请求构造与 8B 帧头 + TLV 解析（与固件 main/config_channel.cc 契约一致）
-src/lib/session.svelte.ts     WebUSB 会话：授权、轮询、拔插、可见性降频、60 秒采样窗口
+src/lib/devices.ts            授权设备条目与「没有选择时该接哪台」的取舍（序列号作身份，纯逻辑）
+src/lib/session_recovery.ts   失败归因（占用 / 驱动 / 设备不在 / 要用户动手）与 1s→2s→5s 退避节奏（纯逻辑）
+src/lib/session.svelte.ts     WebUSB 会话：授权、轮询、设备切换、按序列号接回、可见性降频、60 秒采样窗口
 src/lib/rate.ts               速率差分、u32 回绕、数值与时长格式化
 src/styles/tokens.css         M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
 src/components/ui/            通用组件（SegmentedControl / ConfirmDialog），不含设备协议知识，可整块复用
-src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar）
+src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar / DeviceMenu）
 src/components/mlink/panel/   主面板区，Dashboard 直接渲染（StatusStrip / StatCard / StatTable / RateChart）
 src/components/mlink/drawer/  配置抽屉区（ConfigDrawer / ConfigActions / UsbSettings）
 src/pages/index.astro         唯一页面，挂载 Dashboard island

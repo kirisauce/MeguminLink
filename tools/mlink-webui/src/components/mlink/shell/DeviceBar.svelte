@@ -1,12 +1,13 @@
 <script lang="ts">
 	import { STATE_TEXT, type MlinkSession } from '../../../lib/session.svelte';
+	import DeviceMenu from './DeviceMenu.svelte';
 
 	let { session, onconfig }: { session: MlinkSession; onconfig: () => void } = $props();
 
 	const tone = $derived(
 		session.state === 'streaming'
 			? 'ok'
-			: session.state === 'connecting'
+			: session.state === 'connecting' || session.state === 'waiting'
 				? 'busy'
 				: session.state === 'error' || session.state === 'unsupported'
 					? 'error'
@@ -20,10 +21,7 @@
 		<span class="chip" data-tone={tone}>{STATE_TEXT[session.state]}</span>
 	</div>
 
-	<div class="device">
-		<span class="device-label">设备</span>
-		<code title={session.deviceDetail}>{session.deviceLabel}</code>
-	</div>
+	<DeviceMenu {session} />
 
 	<div class="actions">
 		{#if session.state === 'streaming'}
@@ -92,24 +90,6 @@
 	.chip[data-tone='error'] {
 		background: var(--mlink-status-error-container);
 		color: var(--mlink-status-error);
-	}
-
-	.device {
-		display: flex;
-		align-items: baseline;
-		gap: var(--md-sys-space-sm);
-		font-size: var(--md-sys-typescale-body-sm);
-		color: var(--md-sys-color-on-surface-variant);
-	}
-
-	.device-label {
-		font-size: var(--md-sys-typescale-label-sm);
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-	}
-
-	.device code {
-		color: var(--md-sys-color-on-surface);
 	}
 
 	.actions {
