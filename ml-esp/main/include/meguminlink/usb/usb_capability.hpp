@@ -109,7 +109,7 @@ struct UsbCapabilitySettings
  */
 inline constexpr u16 USB_MS_OS_DESCRIPTOR_SET_LEN = 180;
 
-/** MS OS 2.0 平台能力圈定的接口号：DAP vendor 接口（usb.cc 的 ITF_NUM_DAP） */
+/** MS OS 2.0 平台能力圈定的接口号：DAP vendor 接口（UsbDescriptors::DAP_INTERFACE，见 usb_descriptors.hpp） */
 inline constexpr u8 USB_CAPABILITY_INTERFACE = 0;
 
 /** 编译期支持的能力位掩码 */

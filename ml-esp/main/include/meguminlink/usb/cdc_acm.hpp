@@ -15,7 +15,7 @@ namespace mlink
  *
  * 只管这一段的接口安装与收发。数据进来之后走本机串口还是无线、本机数据怎么送回
  * 主机，由调用方按模式决定（见 CmsisDapUsb 的回调与 UartBridge），本对象不判断模式。
- * 接口描述符不在这里：那是 USB 设备枚举的职责（见 UsbConfigurationDescriptor）。
+ * 接口描述符不在这里：那是 USB 设备枚举的职责（见 UsbDescriptors）。
  */
 class CdcAcm
 {

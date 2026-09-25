@@ -3,12 +3,12 @@
 #include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
 #include "meguminlink/dap_frame.hpp"     // dap_request_size（USB 命令重组）
 #include "meguminlink/usb/usb_capability.hpp"
+#include "meguminlink/usb/usb_descriptors.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/link.hpp" // WirelessLink::submit_dap_command（Wireless 转发）
 
 #include <esp_check.h>
 #include <esp_log.h>
-#include <esp_mac.h>
 #include <esp_rom_sys.h> // esp_rom_delay_us
 #include <sdkconfig.h>
 #include <tinyusb.h>
@@ -16,7 +16,6 @@
 #include <tusb.h>
 
 #include <cstddef>
-#include <cstdio>
 #include <cstring>
 
 // 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 cmsis_dap/Source/*.c 一致）。
@@ -47,96 +46,13 @@ namespace
 {
 using namespace mlink;
 
-// ---- CMSIS-DAP descriptors ----
-// 接口结构：vendor specific 接口 (class 0xFF) + bulk 端点 承载 CMSIS-DAP v2
-// 命令/响应；CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时追加 IAD 组合的
-// CDC ACM 接口作 UART 透传；HID 兼容模式开启（且
-// CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE=y）时再追加 HID 接口承载 CMSIS-DAP v1。
-// 两条 DAP 传输通道共用一条执行路径（见「DAP 命令队列」段）。
-// Product String 必须包含 "CMSIS-DAP"，调试器（pyOCD 等）靠它识别设备。
-
-// VID/PID：量产前需注册自有 VID/PID。当前沿用 Espressif TinyUSB 默认值：
-// 0x303A 为 Espressif VID，0x4020 为 esp_tinyusb vendor 接口默认 PID (0x4000 | 1<<5)
-constexpr u16 USB_VID = 0x303A;
-constexpr u16 USB_PID = 0x4020;
-
-// 索引 0 为语言 ID（英文），esp_tinyusb 直接拷贝其原始 2 字节
-constexpr char LANGID[] = {0x09, 0x04};
-
-// ---- Device descriptor ----
-// bDeviceClass = 0：类在接口级定义（vendor specific）
-constexpr tusb_desc_device_t DEVICE_DESCRIPTOR = {
-    .bLength = sizeof(tusb_desc_device_t),
-    .bDescriptorType = TUSB_DESC_DEVICE,
-    .bcdUSB = 0x0210,
-    .bDeviceClass = 0x00,
-    .bDeviceSubClass = 0x00,
-    .bDeviceProtocol = 0x00,
-    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor = USB_VID,
-    .idProduct = USB_PID,
-    .bcdDevice = 0x0100,
-    .iManufacturer = (u8)UsbStringIndex::Manufacturer,
-    .iProduct = (u8)UsbStringIndex::Product,
-    .iSerialNumber = (u8)UsbStringIndex::SerialNumber,
-    .bNumConfigurations = 0x01,
-};
-
-// ---- Configuration descriptor ----
-// 接口结构（插入顺序即接口号；新接口一律追加在最后，保持既有接口号稳定）：
-//   接口 0：vendor specific (0xFF, 0x00, 0x00) —— CMSIS-DAP v2 bulk transport
-//     EP2 Bulk OUT（命令）+ EP3 Bulk IN（响应）
-//   CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时追加：
-//   IAD 组合的 CDC ACM 串口（UART 透传）
-//     EP4 Interrupt IN（通知）+ EP3 Bulk OUT / EP1 Bulk IN（数据）
-//   HID 兼容模式开启（要求 CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE=y）时追加：
-//   HID 接口（vendor-defined 64B 报告）—— CMSIS-DAP v1
-//     EP1 Interrupt OUT（命令）+ EP2 Interrupt IN（响应）
-
-/** DAP vendor 接口的接口号（永远是第一个插入的接口） */
-constexpr u8 ITF_NUM_DAP = 0;
-
 #if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
-// ---- CMSIS-DAP v1 (HID) ----
-// 报告描述符：vendor-defined usage page (0xFF00)、64B 定长 Input/Output 报告、
-// 无 Report ID——与 DAPLink 参考实现一致。命令经 Output 报告（中断 OUT）下发、
-// 响应经 Input 报告（中断 IN）回传，pyOCD/OpenOCD 的 HID 后端按定长 64B 收发。
-constexpr u8 HID_REPORT_DESCRIPTOR[] = {
-    0x06, 0x00, 0xFF, // Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x01,       // Usage (0x01)
-    0xA1, 0x01,       // Collection (Application)
-    0x15, 0x00,       //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08,       //   Report Size (8)
-    0x95, 0x40,       //   Report Count (64)
-    0x09, 0x01,       //   Usage (0x01)
-    0x81, 0x02,       //   Input (Data,Var,Abs)
-    0x95, 0x40,       //   Report Count (64)
-    0x09, 0x01,       //   Usage (0x01)
-    0x91, 0x02,       //   Output (Data,Var,Abs)
-    0xC0,             // End Collection
-};
-
-// HID 报告长度 = DAP_PACKET_SIZE（64）：CMSIS-DAP v1 的一条命令/响应占满一个
-// 定长报告，短数据补零。数值取自公共常量（无线对端回答 DAP_Info 单包尺寸时也用
-// 它），这里在编译期校验它与 CMSIS-DAP 的 DAP_PACKET_SIZE 一致。
-constexpr u16 HID_REPORT_SIZE = DAP_HID_PACKET_SIZE;
-static_assert(HID_REPORT_SIZE == DAP_PACKET_SIZE, "HID report size must match CMSIS-DAP packet size");
-
 // TinyUSB HID 类实例序号（≠ USB 接口号）：本固件只有一个 HID 接口
 constexpr u8 HID_INSTANCE = 0;
-#endif
 
-#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
-// BOS WebUSB 平台能力里 iLandingPage 指向的字符串索引（字符串内容随 NVS 里的 URL 变）
-constexpr u8 LANDING_PAGE_STRING_INDEX = static_cast<u8>(UsbStringIndex::WebUsbLandingPage);
-#else
-/** WebUSB 未编译时 BOS 里没有引用 landing page 的能力，索引取值无意义 */
-constexpr u8 LANDING_PAGE_STRING_INDEX = 0;
+// 描述符给出的 HID 报告长度必须等于 CMSIS-DAP 的单包尺寸：v1 路径按定长报告收发
+static_assert(USB_HID_REPORT_SIZE == DAP_PACKET_SIZE, "HID report size must match CMSIS-DAP packet size");
 #endif
-
-// MS OS 2.0 描述符集圈定的接口号（usb_capability.cc）必须就是 DAP vendor 接口
-static_assert(ITF_NUM_DAP == USB_CAPABILITY_INTERFACE);
 
 void tinyusb_event_callback([[maybe_unused]] tinyusb_event_t *event, [[maybe_unused]] void *arg)
 {
@@ -251,12 +167,12 @@ void dap_send_vendor_response(const u8 *data, u16 len)
     u16 sent = 0;
     while (sent < len)
     {
-        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+        if (!tud_vendor_n_mounted(USB_DAP_INTERFACE))
         {
-            tud_vendor_n_write_clear(ITF_NUM_DAP); // 断开：丢弃未发数据
+            tud_vendor_n_write_clear(USB_DAP_INTERFACE); // 断开：丢弃未发数据
             return;
         }
-        const u32 n = tud_vendor_n_write(ITF_NUM_DAP, data + sent, len - sent);
+        const u32 n = tud_vendor_n_write(USB_DAP_INTERFACE, data + sent, len - sent);
         if (n > 0)
         {
             sent += static_cast<u16>(n);
@@ -268,7 +184,7 @@ void dap_send_vendor_response(const u8 *data, u16 len)
         for (int w = 0; w < 10 && !progressed; w++)
         {
             esp_rom_delay_us(100);
-            const u32 n2 = tud_vendor_n_write(ITF_NUM_DAP, data + sent, len - sent);
+            const u32 n2 = tud_vendor_n_write(USB_DAP_INTERFACE, data + sent, len - sent);
             if (n2 > 0)
             {
                 sent += static_cast<u16>(n2);
@@ -282,7 +198,7 @@ void dap_send_vendor_response(const u8 *data, u16 len)
     }
     // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：写入字节数 < EP size 时
     // 不会自动发起 IN 传输，短响应必须显式 flush 才能送达主机
-    tud_vendor_n_write_flush(ITF_NUM_DAP);
+    tud_vendor_n_write_flush(USB_DAP_INTERFACE);
 
     // 等这条响应整条被主机读走再返回（见 s_vendor_tx_bytes 的说明）：端点只有 64B，
     // 大响应要跨多次 IN 传输，只等第一段就放行会把这条响应截断、下一条接上去。
@@ -290,7 +206,7 @@ void dap_send_vendor_response(const u8 *data, u16 len)
     const u32 sent_before = s_vendor_tx_bytes;
     for (int w = 0; w < 500; w++)
     {
-        if (!tud_vendor_n_mounted(ITF_NUM_DAP))
+        if (!tud_vendor_n_mounted(USB_DAP_INTERFACE))
         {
             return;
         }
@@ -308,14 +224,14 @@ void dap_send_vendor_response(const u8 *data, u16 len)
 void dap_send_hid_response(const u8 *data, u16 len)
 {
     u16 out_len = len;
-    if (out_len > HID_REPORT_SIZE)
+    if (out_len > USB_HID_REPORT_SIZE)
     {
         ESP_LOGW(TAG, "HID response truncated (%u -> %u)", static_cast<unsigned>(out_len),
-                 static_cast<unsigned>(HID_REPORT_SIZE));
-        out_len = HID_REPORT_SIZE;
+                 static_cast<unsigned>(USB_HID_REPORT_SIZE));
+        out_len = USB_HID_REPORT_SIZE;
     }
 
-    u8 report[HID_REPORT_SIZE] = {};
+    u8 report[USB_HID_REPORT_SIZE] = {};
     std::memcpy(report, data, out_len);
 
     // 响应必须送达：主机按命令顺序逐个读 HID 报告（不像 v2 bulk 那样有独立
@@ -326,7 +242,7 @@ void dap_send_hid_response(const u8 *data, u16 len)
     const CmsisDapUsb &usb = Application::get_instance().usb();
     while (tud_ready() && usb.hid_exposed())
     {
-        if (tud_hid_n_report(HID_INSTANCE, 0, report, HID_REPORT_SIZE))
+        if (tud_hid_n_report(HID_INSTANCE, 0, report, USB_HID_REPORT_SIZE))
         {
             return;
         }
@@ -364,7 +280,7 @@ bool dap_source_ready(DapSource source)
         return Application::get_instance().usb().hid_exposed();
     }
 #endif
-    return tud_vendor_n_mounted(ITF_NUM_DAP);
+    return tud_vendor_n_mounted(USB_DAP_INTERFACE);
 }
 
 /** 一条已提交、还没拿到响应的无线 DAP 命令（响应按可靠传输序号配回来） */
@@ -644,7 +560,7 @@ void dap_task(void *arg)
 void tud_vendor_tx_cb(u8 idx, u32 sent_bytes)
 {
     (void)sent_bytes;
-    if (idx == ITF_NUM_DAP)
+    if (idx == USB_DAP_INTERFACE)
     {
         s_vendor_tx_bytes = s_vendor_tx_bytes + sent_bytes;
     }
@@ -654,7 +570,7 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
 {
     (void)buffer;
     (void)buffer_size;
-    if (idx != ITF_NUM_DAP)
+    if (idx != USB_DAP_INTERFACE)
     {
         return;
     }
@@ -678,13 +594,9 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
 #if CONFIG_TINYUSB_HID_COUNT > 0
 u8 const *tud_hid_descriptor_report_cb([[maybe_unused]] u8 instance)
 {
-#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
-    return HID_REPORT_DESCRIPTOR;
-#else
-    // HID 接口未暴露（MEGUMINLINK_USB_HID_DAP_ENABLE=n）：描述符里没有 HID
-    // 接口，本回调不会被调用。
-    return nullptr;
-#endif
+    // HID 接口未暴露（MEGUMINLINK_USB_HID_DAP_ENABLE=n）时为 nullptr：描述符里
+    // 没有 HID 接口，本回调不会被调用。
+    return Application::get_instance().usb().descriptors().hid_report();
 }
 
 u16 tud_hid_get_report_cb([[maybe_unused]] u8 instance, [[maybe_unused]] u8 report_id,
@@ -717,7 +629,7 @@ const u8 *tud_descriptor_bos_cb()
 {
     // BOS 按运行时的能力状态构造（见 usb_capability.cc）：主机只在枚举时读取，
     // 运行时开关变化靠 apply_usb_capability 的重新枚举让它重读
-    return mlink::Application::get_instance().usb().usb_descriptors().bos();
+    return mlink::Application::get_instance().usb().descriptors().capability().bos();
 }
 
 bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_t *request)
@@ -737,6 +649,7 @@ bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_
     // 运行时被关掉的能力不再响应其厂商请求（STALL）：主机枚举时已从 BOS 得知
     // 设备不宣告该能力，正常不会发这些请求过来
     const mlink::CmsisDapUsb &usb = mlink::Application::get_instance().usb();
+    const UsbCapabilityDescriptors &capability_descriptors = usb.descriptors().capability();
 
     switch (request->bRequest)
     {
@@ -744,8 +657,8 @@ bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_
     case VENDOR_CODE_MS_OS_20:
         if (request->wIndex == MS_OS_20_OP_GET_DESCRIPTOR_SET && usb.usb_capability().winusb != 0)
         {
-            tud_control_xfer(rhport, request, const_cast<u8 *>(usb.usb_descriptors().ms_os_descriptor_set()),
-                             usb.usb_descriptors().ms_os_descriptor_set_len());
+            tud_control_xfer(rhport, request, const_cast<u8 *>(capability_descriptors.ms_os_descriptor_set()),
+                             capability_descriptors.ms_os_descriptor_set_len());
             return true;
         }
         break;
@@ -757,8 +670,8 @@ bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_
         {
             // URL Descriptor 常驻内存，TinyUSB 传输路径按 void* 读取，
             // 去掉 const 仅是接口要求
-            tud_control_xfer(rhport, request, const_cast<u8 *>(usb.usb_descriptors().url_descriptor()),
-                             usb.usb_descriptors().url_descriptor_len());
+            tud_control_xfer(rhport, request, const_cast<u8 *>(capability_descriptors.url_descriptor()),
+                             capability_descriptors.url_descriptor_len());
             return true;
         }
         break;
@@ -772,129 +685,12 @@ bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_
 
 namespace mlink
 {
-void UsbConfigurationDescriptor::rebuild(const UsbCapabilitySettings &settings)
-{
-    begin();
-    add_dap_interface();
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    add_uart_bridge_interface();
-#endif
-#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
-    if (settings.hid_compat != 0)
-    {
-        add_hid_interface();
-    }
-#else
-    (void)settings; // HID 未编译：接口组合固定
-#endif
-    finish();
-}
-
-void UsbConfigurationDescriptor::begin()
-{
-    // bNumInterfaces 与 wTotalLength 收尾回填
-    constexpr tusb_desc_configuration_t HEADER = {
-        .bLength = TUD_CONFIG_DESC_LEN,
-        .bDescriptorType = TUSB_DESC_CONFIGURATION,
-        .wTotalLength = 0,
-        .bNumInterfaces = 0,
-        .bConfigurationValue = 1,
-        .iConfiguration = 0,
-        .bmAttributes = 0x80, // bus powered
-        .bMaxPower = 500 / 2, // 单位 2 mA
-    };
-    static_assert(sizeof(HEADER) == TUD_CONFIG_DESC_LEN);
-
-    m_len = 0;
-    m_next_interface = 0;
-    append(reinterpret_cast<const u8 *>(&HEADER), sizeof(HEADER));
-}
-
-void UsbConfigurationDescriptor::add_dap_interface()
-{
-    const u8 itf = ITF_NUM_DAP;
-    m_next_interface = static_cast<u8>(itf + 1);
-
-    const u8 desc[]{TUD_VENDOR_DESCRIPTOR(itf, (u8)UsbStringIndex::DapInterfaceName, EP_DAP_OUT, EP_DAP_IN, 64)};
-    append(desc, sizeof(desc));
-}
-
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-void UsbConfigurationDescriptor::add_uart_bridge_interface()
-{
-    // CDC 组占两个接口：通信接口（IAD 的 bFirstInterface）与数据接口
-    const u8 itf = m_next_interface;
-    m_next_interface = static_cast<u8>(itf + 2);
-
-    const u8 desc[]{TUD_CDC_DESCRIPTOR(itf, (u8)UsbStringIndex::UartBridgeInterfaceName, EP_CDC_NOTIF, 64, EP_CDC_OUT,
-                                       EP_CDC_IN, 64)};
-    append(desc, sizeof(desc));
-}
-#endif
-
-#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
-void UsbConfigurationDescriptor::add_hid_interface()
-{
-    const u8 itf = m_next_interface;
-    m_next_interface = static_cast<u8>(itf + 1);
-
-    // 报告描述符长度 + 中断端点对（IN/OUT 各 64B，FS 轮询间隔 1ms）
-    const u8 desc[]{TUD_HID_INOUT_DESCRIPTOR(itf, (u8)UsbStringIndex::HidInterfaceName, HID_ITF_PROTOCOL_NONE,
-                                             sizeof(HID_REPORT_DESCRIPTOR), EP_HID_OUT, EP_HID_IN, HID_REPORT_SIZE, 1)};
-    append(desc, sizeof(desc));
-}
-#endif
-
-void UsbConfigurationDescriptor::finish()
-{
-    // ESP 目标为小端，与 USB 描述符一致
-    const u16 total_len = static_cast<u16>(m_len);
-    std::memcpy(m_buffer + offsetof(tusb_desc_configuration_t, wTotalLength), &total_len, sizeof(total_len));
-    m_buffer[offsetof(tusb_desc_configuration_t, bNumInterfaces)] = m_next_interface;
-}
-
-void UsbConfigurationDescriptor::append(const u8 *bytes, usize len)
-{
-    if (m_len + len > sizeof(m_buffer))
-    {
-        // 容量已覆盖全部编译期布局：越界说明新接口段没算进 CAPACITY
-        ESP_LOGE(TAG, "Configuration descriptor overflow (%u + %u > %u), interface segment dropped",
-                 static_cast<unsigned>(m_len), static_cast<unsigned>(len), static_cast<unsigned>(sizeof(m_buffer)));
-        return;
-    }
-
-    std::memcpy(m_buffer + m_len, bytes, len);
-    m_len += len;
-}
-
 CmsisDapUsb::CmsisDapUsb()
 {
-    // 能力状态从 NVS 载入（无记录用编译期默认值），并据此构造 BOS、GET_URL、
-    // 产品名与配置描述符：必须在 tinyusb_driver_install（init）之前完成，主机
-    // 枚举时读到的就是它
+    // 能力状态从 NVS 载入（无记录用编译期默认值），并据此构造描述符集：必须在
+    // tinyusb_driver_install（init）之前完成，主机枚举时读到的就是它
     m_usb_capability = usb_capability_load();
-
-    usb_product_string(m_usb_capability.device_name, m_product_string, sizeof(m_product_string));
-    dap_product_string(m_usb_capability.device_name, m_dap_product_string, sizeof(m_dap_product_string));
-
-    m_string_descriptors[(usize)UsbStringIndex::LangId] = LANGID;
-    m_string_descriptors[(usize)UsbStringIndex::Manufacturer] = "MeguminLink";
-    m_string_descriptors[(usize)UsbStringIndex::Product] = m_product_string;
-    m_string_descriptors[(usize)UsbStringIndex::SerialNumber] = m_serial;
-    m_string_descriptors[(usize)UsbStringIndex::DapInterfaceName] = "CMSIS-DAP v2";
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    // CDC 接口的 iInterface 必须给出字符串：空槽会让主机的字符串请求吃到 STALL
-    m_string_descriptors[(usize)UsbStringIndex::UartBridgeInterfaceName] = "UART Bridge";
-#endif
-#if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
-    m_string_descriptors[(usize)UsbStringIndex::HidInterfaceName] = "CMSIS-DAP v1";
-#endif
-
-#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
-    m_string_descriptors[(usize)UsbStringIndex::WebUsbLandingPage] = m_usb_capability.landing_page;
-#endif
-    m_usb_descriptors.rebuild(m_usb_capability, LANDING_PAGE_STRING_INDEX);
-    m_config_descriptor.rebuild(m_usb_capability);
+    m_descriptors.rebuild(m_usb_capability);
 
     // 命令队列按字节容量创建：每条命令最多占一个 DapCommand（长度字段 +
     // MAX_DAP_PAYLOAD_SIZE 数据段）。容量必须容得下至少一条完整命令，
@@ -923,20 +719,15 @@ esp_err_t CmsisDapUsb::init()
     esp_err_t ret;
     [[maybe_unused]] BaseType_t dap_core = 0; // 多核下 = TinyUSB 任务的反核；单核无意义
 
-    {
-        // 串号 = 芯片 MAC，保证多个 probe 可同时枚举
-        u8 mac[6];
-        ret = esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
-        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read MAC address");
-        snprintf(m_serial, sizeof(m_serial), MACSTR, MAC2STR(mac));
-    }
+    ret = m_descriptors.load_serial();
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to read MAC address");
 
     {
         tinyusb_config_t tinyusb_config = TINYUSB_DEFAULT_CONFIG(tinyusb_event_callback);
-        tinyusb_config.descriptor.device = &DEVICE_DESCRIPTOR;
-        tinyusb_config.descriptor.string = m_string_descriptors.data();
-        tinyusb_config.descriptor.string_count = static_cast<int>(m_string_descriptors.size());
-        tinyusb_config.descriptor.full_speed_config = m_config_descriptor.data();
+        tinyusb_config.descriptor.device = &m_descriptors.device();
+        tinyusb_config.descriptor.string = m_descriptors.string_table();
+        tinyusb_config.descriptor.string_count = m_descriptors.string_count();
+        tinyusb_config.descriptor.full_speed_config = m_descriptors.config();
 
 #if !CONFIG_FREERTOS_UNICORE
         // 多核：显式固定 TinyUSB 任务到 core 1、优先级 5，不依赖库默认值
@@ -1010,13 +801,7 @@ void CmsisDapUsb::apply_usb_capability(const UsbCapabilitySettings &settings)
     vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
 
     m_usb_capability = settings;
-    usb_product_string(m_usb_capability.device_name, m_product_string, sizeof(m_product_string));
-    dap_product_string(m_usb_capability.device_name, m_dap_product_string, sizeof(m_dap_product_string));
-    m_usb_descriptors.rebuild(m_usb_capability, LANDING_PAGE_STRING_INDEX);
-    m_config_descriptor.rebuild(m_usb_capability);
-#if CONFIG_MEGUMINLINK_USB_WEBUSB_CAPABILITY_ENABLE
-    m_string_descriptors[(usize)UsbStringIndex::WebUsbLandingPage] = m_usb_capability.landing_page;
-#endif
+    m_descriptors.rebuild(m_usb_capability);
 
     tud_connect();
     ESP_LOGI(TAG, "USB capabilities applied (webusb=%u winusb=%u hid_compat=%u landing_page=%s), re-enumerating",

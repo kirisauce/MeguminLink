@@ -19,6 +19,7 @@ list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/uart/uart_bridge.cc)
 if(CONFIG_MEGUMINLINK_USB_SUPPORT)
     list(APPEND __src
         ${CMAKE_CURRENT_LIST_DIR}/usb/usb.cc
+        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_descriptors.cc
         ${CMAKE_CURRENT_LIST_DIR}/usb/cdc_acm.cc
         ${CMAKE_CURRENT_LIST_DIR}/usb/usb_capability.cc)
 endif()
