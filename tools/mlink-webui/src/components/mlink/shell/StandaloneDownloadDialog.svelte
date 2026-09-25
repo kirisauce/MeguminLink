@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { STANDALONE_FILENAME } from '../../../lib/standalone';
 	import ConfirmDialog from '../../ui/ConfirmDialog.svelte';
 
 	let { open, href, onclose }: { open: boolean; href: string; onclose: () => void } = $props();
@@ -24,7 +25,7 @@
 			const url = URL.createObjectURL(blob);
 			const anchor = document.createElement('a');
 			anchor.href = url;
-			anchor.download = 'mlink-webui-standalone.html';
+			anchor.download = STANDALONE_FILENAME;
 			anchor.click();
 			URL.revokeObjectURL(url);
 			onclose();

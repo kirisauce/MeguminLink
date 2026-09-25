@@ -3,6 +3,8 @@
 	import type uPlot from 'uplot';
 	import { MlinkSession } from '../../../lib/session.svelte';
 	import { formatBytes, formatCount, formatLineCoding, formatRate, formatUartOpen, type CounterKey } from '../../../lib/rate';
+	import { STANDALONE_HREF } from '../../../lib/standalone';
+	import StandaloneDownloadDialog from './StandaloneDownloadDialog.svelte';
 	import DeviceBar from './DeviceBar.svelte';
 	import ConfigDrawer from '../drawer/ConfigDrawer.svelte';
 	import StatusStrip from '../panel/StatusStrip.svelte';
@@ -14,8 +16,14 @@
 
 	const session = new MlinkSession();
 
+	/** 单文件版本地址；null = 本构建不提供下载入口（离线页自己就是那个产物）。 */
+	let { downloadHref = STANDALONE_HREF }: { downloadHref?: string | null } = $props();
+
 	/** 配置抽屉的开关；面板本身固定在视口右侧，不参与页面流。 */
 	let configOpen = $state(false);
+
+	/** 单文件下载弹窗的开关。 */
+	let downloadOpen = $state(false);
 
 	onMount(() => {
 		void session.restore();
@@ -104,6 +112,13 @@
 	<DeviceBar {session} onconfig={() => (configOpen = true)} />
 
 	<main>
+		{#if downloadHref !== null}
+			<div class="standalone">
+				<p>想离线用？</p>
+				<button type="button" onclick={() => (downloadOpen = true)}>下载单文件HTML</button>
+			</div>
+		{/if}
+
 		<UsbDiagnosisAlert {session} />
 
 		{#if session.error !== null}
@@ -161,6 +176,14 @@
 	</main>
 
 	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} />
+
+	{#if downloadHref !== null}
+		<StandaloneDownloadDialog
+			open={downloadOpen}
+			href={downloadHref}
+			onclose={() => (downloadOpen = false)}
+		/>
+	{/if}
 </div>
 
 <style>
@@ -171,6 +194,40 @@
 		max-width: 64rem;
 		margin: 0 auto;
 		padding: var(--md-sys-space-xl);
+	}
+
+	/* 单文件下载入口：常驻在内容顶部，浅色容器衬底 + 主色描边按钮，
+	   可见但不跟「连接设备」这类主操作抢视觉 */
+	.standalone {
+		display: flex;
+		align-items: center;
+		gap: var(--md-sys-space-md);
+		flex-wrap: wrap;
+		padding: var(--md-sys-space-sm) var(--md-sys-space-lg);
+		border-radius: var(--md-sys-shape-corner-md);
+		background: var(--md-sys-color-surface-container-low);
+	}
+
+	.standalone p {
+		margin: 0;
+		font-size: var(--md-sys-typescale-body-md);
+		color: var(--md-sys-color-on-surface-variant);
+	}
+
+	.standalone button {
+		font: inherit;
+		font-size: var(--md-sys-typescale-body-md);
+		padding: 0.35rem 1.1rem;
+		border: 1px solid var(--md-sys-color-primary);
+		border-radius: var(--md-sys-shape-corner-full);
+		background: transparent;
+		color: var(--md-sys-color-primary);
+		cursor: pointer;
+		transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-enter);
+	}
+
+	.standalone button:hover {
+		background: var(--md-sys-color-surface-container);
 	}
 
 	.cards {

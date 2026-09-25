@@ -6,6 +6,8 @@
  * 安全导入，也能在宿主机上喂假环境跑用例。
  */
 
+import { STANDALONE_HREF } from './standalone';
+
 export type CheckState = 'pass' | 'fail' | 'unknown';
 
 export type UsbCheckId =
@@ -139,7 +141,7 @@ export function diagnoseWebUsb(env: UsbEnvironment): UsbDiagnosis {
 			],
 			link: {
 				label: '点这里下载单文件版本~',
-				href: '/mlink-webui-standalone.html',
+				href: STANDALONE_HREF,
 				download: true,
 			},
 		});

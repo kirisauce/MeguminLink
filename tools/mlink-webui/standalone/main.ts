@@ -17,4 +17,5 @@ if (target === null) {
 	throw new Error('缺少 #app 挂载点');
 }
 
-mount(Dashboard, { target });
+// 离线页自己就是这个产物，不再提供下载入口（file:// 下也解析不到站点根）。
+mount(Dashboard, { target, props: { downloadHref: null } });
