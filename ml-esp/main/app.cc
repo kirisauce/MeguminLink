@@ -72,13 +72,12 @@ Application::Application()
     // 无线链路初始化（WiFi/ESP-NOW/广播 peer + 无线侧 DAP 执行器）：
     // 任何构建都创建，仅主循环投递命令时工作（Local 模式下空闲阻塞）
     ESP_ERROR_CHECK(m_wireless_link.init());
-#if !CONFIG_MEGUMINLINK_USB_SUPPORT
-    // 目标侧无线 UART 桥（C3）：UART <-> ESP-NOW，与无线链路同生命周期
-    ESP_ERROR_CHECK(m_wireless_uart.init());
-#endif
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
+    // USB 先起：本机串口桥的对侧端口（CDC）由它提供
     ESP_ERROR_CHECK(m_usb.init());
 #endif
+    // 本机串口桥：驱动、两个队列与两条任务都由它自己建立，两端同一实现
+    ESP_ERROR_CHECK(m_uart_bridge.init());
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -213,83 +212,70 @@ WirelessLink &Application::wireless_link()
     return m_wireless_link;
 }
 
+UartBridge &Application::uart_bridge()
+{
+    return m_uart_bridge;
+}
+
 ConfigChannel &Application::config_channel()
 {
     return m_config_channel;
 }
 
-void Application::send_uart_data(const u8 *data, size_t len, UartSource source)
+void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSource source)
 {
-    // 尽力而为：未配对/发送失败一律丢弃（与 DAP 转发语义一致，串口无重试）。
-    // 未配对时通常还处于配对流程（PC 端不会发串口数据），DEBUG 级即可。
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!mlink::peer_mac_load(peer_mac))
+    // 本机某个端口收到数据，按当前模式选路。路径实现各自在自己的对象里：
+    // 无线在 WirelessLink、本机 UART 在 UartBridge、CDC 在 CmsisDapUsb。
+    if (m_mode == Mode::Wireless)
     {
-        ESP_LOGD(TAG, "Wireless UART: no paired peer, %u bytes dropped", static_cast<unsigned>(len));
+        const esp_err_t ret = m_wireless_link.send_uart_data(data, len, source);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Wireless UART: failed to send %u bytes: %s", static_cast<unsigned>(len), esp_err_to_name(ret));
+        }
         return;
     }
 
-    const esp_err_t ret = m_wireless_link.send_uart_data(peer_mac, data, len, source);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Wireless UART: failed to send %u bytes: %s", static_cast<unsigned>(len), esp_err_to_name(ret));
-    }
-}
-
-void Application::on_uart_data(const u8 *data, size_t len, UartSource source)
-{
-    // 方向由帧类型给出（recv_cb 直通调用，运行在 esp_wifi 任务上下文）：
-    // 来自主机侧的数据写本机 UART TX，来自目标侧的数据写本机 CDC。USB 存在但
-    // UART 桥关闭时（无 CDC 接口）无处可写，直接丢弃。
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    // Local：CDC 与本机 UART 直通，不经过无线。数据从哪来就写到对面去。
     if (source == UartSource::Host)
     {
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-        m_usb.uart_data_to_uart(data, len);
-#elif !CONFIG_MEGUMINLINK_USB_SUPPORT
-        m_wireless_uart.write_uart(data, len);
-#else
-        (void)data;
-        (void)len;
-#endif
-        return;
+        m_uart_bridge.send_uart_data(data, len);
     }
-
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    m_usb.uart_data_to_cdc(data, len);
+    else
+    {
+        m_config_channel.add_uart_tx(static_cast<u16>(m_usb.cdc().send_uart_data(data, len)));
+    }
 #else
+    // 直通的另一端不存在：无 USB 的一端（LOCAL_MODE_SUPPORTED 为假，上电即
+    // Wireless，走不到这里），或 CDC 接口未编译。丢弃。
     (void)data;
     (void)len;
+    (void)source;
 #endif
 }
 
-void Application::send_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+void Application::forward_uart_data_from_wireless(const u8 *data, size_t len, UartSource source)
 {
-    // 尽力而为：未配对丢弃（与 send_uart_data 同语义）。PC 端改串口参数
-    // 是低频事件，失败仅告警，不重试。
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!mlink::peer_mac_load(peer_mac))
+    // 无线来的帧：写本机端口。recv_cb 跑在 esp_wifi 任务上下文，而写 UART 会
+    // 阻塞，所以桥只做一次拷贝入队，真正的写入在它自己的 tx 任务里。
+    m_uart_bridge.push_inbound(data, len, source);
+}
+
+void Application::route_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    // 与 forward_uart_data_from_port 同一套选路：Wireless 同步给对端，Local 直接设本机 UART。
+    if (m_mode == Mode::Wireless)
     {
-        ESP_LOGD(TAG, "Wireless UART: no paired peer, line coding dropped");
+        const esp_err_t ret = m_wireless_link.send_line_coding(baud, data_bits, stop_bits, parity);
+        if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGW(TAG, "Wireless UART: failed to send line coding: %s", esp_err_to_name(ret));
+        }
         return;
     }
-    const esp_err_t ret = m_wireless_link.send_uart_line_coding(peer_mac, baud, data_bits, stop_bits, parity);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Wireless UART: failed to send line coding: %s", esp_err_to_name(ret));
-    }
-}
 
-void Application::on_uart_line_coding(const payload::UartLineCoding &lc)
-{
-    // 收到就配置本机 UART（recv_cb 直通调用）：真正驱动目标串口的是数据方向
-    // 同源的那块板，无 USB 侧与 USB 侧一视同仁。
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    m_usb.configure_local_uart(lc.baud, lc.data_bits, lc.stop_bits, lc.parity);
-#elif !CONFIG_MEGUMINLINK_USB_SUPPORT
-    m_wireless_uart.configure(lc.baud, lc.data_bits, lc.stop_bits, lc.parity);
-#else
-    (void)lc;
-#endif
+    m_uart_bridge.configure(baud, data_bits, stop_bits, parity);
 }
 
 void Application::enter_pairing(bool manual)

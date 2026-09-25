@@ -76,7 +76,7 @@ class ConfigChannel
      * 各参数按 CDC 原值记录，不做语义转换：stop_bits 0=1、1=1.5、2=2；
      * parity 0=无、1=奇、2=偶、3=Mark、4=Space；data_bits 为 5-8。
      * 串口是否被主机打开不在这里缓存，GetStats 时实时查 TinyUSB 的 DTR
-     * （见 CmsisDapUsb::uart_host_open），避免拔插后留下过期状态。
+     * （见 CdcAcm::host_open），避免拔插后留下过期状态。
      */
     void set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
@@ -303,7 +303,7 @@ class ConfigChannel
 #endif
 
     // 主机下发的线编码（CDC SET_LINE_CODING）。无回调时是桥接默认值 8N1，
-    // 与 uart_bridge_init 的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
+    // 与 UartBridge 安装驱动时的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
     volatile u32 m_uart_baud = CONFIG_MEGUMINLINK_UART_BRIDGE_BAUD_RATE;
     volatile u8 m_uart_data_bits = 8;
     volatile u8 m_uart_stop_bits = 0; // CDC_LINE_CODING_STOP_BITS_1

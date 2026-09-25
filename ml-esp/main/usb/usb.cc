@@ -952,8 +952,8 @@ esp_err_t CmsisDapUsb::init()
     }
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    ret = uart_bridge_init();
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to initialize USB CDC ACM interface");
+    ret = m_cdc.init();
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to initialize CDC ACM interface");
 #endif
 
     // 创建DAP处理任务。
@@ -978,6 +978,8 @@ void CmsisDapUsb::set_enabled(bool enabled)
     // tud_disconnect()/tud_connect() 线程安全（内部持有 usbd 互斥锁），
     // 可从任务上下文调用；tud_task 由 tinyusb_driver_install 创建后持续运行，
     // 断开/重连不会破坏驱动状态，重新连接时主机会重新枚举设备。
+    // 这里只挂起 DAP 任务：本机串口桥（UartBridge）有它自己的任务，且 Local 模式下
+    // 串口直通与 USB 是否在总线上无关，不随本开关启停。
     if (enabled)
     {
         tud_connect();
@@ -985,12 +987,6 @@ void CmsisDapUsb::set_enabled(bool enabled)
         {
             vTaskResume(m_dap_task);
         }
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-        if (m_uart_bridge_task != nullptr)
-        {
-            vTaskResume(m_uart_bridge_task);
-        }
-#endif
         ESP_LOGI(TAG, "USB enabled (local debug mode)");
     }
     else
@@ -1002,12 +998,6 @@ void CmsisDapUsb::set_enabled(bool enabled)
         {
             vTaskSuspend(m_dap_task);
         }
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-        if (m_uart_bridge_task != nullptr)
-        {
-            vTaskSuspend(m_uart_bridge_task);
-        }
-#endif
         ESP_LOGI(TAG, "USB disabled (wireless debug mode)");
     }
 }

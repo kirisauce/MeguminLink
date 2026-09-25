@@ -17,9 +17,7 @@
 #include "meguminlink/usb/usb.hpp"
 #endif
 
-#if !CONFIG_MEGUMINLINK_USB_SUPPORT
-#include "meguminlink/wireless/uart.hpp"
-#endif
+#include "meguminlink/uart/uart_bridge.hpp"
 
 #if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
 #include "meguminlink/led/led_controller.hpp"
@@ -119,6 +117,9 @@ class Application
     CmsisDapUsb &usb();
 #endif
 
+    /** 本机串口桥访问器（写本机 UART / 应用线编码） */
+    UartBridge &uart_bridge();
+
     /** 无线链路访问器（配对/转发/执行接线使用） */
     WirelessLink &wireless_link();
 
@@ -126,35 +127,29 @@ class Application
     ConfigChannel &config_channel();
 
     /**
-     * 本机某个串口端口收到数据 → 打包无线帧发给配对 peer（尽力而为）。
-     * 调用方：S3 侧 CDC RX 回调与 UART 桥任务、C3 侧 UART 桥任务。未配对/
-     * 发送失败时丢弃（与 DAP 转发一致，PC 端串口无重试语义，丢了就是丢了）。
+     * 本机某个端口收到数据 → 按当前模式选路。Local：CDC 与本机 UART 直通；
+     * Wireless：交给无线链路发给配对 peer（查配对与出向准入在链路侧完成）。
+     * 调用方：S3 侧 CDC RX 回调与 UART 桥任务、C3 侧 UART 桥任务。
      *
      * @param source 数据来自哪个端口，决定帧类型：UartSource::Host 来自本机 CDC、
      *               对端据此写它的 UART TX；UartSource::Target 来自本机 UART、
      *               对端据此写它的 CDC
      */
-    void send_uart_data(const u8 *data, size_t len, UartSource source);
+    void forward_uart_data_from_port(const u8 *data, size_t len, UartSource source);
 
     /**
-     * 收到无线串口数据帧 → 写入本机对侧端口（recv_cb 直通调用，esp_wifi
-     * 任务上下文）。方向由帧类型给出，与本机是 USB 侧还是目标侧无关：
-     * 来自主机侧的数据写本机 UART TX，来自目标侧的数据写本机 CDC。
+     * 无线收到对端串口帧 → 写本机端口（recv_cb 直通调用）。
+     *
+     * 与 forward_uart_data_from_port 方向相反，参数含义也不同：这里的 source 是**对端**把它
+     * 当作哪个端口的数据，决定本机写 UART TX 还是写 CDC。
      */
-    void on_uart_data(const u8 *data, size_t len, UartSource source);
+    void forward_uart_data_from_wireless(const u8 *data, size_t len, UartSource source);
 
     /**
-     * 本地串口线编码变化 → 打包 UartLineCoding 帧发给配对 peer（尽力而为）。
-     * 调用方：S3 侧 CDC SET_LINE_CODING 回调（Wireless 模式）。未配对丢弃。
+     * 本机串口线编码变化 → 按当前模式选路。Local：直接设本机 UART；
+     * Wireless：同步给配对 peer，由对端翻译后应用。
      */
-    void send_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
-
-    /**
-     * 收到无线 UartLineCoding 帧 → 应用到本机 UART（recv_cb 直通调用）。
-     * 无论本机是 USB 侧还是目标侧，收到就按它配置本地 UART：数据方向同源的
-     * 那块板才是真正驱动目标串口的一块。
-     */
-    void on_uart_line_coding(const payload::UartLineCoding &lc);
+    void route_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     void run();
 
@@ -225,10 +220,8 @@ class Application
     CmsisDapUsb m_usb;
 #endif
 
-#if !CONFIG_MEGUMINLINK_USB_SUPPORT
-    /** 目标侧无线 UART 桥（UART <-> ESP-NOW，仅无 USB 端如 C3 编译） */
-    WirelessUartBridge m_wireless_uart;
-#endif
+    /** 本机串口桥（UART ↔ 对侧：无线，或 Local 模式下的主机 CDC）；两端同一实现 */
+    UartBridge m_uart_bridge;
 
     /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless/link.hpp） */
     WirelessLink m_wireless_link;

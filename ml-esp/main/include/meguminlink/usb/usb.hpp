@@ -11,6 +11,7 @@
 
 #include "meguminlink/common.hpp"
 #include "meguminlink/dap_executor.hpp"
+#include "meguminlink/usb/cdc_acm.hpp"
 #include "meguminlink/usb/usb_capability.hpp"
 #include "sdkconfig.h"
 
@@ -119,14 +120,20 @@ class CmsisDapUsb
     CmsisDapUsb();
     ~CmsisDapUsb();
 
-    /** 安装 TinyUSB 驱动并注册 CMSIS-DAP v2 描述符（幂等） */
+    /**
+     * 安装 TinyUSB 驱动、注册 CMSIS-DAP v2 描述符，并在 UART 透传接口开启时安装
+     * CDC ACM 接口（见 CdcAcm）（幂等）。
+     *
+     * 本机串口的驱动安装与桥任务不在这里：那是 UartBridge 的职责，两端共用
+     * 同一实现（见 meguminlink/uart/uart_bridge.hpp），USB 侧只提供 CDC 这一端。
+     */
     esp_err_t init();
 
     /**
      * 启用/禁用整个 USB 设备（任务上下文调用）。
      *
      * disabled：tud_disconnect() 断开 USB 总线（主机端表现为拔线），
-     * 并挂起 DAP/UART 桥处理任务；enabled：tud_connect() 重新枚举并恢复任务。
+     * 并挂起 DAP 任务；enabled：tud_connect() 重新枚举并恢复任务。
      *
      * 注意：当前无调用方——USB 在 Local 与 Wireless 模式下都常驻启用
      * （Wireless 下 DAP 命令由 dap_task 无线转发，见 usb.cc），此接口保留
@@ -182,41 +189,16 @@ class CmsisDapUsb
     u8 m_rx_accum[DAP_MAX_REQUEST_SIZE];
     size_t m_rx_accum_len = 0;
 
-  private:
-#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    esp_err_t uart_bridge_init();
-    static void uart_bridge_task(void *arg);
-
   public:
-    /**
-     * 来自目标侧方向的无线串口帧到达 → 写入 CDC TX（recv_cb 直通调用，
-     * esp_wifi 任务上下文；tinyusb_cdcacm_write_queue/flush 为任务安全 API）。
-     * 尽力而为：CDC TX FIFO 满时丢弃多余字节并告警。
-     */
-    void uart_data_to_cdc(const u8 *data, size_t len);
-
-    /**
-     * 来自主机侧方向的无线串口帧到达（或 Local 模式下 CDC 收到数据）→ 写入
-     * 本机 UART TX。尽力而为：TX 环形缓冲满时丢弃多余字节并告警。
-     */
-    void uart_data_to_uart(const u8 *data, size_t len);
-
-    /**
-     * 把一条线编码参数应用到本机 UART1。参数为 CDC 枚举原值，驱动不支持的
-     * 取值告警后跳过该项。调用方：Local 模式下的主机 SET_LINE_CODING，以及
-     * Wireless 模式下来自对端的 UartLineCoding 帧。
-     */
-    void configure_local_uart(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
-
-    /**
-     * 主机是否已打开 CDC ACM 串口（TinyUSB 的 DTR，且总线就绪）。
-     * 实时查询不缓存：拔插与重新枚举后不会留下过期的"已打开"。
-     */
-    bool uart_host_open() const;
-
-  private:
+#if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    /** UART 透传的 CDC ACM 接口（主机串口）：接口安装与收发都在 CdcAcm 里 */
+    CdcAcm &cdc()
+    {
+        return m_cdc;
+    }
 #endif
 
+  private:
     bool m_initialized = false;
     char m_serial[18]; // MACSTR 格式 "aa:bb:cc:dd:ee:ff"（17 字符 + NUL）
     std::array<const char *, (usize)UsbStringIndex::Max> m_string_descriptors;
@@ -240,8 +222,8 @@ class CmsisDapUsb
     UsbConfigurationDescriptor m_config_descriptor;
 
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    QueueHandle_t m_uart_queue;
-    TaskHandle_t m_uart_bridge_task = nullptr;
+    /** UART 透传的 CDC ACM 接口（主机串口），见 cdc_acm.hpp */
+    CdcAcm m_cdc;
 #endif
 };
 } // namespace mlink

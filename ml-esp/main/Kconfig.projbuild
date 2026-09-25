@@ -174,6 +174,33 @@ config MEGUMINLINK_UART_BRIDGE_BAUD_RATE
     int "UART bridge baud rate"
     default 115200
 
+config MEGUMINLINK_UART_TX_MAX_BPS
+    int "Wireless UART egress rate cap (bit/s)"
+    default 115200
+    help
+        Upper bound for port data entering the wireless link, expressed as the
+        line rate the far end UART is expected to drain. The bridge admits one
+        tenth of this value in bytes per second, so the default suits a 115200
+        baud peer.
+
+config MEGUMINLINK_UART_TX_MIN_PERCENT
+    int "Wireless UART share while DAP is busy (percent)"
+    default 25
+    range 0 100
+    help
+        Share of the egress cap still granted to port data while reliable DAP
+        traffic has messages in flight. 0 stops port data entirely for the
+        duration of DAP activity, 100 disables DAP priority.
+
+config MEGUMINLINK_UART_INBOUND_QUEUE_DEPTH
+    int "Inbound UART frame queue depth (frames)"
+    default 8
+    help
+        Frames the peer-facing receive callback may hand to the bridge before it
+        has written them to this side's port. The callback never writes the UART
+        itself, so a full queue drops the frame and counts it instead of blocking
+        the WiFi task.
+
 endmenu
 
 menu "Wireless"

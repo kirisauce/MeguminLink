@@ -9,22 +9,18 @@ list(APPEND __src
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq_link.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/pairing.cc)
 
-# 目标侧无线 UART 桥（UART <-> ESP-NOW）：仅无 USB 端（如 ESP32-C3 接收端）
-# 编译。S3 侧串口走 USB CDC（usb/uart_bridge.cc 按模式分流），本文件不参与
-# USB 构建。
-if(NOT CONFIG_MEGUMINLINK_USB_SUPPORT)
-    list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/wireless/uart.cc)
-endif()
+# 本机串口桥（UART <-> 无线；Local 模式下 UART <-> 主机 CDC）：两端共用一份实现，
+# 对侧端口的差异在文件内用 CONFIG_MEGUMINLINK_USB_SUPPORT 表达，无条件编译。
+list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/uart/uart_bridge.cc)
 
-# main/usb/ 子目录（TinyUSB + UART 桥）仅在 CONFIG_MEGUMINLINK_USB_SUPPORT 开启时编译，
-# 该选项仅对 ESP32-S3 可用（见同目录 Kconfig.projbuild）
+# main/usb/ 子目录（TinyUSB）仅在 CONFIG_MEGUMINLINK_USB_SUPPORT 开启时编译，
+# 该选项仅对 ESP32-S3 可用（见同目录 Kconfig.projbuild）。
+# 源文件逐个登记：glob 的结果在配置期固定，新增文件不会自动进构建。
 if(CONFIG_MEGUMINLINK_USB_SUPPORT)
-    file(GLOB __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/*.cc ${CMAKE_CURRENT_LIST_DIR}/usb/*.c)
-    # UART bridge 仅在 MEGUMINLINK_USB_UART_BRIDGE_ENABLE 开启时编译
-    if(NOT CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE)
-        list(REMOVE_ITEM __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/uart_bridge.cc)
-    endif()
-    list(APPEND __src ${__usb_src})
+    list(APPEND __src
+        ${CMAKE_CURRENT_LIST_DIR}/usb/usb.cc
+        ${CMAKE_CURRENT_LIST_DIR}/usb/cdc_acm.cc
+        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_capability.cc)
 endif()
 
 # CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2）：无条件编译。

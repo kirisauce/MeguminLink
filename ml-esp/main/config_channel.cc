@@ -765,7 +765,7 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
 
     // 串口是否被主机打开：实时查 DTR（总线未就绪时为 false），不走缓存
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    const u8 uart_host_open = Application::get_instance().usb().uart_host_open() ? 1 : 0;
+    const u8 uart_host_open = Application::get_instance().usb().cdc().host_open() ? 1 : 0;
 #else
     const u8 uart_host_open = 0; // 没有 CDC 接口：不存在主机串口
 #endif
