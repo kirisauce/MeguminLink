@@ -294,8 +294,8 @@ esp_err_t WirelessLink::set_wifi_rate(u8 rate)
 
     // 广播 peer 不支持速率配置；已配对单播 peer 直接改配置，无需重建。
     // 对端侧的同一档位由配置通道经 RelayedUsbControl 下发（见 config_channel）。
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac != nullptr)
     {
         const esp_err_t ret = set_peer_rate(peer_mac);
         if (ret != ESP_OK)
@@ -366,8 +366,8 @@ void WirelessLink::poll()
     //    手上的帧一律发送失败；ARQ 层也要知道会话对端才能握手。两者都幂等（只有
     //    真的换了对端才会重置会话），而且执行侧（Local 模式）同样需要——它不发起
     //    命令，但要能回应握手与响应。
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (mlink::peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac != nullptr)
     {
         (void)peer_add(peer_mac);
         m_arq.set_peer(peer_mac);
@@ -408,10 +408,10 @@ void WirelessLink::poll()
         const ArqSettings settings = m_arq.settings();
         m_arq_probe_tx_ms = now + settings.breaker_probe_ms;
 
-        u8 peer_mac[ESP_NOW_ETH_ALEN];
-        if (peer_mac_load(peer_mac))
+        const u8 *probe_mac = peer_mac_key().cached();
+        if (probe_mac != nullptr)
         {
-            const esp_err_t ret = send_ping(peer_mac, ARQ_PROBE_TOKEN);
+            const esp_err_t ret = send_ping(probe_mac, ARQ_PROBE_TOKEN);
             if (ret != ESP_OK)
             {
                 ESP_LOGW(TAG, "ARQ probe ping failed: %s", esp_err_to_name(ret));
@@ -666,8 +666,8 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
 
 esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
 {
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr)
     {
         // 未配对时通常还在配对流程（PC 端不会发串口数据），DEBUG 级即可
         ESP_LOGD(TAG, "no paired peer, %u bytes dropped", static_cast<unsigned>(len));
@@ -710,8 +710,8 @@ esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource so
 
 esp_err_t WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr)
     {
         return ESP_ERR_NOT_FOUND;
     }
@@ -763,8 +763,8 @@ esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const paylo
 
 esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 *seq_out)
 {
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!mlink::peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr)
     {
         ESP_LOGW(TAG, "Wireless: no paired peer, %u-byte DAP request dropped", static_cast<unsigned>(len));
         return ESP_ERR_NOT_FOUND;

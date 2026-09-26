@@ -330,8 +330,8 @@ void Application::clear_pairing()
 {
     // 先取旧记录（擦除后就取不到了）：NVS 记录与 ESP-NOW peer 表一起清，
     // 后者在重启后本来就是空的，但运行期残留会让旧 peer 仍可发帧过来。
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac != nullptr)
     {
         const esp_err_t ret = m_wireless_link.peer_remove(peer_mac);
         if (ret != ESP_OK)
@@ -339,7 +339,11 @@ void Application::clear_pairing()
             ESP_LOGW(TAG, "Failed to remove peer " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
         }
     }
-    (void)peer_mac_erase();
+    const esp_err_t erase_ret = peer_mac_key().erase();
+    if (erase_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to erase peer MAC: %s", esp_err_to_name(erase_ret));
+    }
 
     // 无条件重开一轮配对：配对流程进行中时先退出，让状态机从头开始
     if (m_pairing_active)
@@ -403,10 +407,14 @@ void Application::consume_pending_action()
     case ConfigChannel::Action::ClearPair:
         clear_pairing();
         break;
-    case ConfigChannel::Action::Reset:
+    case ConfigChannel::Action::Reset: {
         // 删除失败不回滚：重启后的构造逻辑会按残留记录自愈
         ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and WiFi rate, rebooting");
-        (void)peer_mac_erase();
+        const esp_err_t erase_ret = peer_mac_key().erase();
+        if (erase_ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to erase peer MAC: %s", esp_err_to_name(erase_ret));
+        }
         (void)m_mode_key.erase();
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
         (void)usb_capability_erase();
@@ -420,6 +428,7 @@ void Application::consume_pending_action()
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
+    }
     case ConfigChannel::Action::Reboot:
         ESP_LOGI(TAG, "Reboot requested");
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
@@ -562,8 +571,7 @@ void Application::run()
             // 统一配对入口：未配对 → 自动进入配对流程；已配对 → 无线调试
             if (!m_pairing_active)
             {
-                u8 peer_mac[ESP_NOW_ETH_ALEN];
-                if (!peer_mac_load(peer_mac))
+                if (peer_mac_key().cached() == nullptr)
                 {
                     enter_pairing(false);
                 }
@@ -589,8 +597,8 @@ void Application::run()
                 // 时 drop_peer() 会移除 peer（pairing.cc），重启后 peer list 也为空，
                 // 而 dap_task 转发依赖 peer 在 ESP-NOW list 中；peer_add 幂等，
                 // 周期调用开销可忽略，配对完成后下一轮循环即恢复转发。
-                u8 peer_mac[ESP_NOW_ETH_ALEN];
-                if (peer_mac_load(peer_mac))
+                const u8 *peer_mac = peer_mac_key().cached();
+                if (peer_mac != nullptr)
                 {
                     m_wireless_link.peer_add(peer_mac);
                 }

@@ -88,18 +88,29 @@ template <size_t N> class NvsKeyBlob : public NvsKey
     {
     }
 
-    /** 拷贝缓存到 out（len 须 == N）；首次调用自动从 NVS 加载；无记录返回 false */
-    bool get(void *out, size_t len) const
+    /**
+     * 零拷贝访问：返回指向内部缓存的指针，首次调用自动从 NVS 加载（此后读不再
+     * 访问 flash）。指针在键对象生命周期内始终有效，写/擦除会原地更新其内容；
+     * 无记录或加载失败返回 nullptr。
+     */
+    const u8 *cached() const
     {
         if (!m_loaded)
         {
             m_loaded = raw_load_blob(m_data, N);
         }
-        if (!m_loaded || len != N)
+        return m_loaded ? m_data : nullptr;
+    }
+
+    /** 拷贝缓存到 out（len 须 == N）；首次调用自动从 NVS 加载；无记录返回 false */
+    bool get(void *out, size_t len) const
+    {
+        const u8 *view = cached();
+        if (view == nullptr || len != N)
         {
             return false;
         }
-        memcpy(out, m_data, N);
+        memcpy(out, view, N);
         return true;
     }
 
@@ -119,7 +130,7 @@ template <size_t N> class NvsKeyBlob : public NvsKey
         return raw_store_blob(m_data, N);
     }
 
-    /** 删除记录并清空缓存（返回 ESP_OK 表示下次 get() 返回 false） */
+    /** 删除记录并清空缓存（返回 ESP_OK 表示下次 cached() 返回 nullptr） */
     esp_err_t erase()
     {
         const esp_err_t ret = raw_erase();
@@ -225,14 +236,15 @@ class NvsWriteBatch
     bool m_open = false;
 };
 
-/** 读取已配对对端的 MAC 地址；不存在时返回 false */
-bool peer_mac_load(u8 mac[ESP_NOW_ETH_ALEN]);
-
-/** 持久化对端 MAC 地址（配对完成时调用） */
-esp_err_t peer_mac_store(const u8 mac[ESP_NOW_ETH_ALEN]);
-
-/** 删除已配对对端的 MAC 记录（清除配对 / 恢复默认时调用） */
-esp_err_t peer_mac_erase();
+/**
+ * peer MAC 键的访问点：缓存跨调用共享（实例在 nvs_flash.cc 内按需构造，首次访问
+ * 自动从 NVS 加载，此后读不再访问 flash、写相同值跳过落盘）。
+ *
+ * 读走零拷贝的 cached()：返回指向内部缓存的指针，无记录返回 nullptr；
+ * set(mac, ESP_NOW_ETH_ALEN) 持久化（配对完成时调用，相同值跳过落盘）；erase()
+ * 删除记录（清除配对 / 恢复出厂设置时调用，键本来不存在视为成功）。
+ */
+NvsKeyBlob<ESP_NOW_ETH_ALEN> &peer_mac_key();
 } // namespace mlink
 
 #endif

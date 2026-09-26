@@ -8,10 +8,13 @@ static constexpr char TAG[] = "mlink::nvs_flash";
 namespace
 {
 constexpr char KEY_PEER_MAC[] = "peer_mac";
-
-// 模块级常驻的 peer MAC 键：缓存跨 peer_mac_load/store 调用共享
-mlink::NvsKeyBlob<ESP_NOW_ETH_ALEN> g_peer_mac_key(KEY_PEER_MAC);
 } // namespace
+
+mlink::NvsKeyBlob<ESP_NOW_ETH_ALEN> &mlink::peer_mac_key()
+{
+    static mlink::NvsKeyBlob<ESP_NOW_ETH_ALEN> key(KEY_PEER_MAC);
+    return key;
+}
 
 esp_err_t mlink::nvs_flash_init()
 {
@@ -235,29 +238,4 @@ esp_err_t mlink::NvsWriteBatch::commit()
         return ESP_ERR_INVALID_STATE;
     }
     return nvs_commit(m_handle);
-}
-
-bool mlink::peer_mac_load(u8 mac[ESP_NOW_ETH_ALEN])
-{
-    return g_peer_mac_key.get(mac, ESP_NOW_ETH_ALEN);
-}
-
-esp_err_t mlink::peer_mac_store(const u8 mac[ESP_NOW_ETH_ALEN])
-{
-    const esp_err_t ret = g_peer_mac_key.set(mac, ESP_NOW_ETH_ALEN);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to store peer MAC: %s", esp_err_to_name(ret));
-    }
-    return ret;
-}
-
-esp_err_t mlink::peer_mac_erase()
-{
-    const esp_err_t ret = g_peer_mac_key.erase();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to erase peer MAC: %s", esp_err_to_name(ret));
-    }
-    return ret;
 }

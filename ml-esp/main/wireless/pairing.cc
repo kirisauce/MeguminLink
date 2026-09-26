@@ -85,7 +85,7 @@ void PairingState::drop_peer()
 
 void PairingState::complete_pairing(Application &app, const u8 *peer)
 {
-    const esp_err_t ret = peer_mac_store(peer);
+    const esp_err_t ret = peer_mac_key().set(peer, ESP_NOW_ETH_ALEN);
     ESP_LOGI(TAG, "Pairing complete with " MACSTR " (nvs: %s)", MAC2STR(peer),
              ret == ESP_OK ? "ok" : esp_err_to_name(ret));
     drop_peer();

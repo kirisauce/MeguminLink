@@ -1,7 +1,7 @@
 #include "meguminlink/config_channel.hpp"
 
 #include "meguminlink/app.hpp"
-#include "meguminlink/nvs_flash.hpp" // peer_mac_load + esp_now.h（ESP_NOW_ETH_ALEN）
+#include "meguminlink/nvs_flash.hpp" // peer_mac_key + esp_now.h（ESP_NOW_ETH_ALEN）
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/link.hpp"
 
@@ -90,8 +90,8 @@ void ConfigChannel::start_ping()
     m_ping_deadline_us = m_ping_sent_us + static_cast<i64>(CONFIG_MEGUMINLINK_PING_TIMEOUT_MS) * 1000;
     portEXIT_CRITICAL(&m_ping_lock);
 
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr)
     {
         // 无配对记录：没有可探测的对端，直接判离线，不必等满超时窗口
         finish_ping(false, 0);
@@ -127,8 +127,8 @@ void ConfigChannel::on_pong(const u8 *src_mac, u32 token)
 {
     // 只认已配对对端的回显：广播地址常驻 peer 表，其他设备的帧同样能到达
     // 本机，来源与 token 双重校验后才算本轮结果
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!peer_mac_load(peer_mac) || std::memcmp(peer_mac, src_mac, ESP_NOW_ETH_ALEN) != 0)
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr || std::memcmp(peer_mac, src_mac, ESP_NOW_ETH_ALEN) != 0)
     {
         return;
     }
@@ -556,8 +556,7 @@ u8 pair_state()
     {
         return 2;
     }
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    return peer_mac_load(peer_mac) ? 1 : 0;
+    return peer_mac_key().cached() != nullptr ? 1 : 0;
 }
 
 /** SetUsbConfig 载荷的解析结果 */
@@ -783,10 +782,10 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     p += tlv_str(m_response + p, TAG_IDF_VERSION, desc.idf_ver);
     p += tlv_u8(m_response + p, TAG_CFG_MODE, Application::get_instance().mode() == Mode::Local ? 0 : 1);
 
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac != nullptr)
     {
-        p += tlv_blob(m_response + p, TAG_CFG_PEER_MAC, peer_mac, sizeof(peer_mac));
+        p += tlv_blob(m_response + p, TAG_CFG_PEER_MAC, peer_mac, ESP_NOW_ETH_ALEN);
     }
 
     p += tlv_u8(m_response + p, TAG_CFG_WIFI_RATE, Application::get_instance().wireless_link().wifi_rate());
@@ -1165,8 +1164,8 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
 
 void ConfigChannel::relay_to_peer(u8 cmd, u8 arg)
 {
-    u8 peer_mac[ESP_NOW_ETH_ALEN];
-    if (!peer_mac_load(peer_mac))
+    const u8 *peer_mac = peer_mac_key().cached();
+    if (peer_mac == nullptr)
     {
         ESP_LOGW(TAG, "No paired peer: command 0x%02X applied locally only", cmd);
         return;
