@@ -327,7 +327,10 @@ class WirelessLink
     /** 是否处于 ESP-NOW 发送退避窗口内（窗口内只抑制串口数据帧） */
     bool espnow_backoff_active(u32 now) const;
 
-    /** 撞上 NO_MEM：抬高退避档位并按档位设定窗口（首档 20ms，逐级翻倍，200ms 封顶） */
+    /**
+     * 抬高退避档位并按档位设定窗口（首档 20ms，逐级翻倍，200ms 封顶）。
+     * 触发源有两个：撞上 NO_MEM，以及发送完成回调连续报失败达到阈值。
+     */
     void enter_espnow_backoff(u32 now);
 
     /**
@@ -401,6 +404,16 @@ class WirelessLink
     static constexpr u8 ESPNOW_BACKOFF_MAX_LEVEL = 5;
 
     /**
+     * 发送完成回调连续报失败的阈值：达到即与 NO_MEM 走同一套退避。
+     *
+     * 连续失败说明空口或对端一侧出了问题（信道被占、对端没有应答），此时继续
+     * 满速灌帧只会让驱动队列越堆越深；退避窗口内只抑制尽力而为帧，可靠帧照发。
+     */
+    static constexpr u8 ESPNOW_TX_FAIL_STREAK_THRESHOLD = 8;
+    /** 发送失败日志的限速间隔：差链路下每帧一条会把日志刷满 */
+    static constexpr u32 ESPNOW_TX_FAIL_LOG_INTERVAL_MS = 1000;
+
+    /**
      * 串口出向令牌桶。只有串口数据帧过这道闸（DAP 的可靠帧不受限）：桶满两帧、
      * 按对端线速补充，链路正忙时按配置比例压低。调用方是 CDC 回调（tinyusb
      * 任务）与 UART 桥任务，自旋锁保护。
@@ -410,12 +423,24 @@ class WirelessLink
     u32 m_uart_bucket_refill_ms = 0;
 
     /**
-     * ESP-NOW 发送退避。撞上 NO_MEM 时抬高，退避窗口过期后仍能发出帧才降回
-     * 正常；窗口内只抑制串口数据帧，确认帧与 DAP 帧照常尝试——队列排空后要靠
-     * 它们把确认带回去。单字读写在 32 位目标上原子，不需要临界区。
+     * ESP-NOW 发送退避。撞上 NO_MEM、或发送完成回调连续报失败达到阈值时抬高；
+     * 退避窗口过期后仍能发出帧才降回正常；窗口内只抑制串口数据帧，确认帧与
+     * DAP 帧照常尝试——队列排空后要靠它们把确认带回去。
+     *
+     * 档位与截止时刻要一起更新，且 send_raw（多任务）与 send_cb（esp_wifi 任务）
+     * 会并发调用，故由 m_espnow_backoff_lock 保护；espnow_backoff_active() 只读
+     * 单个截止时刻，保持无锁。
      */
+    portMUX_TYPE m_espnow_backoff_lock = portMUX_INITIALIZER_UNLOCKED;
     volatile u32 m_espnow_backoff_until_ms = 0;
     volatile u8 m_espnow_backoff_level = 0;
+
+    /**
+     * 发送完成回调报失败的连续次数（成功清零）与最近一条失败日志的时刻。
+     * 两者都只由 send_cb（esp_wifi 任务）读写，不需要额外同步。
+     */
+    volatile u8 m_send_fail_streak = 0;
+    volatile u32 m_send_fail_log_ms = 0;
 
     /**
      * 最近一次可靠帧（DAP 命令/响应）发出的时刻。串口准入据此判断链路是否正忙：

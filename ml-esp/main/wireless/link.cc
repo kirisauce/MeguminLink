@@ -104,9 +104,31 @@ void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data,
 
 void WirelessLink::send_cb([[maybe_unused]] const wifi_tx_info_t *send_info, esp_now_send_status_t send_status)
 {
-    if (send_status != ESP_NOW_SEND_SUCCESS)
+    auto &self = Application::get_instance().wireless_link();
+
+    if (send_status == ESP_NOW_SEND_SUCCESS)
     {
-        ESP_LOGW(TAG, "ESP-NOW send failed");
+        self.m_send_fail_streak = 0;
+        return;
+    }
+
+    const u32 now = now_ms();
+    const u8 streak = (self.m_send_fail_streak < 0xFF) ? static_cast<u8>(self.m_send_fail_streak + 1) : 0xFF;
+    self.m_send_fail_streak = streak;
+
+    // 连续失败达到阈值：与 NO_MEM 共用同一套退避。退避只抑制尽力而为帧，可靠帧
+    // 照发——ARQ 正靠它们在守重传，停掉只会把主机侧拖成超时。
+    if (streak >= ESPNOW_TX_FAIL_STREAK_THRESHOLD)
+    {
+        self.m_send_fail_streak = 0; // 重新累计：持续失败期间由退避窗口持续刷新
+        self.enter_espnow_backoff(now);
+    }
+
+    // 失败日志限速：差链路下每帧一条会把日志刷满
+    if (static_cast<i32>(now - self.m_send_fail_log_ms) >= 0)
+    {
+        self.m_send_fail_log_ms = now + ESPNOW_TX_FAIL_LOG_INTERVAL_MS;
+        ESP_LOGW(TAG, "ESP-NOW send failed (streak %u)", streak);
     }
 }
 
@@ -498,8 +520,8 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
         m_last_reliable_tx_ms = now;
     }
 
-    // 退避窗口内不再触碰驱动。持续满速冲击 NO_MEM 会把 ESP-NOW 的发送队列带进
-    // 不可恢复的状态，只有重启设备才能解开——宁可丢尽力而为的帧。
+    // 退避窗口内不再触碰驱动。持续满速冲击会把 ESP-NOW 的发送队列带进不可恢复
+    // 的状态（NO_MEM，或对端持续不应答），只有重启设备才能解开——宁可丢尽力而为的帧。
     if (!reliable && espnow_backoff_active(now))
     {
         return ESP_ERR_TIMEOUT;
@@ -587,42 +609,45 @@ bool WirelessLink::espnow_backoff_active(u32 now) const
 
 void WirelessLink::enter_espnow_backoff(u32 now)
 {
-    const u8 level = (m_espnow_backoff_level < ESPNOW_BACKOFF_MAX_LEVEL)
-                         ? static_cast<u8>(m_espnow_backoff_level + 1)
-                         : ESPNOW_BACKOFF_MAX_LEVEL;
-    u32 window = static_cast<u32>(ESPNOW_BACKOFF_BASE_MS) << (level - 1);
+    u8 level = 0;
+    u32 window = 0;
+    bool first_of_level = false;
+
+    portENTER_CRITICAL(&m_espnow_backoff_lock);
+    level = (m_espnow_backoff_level < ESPNOW_BACKOFF_MAX_LEVEL) ? static_cast<u8>(m_espnow_backoff_level + 1)
+                                                                : ESPNOW_BACKOFF_MAX_LEVEL;
+    window = static_cast<u32>(ESPNOW_BACKOFF_BASE_MS) << (level - 1);
     if (window > ESPNOW_BACKOFF_MAX_MS)
     {
         window = ESPNOW_BACKOFF_MAX_MS;
     }
-
-    const bool first_of_level = (level != m_espnow_backoff_level);
+    first_of_level = (level != m_espnow_backoff_level);
     m_espnow_backoff_level = level;
     m_espnow_backoff_until_ms = now + window;
+    portEXIT_CRITICAL(&m_espnow_backoff_lock);
+
+    // 日志在临界区外：只有档位真的抬升才打一条，持续失败期间不会重复刷
     if (first_of_level)
     {
-        ESP_LOGW(TAG, "ESP-NOW TX queue full: UART frames muted for %u ms (level %u)", static_cast<unsigned>(window),
-                 level);
+        ESP_LOGW(TAG, "ESP-NOW TX backoff: best-effort frames muted for %u ms (level %u)",
+                 static_cast<unsigned>(window), level);
     }
 }
 
 void WirelessLink::clear_espnow_backoff(u32 now)
 {
-    if (m_espnow_backoff_level == 0 && m_espnow_backoff_until_ms == 0)
-    {
-        return;
-    }
-
+    portENTER_CRITICAL(&m_espnow_backoff_lock);
+    const bool pending = (m_espnow_backoff_level != 0 || m_espnow_backoff_until_ms != 0);
     // 窗口内发出成功只说明驱动队列碰巧腾出了一个空位（退避期间确认帧与 DAP 帧
     // 照常尝试），不构成"空口已恢复"的证据。窗口真正过去之后仍能发出去，才说明
     // 队列确实被排空，此时才降回正常档位。
-    if (espnow_backoff_active(now))
+    const bool expired = !(static_cast<i32>(m_espnow_backoff_until_ms - now) > 0);
+    if (pending && expired)
     {
-        return;
+        m_espnow_backoff_level = 0;
+        m_espnow_backoff_until_ms = 0;
     }
-
-    m_espnow_backoff_level = 0;
-    m_espnow_backoff_until_ms = 0;
+    portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
 esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 *seq_out)
