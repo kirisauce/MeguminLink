@@ -20,59 +20,86 @@ static constexpr char TAG[] = "mlink::config_channel";
 
 void ConfigChannel::add_dap_command(u16 request_bytes, u16 response_bytes)
 {
-    m_dap_cmds = m_dap_cmds + 1;
-    m_dap_request_bytes = m_dap_request_bytes + request_bytes;
-    m_dap_response_bytes = m_dap_response_bytes + response_bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.dap_cmds = m_stats.dap_cmds + 1;
+    m_stats.dap_request_bytes = m_stats.dap_request_bytes + request_bytes;
+    m_stats.dap_response_bytes = m_stats.dap_response_bytes + response_bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_wireless_tx(u16 bytes)
 {
-    m_wireless_tx_bytes = m_wireless_tx_bytes + bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.wireless_tx_bytes = m_stats.wireless_tx_bytes + bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_wireless_rx(u16 bytes, i8 rssi)
 {
-    m_wireless_rx_bytes = m_wireless_rx_bytes + bytes;
-    m_wireless_rssi = rssi;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.wireless_rx_bytes = m_stats.wireless_rx_bytes + bytes;
+    m_stats.wireless_rssi = rssi;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_uart_rx(u16 bytes)
 {
-    m_uart_rx_bytes = m_uart_rx_bytes + bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.uart_rx_bytes = m_stats.uart_rx_bytes + bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_uart_tx(u16 bytes)
 {
-    m_uart_tx_bytes = m_uart_tx_bytes + bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.uart_tx_bytes = m_stats.uart_tx_bytes + bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_uart_wireless_rx(u16 bytes)
 {
-    m_uart_wireless_rx_bytes = m_uart_wireless_rx_bytes + bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.uart_wireless_rx_bytes = m_stats.uart_wireless_rx_bytes + bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 void ConfigChannel::add_uart_wireless_tx(u16 bytes)
 {
-    m_uart_wireless_tx_bytes = m_uart_wireless_tx_bytes + bytes;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.uart_wireless_tx_bytes = m_stats.uart_wireless_tx_bytes + bytes;
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
 void ConfigChannel::add_loss_frame(bool dropped)
 {
-    m_loss_frames = m_loss_frames + 1;
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.loss_frames = m_stats.loss_frames + 1;
     if (dropped)
     {
-        m_loss_dropped = m_loss_dropped + 1;
+        m_stats.loss_dropped = m_stats.loss_dropped + 1;
     }
+    portEXIT_CRITICAL(&m_stats_lock);
 }
 #endif
 
 void ConfigChannel::set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
-    m_uart_baud = baud;
-    m_uart_data_bits = data_bits;
-    m_uart_stop_bits = stop_bits;
-    m_uart_parity = parity;
+    // 四个字段在同一临界区内整体写入：GetStats 的快照不会读到改了一半的组合
+    portENTER_CRITICAL(&m_stats_lock);
+    m_stats.uart_baud = baud;
+    m_stats.uart_data_bits = data_bits;
+    m_stats.uart_stop_bits = stop_bits;
+    m_stats.uart_parity = parity;
+    portEXIT_CRITICAL(&m_stats_lock);
+}
+
+ConfigChannel::Stats ConfigChannel::stats_snapshot() const
+{
+    portENTER_CRITICAL(&m_stats_lock);
+    const Stats snapshot = m_stats;
+    portEXIT_CRITICAL(&m_stats_lock);
+    return snapshot;
 }
 
 void ConfigChannel::start_ping()
@@ -698,16 +725,18 @@ u16 ConfigChannel::finish_response(u8 cmd, u8 seq, usize end)
 
 u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
 {
+    // 统计与线编码先取一份自洽快照：此后只读局部副本，TLV 组帧不接触统计锁
+    const Stats stats = stats_snapshot();
     usize p = FRAME_HEADER_SIZE;
 
     p += tlv_u8(m_response + p, TAG_MODE, Application::get_instance().mode() == Mode::Local ? 0 : 1);
     p += tlv_u8(m_response + p, TAG_PAIR, pair_state());
-    p += tlv_i8(m_response + p, TAG_RSSI, m_wireless_rssi);
-    p += tlv_u32(m_response + p, TAG_DAP_CMDS, m_dap_cmds);
-    p += tlv_u32(m_response + p, TAG_DAP_REQUEST, m_dap_request_bytes);
-    p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, m_dap_response_bytes);
-    p += tlv_u32(m_response + p, TAG_WIRELESS_TX, m_wireless_tx_bytes);
-    p += tlv_u32(m_response + p, TAG_WIRELESS_RX, m_wireless_rx_bytes);
+    p += tlv_i8(m_response + p, TAG_RSSI, stats.wireless_rssi);
+    p += tlv_u32(m_response + p, TAG_DAP_CMDS, stats.dap_cmds);
+    p += tlv_u32(m_response + p, TAG_DAP_REQUEST, stats.dap_request_bytes);
+    p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, stats.dap_response_bytes);
+    p += tlv_u32(m_response + p, TAG_WIRELESS_TX, stats.wireless_tx_bytes);
+    p += tlv_u32(m_response + p, TAG_WIRELESS_RX, stats.wireless_rx_bytes);
     {
         // 可靠传输的运行状态：丢帧是否被吸收、恢复得多快，全看这几个数
         const ArqLink::Snapshot arq = Application::get_instance().wireless_link().arq_snapshot();
@@ -748,13 +777,13 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_PING_OK, ping.ok);
     p += tlv_u32(m_response + p, TAG_PING_FAIL, ping.fail);
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    p += tlv_u32(m_response + p, TAG_LOSS_FRAMES, m_loss_frames);
-    p += tlv_u32(m_response + p, TAG_LOSS_DROPPED, m_loss_dropped);
+    p += tlv_u32(m_response + p, TAG_LOSS_FRAMES, stats.loss_frames);
+    p += tlv_u32(m_response + p, TAG_LOSS_DROPPED, stats.loss_dropped);
 #endif
-    p += tlv_u32(m_response + p, TAG_UART_RX, m_uart_rx_bytes);
-    p += tlv_u32(m_response + p, TAG_UART_TX, m_uart_tx_bytes);
-    p += tlv_u32(m_response + p, TAG_UART_WIRELESS_RX, m_uart_wireless_rx_bytes);
-    p += tlv_u32(m_response + p, TAG_UART_WIRELESS_TX, m_uart_wireless_tx_bytes);
+    p += tlv_u32(m_response + p, TAG_UART_RX, stats.uart_rx_bytes);
+    p += tlv_u32(m_response + p, TAG_UART_TX, stats.uart_tx_bytes);
+    p += tlv_u32(m_response + p, TAG_UART_WIRELESS_RX, stats.uart_wireless_rx_bytes);
+    p += tlv_u32(m_response + p, TAG_UART_WIRELESS_TX, stats.uart_wireless_tx_bytes);
 
     // 串口是否被主机打开：实时查 DTR（总线未就绪时为 false），不走缓存
 #if CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
@@ -763,10 +792,10 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     const u8 uart_host_open = 0; // 没有 CDC 接口：不存在主机串口
 #endif
     p += tlv_u8(m_response + p, TAG_UART_HOST_OPEN, uart_host_open);
-    p += tlv_u32(m_response + p, TAG_UART_BAUD, m_uart_baud);
-    p += tlv_u8(m_response + p, TAG_UART_DATA_BITS, m_uart_data_bits);
-    p += tlv_u8(m_response + p, TAG_UART_STOP_BITS, m_uart_stop_bits);
-    p += tlv_u8(m_response + p, TAG_UART_PARITY, m_uart_parity);
+    p += tlv_u32(m_response + p, TAG_UART_BAUD, stats.uart_baud);
+    p += tlv_u8(m_response + p, TAG_UART_DATA_BITS, stats.uart_data_bits);
+    p += tlv_u8(m_response + p, TAG_UART_STOP_BITS, stats.uart_stop_bits);
+    p += tlv_u8(m_response + p, TAG_UART_PARITY, stats.uart_parity);
     p += tlv_u32(m_response + p, TAG_UPTIME, static_cast<u32>(esp_timer_get_time() / 1000));
 
     return finish_response(cmd, seq, p);

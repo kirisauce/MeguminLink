@@ -21,9 +21,11 @@ namespace mlink
 /**
  * 配置/遥测通道：设备端统计计数器 + EP0 厂商请求（bRequest 0x4D）处理。
  *
- * 计数器是无锁 u32 累计值——热路径只多一次加法，32 位回绕由上位机对两次
- * 快照差分时处理（(cur - prev) & 0xFFFFFFFF）。计数器在所有目标上都累加
- * （无线接收端没有读取者，代价是几十字节 RAM），因此本模块在非 USB 目标
+ * 计数器与线编码合成一组由 m_stats_lock 保护的累计值：热路径只多一次短临界区
+ * 内的加法，32 位回绕由上位机对两次快照差分时处理（(cur - prev) & 0xFFFFFFFF）。
+ * GetStats 在锁内取一份整体快照、锁外组帧——逐字段裸读会拼出不同时刻的组合值，
+ * 而计数器是读改写累加，同一字段有多个写者时还会丢更新。计数器在所有目标上都
+ * 累加（无线接收端没有读取者，代价是几十字节 RAM），因此本模块在非 USB 目标
  * （如 ESP32-C3 接收端）上也参与构建，只有 EP0 协议部分按
  * CONFIG_MEGUMINLINK_USB_SUPPORT 裁剪——wireless/link.cc 的挂点因此无需 #if。
  *
@@ -75,6 +77,7 @@ class ConfigChannel
      * parity 0=无、1=奇、2=偶、3=Mark、4=Space；data_bits 为 5-8。
      * 串口是否被主机打开不在这里缓存，GetStats 时实时查 TinyUSB 的 DTR
      * （见 CdcAcm::host_open），避免拔插后留下过期状态。
+     * 四个字段与统计计数同组、在同一临界区内整体写入，快照因此不会读到改了一半的组合。
      */
     void set_uart_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
@@ -277,29 +280,42 @@ class ConfigChannel
     /** 读一次探测结果快照（组装 GetStats 响应时调用） */
     PingSnapshot ping_snapshot() const;
 
-    // 写入端各在自己的任务上下文串行（DAP 任务 / esp_wifi 任务 / 桥任务），
-    // 读取端只有 EP0 请求处理，无需临界区。
-    volatile u32 m_dap_cmds = 0;
-    volatile u32 m_dap_request_bytes = 0;
-    volatile u32 m_dap_response_bytes = 0;
-    volatile u32 m_wireless_tx_bytes = 0;
-    volatile u32 m_wireless_rx_bytes = 0;
-    volatile i8 m_wireless_rssi = 0;
-    volatile u32 m_uart_rx_bytes = 0;
-    volatile u32 m_uart_tx_bytes = 0;
-    volatile u32 m_uart_wireless_rx_bytes = 0;
-    volatile u32 m_uart_wireless_tx_bytes = 0;
+    /**
+     * 统计与线编码的整组数据。
+     *
+     * 写入端分散在多个任务（DAP 任务 / esp_wifi 任务 / 桥任务 / 主循环），
+     * 读取端是 EP0 请求处理；计数器是读改写累加，同一计数器会有多个写者，
+     * 因此整组由 m_stats_lock 保护——组内字段要么一起被取走，要么都不取。
+     */
+    struct Stats
+    {
+        u32 dap_cmds = 0;
+        u32 dap_request_bytes = 0;
+        u32 dap_response_bytes = 0;
+        u32 wireless_tx_bytes = 0;
+        u32 wireless_rx_bytes = 0;
+        i8 wireless_rssi = 0;
+        u32 uart_rx_bytes = 0;
+        u32 uart_tx_bytes = 0;
+        u32 uart_wireless_rx_bytes = 0;
+        u32 uart_wireless_tx_bytes = 0;
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    volatile u32 m_loss_frames = 0;  /**< 参与注入判定的出向帧数（比例的分母） */
-    volatile u32 m_loss_dropped = 0; /**< 被判丢的帧数（分子） */
+        u32 loss_frames = 0;  /**< 参与注入判定的出向帧数（比例的分母） */
+        u32 loss_dropped = 0; /**< 被判丢的帧数（分子） */
 #endif
+        // 主机下发的线编码（CDC SET_LINE_CODING）。无回调时是桥接默认值 8N1，
+        // 与 UartBridge 安装驱动时的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
+        u32 uart_baud = CONFIG_MEGUMINLINK_UART_BRIDGE_BAUD_RATE;
+        u8 uart_data_bits = 8;
+        u8 uart_stop_bits = 0; // CDC_LINE_CODING_STOP_BITS_1
+        u8 uart_parity = 0;    // CDC_LINE_CODING_PARITY_NONE
+    };
 
-    // 主机下发的线编码（CDC SET_LINE_CODING）。无回调时是桥接默认值 8N1，
-    // 与 UartBridge 安装驱动时的初值一致；串口打开状态不缓存（见 set_uart_line_coding）。
-    volatile u32 m_uart_baud = CONFIG_MEGUMINLINK_UART_BRIDGE_BAUD_RATE;
-    volatile u8 m_uart_data_bits = 8;
-    volatile u8 m_uart_stop_bits = 0; // CDC_LINE_CODING_STOP_BITS_1
-    volatile u8 m_uart_parity = 0;    // CDC_LINE_CODING_PARITY_NONE
+    /** 取一份自洽的统计+线编码快照（锁内整体拷贝，TLV 组帧在锁外做） */
+    Stats stats_snapshot() const;
+
+    mutable portMUX_TYPE m_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+    Stats m_stats = {};
 
     /**
      * 存活探测状态：主循环发起/结算、收到 Pong 时校验，EP0 只读快照，
