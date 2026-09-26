@@ -1,2 +1,3 @@
+# MeguminLink S3 芯片层：两块 S3 板都用 WS2812 指示灯
+# （板级引脚、按钮与 DAP/串口引脚见 sdkconfig.defaults.s3-pv2 / .s3-devboard）
 CONFIG_MEGUMINLINK_LED_DRIVER_WS2812=y
-
