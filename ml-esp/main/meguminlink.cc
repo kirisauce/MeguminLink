@@ -1,10 +1,25 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "sdkconfig.h"
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+#include "meguminlink/usb/update_mode.hpp"
+#endif
 
 extern "C" void app_main();
 
 void app_main()
 {
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    // 更新模式请求优先于一切初始化（进入请求在本调用里读出并清除）：该分支不
+    // 初始化 NVS、无线、串口桥与 Application，只安装一个 vendor 接口的 USB
+    // 并显示渐变灯效。见 meguminlink/usb/update_mode.hpp。
+    if (mlink::update_mode::consume_request())
+    {
+        mlink::UpdateMode::get_instance().run(); // 不返回
+    }
+#endif
+
     ESP_ERROR_CHECK(mlink::nvs_flash_init());
 
     // get_instance() 延迟构造：构造时（NVS 已初始化）自动完成无线链路

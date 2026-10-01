@@ -16,6 +16,7 @@
     mlinkctl unpair              清除配对记录并重新配对（cmd 0x12）
     mlinkctl reset               恢复出厂设置：清除配对、模式与 USB 能力记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
+    mlinkctl update             进入更新模式：软复位后只保留一个 vendor 接口并显示渐变灯效（cmd 0x1C）
 
 `mlinkctl --help` 与 `mlinkctl <command> --help` 由 argparse 生成。
 
@@ -31,7 +32,9 @@ ping 是唯一的例外：设备端异步执行探测（主循环发 Ping、等 
 (cur - prev) & 0xFFFFFFFF 处理）。
 
 动作命令的 status=ok 只表示设备已接受投递：执行发生在设备主循环，
-结果看设备日志与行为；reset 与 reboot 之后设备会重新枚举，注意等待。
+结果看设备日志与行为；reset / reboot / update 之后设备会重新枚举，注意等待。
+更新模式（update）没有配置通道：那里的设备只暴露一个 vendor 接口，本工具对
+它发命令会得到传输错误，属预期；硬复位/断电即回正常模式。
 
 Linux 非 root 访问需要在 /etc/udev/rules.d/99-meguminlink.rules 写一行：
 
@@ -65,6 +68,7 @@ CMD_APPLY_USB_CONFIG = 0x17
 CMD_PING = 0x18
 CMD_SET_WIFI_RATE = 0x19
 CMD_SET_LOSS = 0x1A
+CMD_ENTER_UPDATE = 0x1C
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -226,9 +230,10 @@ ACTIONS = {
     "unpair": (CMD_CLEAR_PAIR, "清除配对记录并重新配对"),
     "reset": (CMD_RESET, "恢复出厂设置：清除配对、模式与 USB 能力记录"),
     "reboot": (CMD_REBOOT, "重启设备"),
+    "update": (CMD_ENTER_UPDATE, "进入更新模式：重启后只保留一个 vendor 接口，硬复位退出"),
 }
 # 执行后设备会重新枚举的子命令
-REBOOTING = {"reset", "reboot"}
+REBOOTING = {"reset", "reboot", "update"}
 
 
 def die(message):

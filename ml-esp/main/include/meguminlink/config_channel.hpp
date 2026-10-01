@@ -151,6 +151,9 @@ class ConfigChannel
         ClearPair,      // 清除配对记录并进入配对流程
         Reset,          // 恢复出厂设置：清除配对、模式与 USB 能力记录后重启
         Reboot,         // 立即重启
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+        EnterUpdate,   // 请求软复位进入更新模式（仅 USB 目标可达，见 update_mode.hpp）
+#endif
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
         Ping,           // 立即探测已配对对端（存活与往返时延）
         SetWifiRate,    // arg: wifi_phy_rate_t 原值（ESP-NOW 发送速率档位）

@@ -2,6 +2,7 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
 #include "meguminlink/dap_frame.hpp"     // dap_request_size（USB 命令重组）
+#include "meguminlink/usb/update_mode.hpp" // UpdateMode::try_instance（更新模式分流）
 #include "meguminlink/usb/usb_capability.hpp"
 #include "meguminlink/usb/usb_descriptors.hpp"
 #include "meguminlink/wireless/frame.hpp"
@@ -570,6 +571,16 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
 {
     (void)buffer;
     (void)buffer_size;
+
+    // 更新模式：唯一的 vendor 接口由 UpdateMode 接管（本轮只把 FIFO 读空），
+    // 分流必须发生在 Application 之前——更新模式没有构造 Application，取它
+    // 会连带初始化 NVS、无线与串口桥
+    if (auto *update = mlink::UpdateMode::try_instance())
+    {
+        update->usb_rx(idx);
+        return;
+    }
+
     if (idx != USB_DAP_INTERFACE)
     {
         return;
@@ -627,6 +638,12 @@ void tud_hid_set_report_cb([[maybe_unused]] u8 instance, [[maybe_unused]] u8 rep
 
 const u8 *tud_descriptor_bos_cb()
 {
+    // 更新模式不宣告平台能力（其描述符只报 USB 2.0，主机不会请求 BOS）
+    if (auto *update = mlink::UpdateMode::try_instance())
+    {
+        return update->usb_bos();
+    }
+
     // BOS 按运行时的能力状态构造（见 usb_capability.cc）：主机只在枚举时读取，
     // 运行时开关变化靠 apply_usb_capability 的重新枚举让它重读
     return mlink::Application::get_instance().usb().descriptors().capability().bos();
@@ -634,6 +651,13 @@ const u8 *tud_descriptor_bos_cb()
 
 bool tud_vendor_control_xfer_cb(u8 rhport, u8 stage, const tusb_control_request_t *request)
 {
+    // 更新模式的接入点在 Application 之前：该模式没有配置通道，也不存在
+    // Application 实例（见 UpdateMode::usb_control）
+    if (auto *update = mlink::UpdateMode::try_instance())
+    {
+        return update->usb_control(rhport, stage, request);
+    }
+
     // 配置通道（bRequest = 0x4D）：EP0 厂商请求，与下述 MS OS 2.0 / WebUSB
     // 的描述符请求按 bRequest 分派；非本模块的请求交回下方原逻辑处理
     if (mlink::Application::get_instance().config_channel().handle_control(rhport, stage, request))

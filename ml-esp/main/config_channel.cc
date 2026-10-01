@@ -239,6 +239,9 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //                        由主机下发本机，本机再经会话重置帧同步给对端
 //   0x1A SetLoss        参数 = 注入丢包率千分比 0-255（0.1% 步进），0 = 关闭；
 //                        仅在 CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE 下存在
+//   0x1C EnterUpdate   软复位进入更新模式：重启后 USB 只暴露一个 vendor 接口并
+//                        显示渐变灯效，硬复位退出；仅 USB 目标支持（无 USB 侧回
+//                        unsupported）。进入请求跨软复位传递，见 update_mode.cc
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
 //
@@ -277,6 +280,7 @@ enum class Cmd : u8
     Ping = 0x18,
     SetWifiRate = 0x19,
     SetLinkConfig = 0x1B,
+    EnterUpdate = 0x1C,
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     SetLoss = 0x1A,
 #endif
@@ -401,6 +405,9 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
         // 没有合法草稿就没什么可应用的（被拒的草稿不算，原因由 GetUsbConfig 报出）
         return has_valid_usb_draft() ? post_action_response(cmd, seq, Action::ApplyUsbConfig, 0)
                                      : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+    case Cmd::EnterUpdate:
+        // 只投递动作：置跨复位请求标志与重启都在主循环做（这里占的是 tinyusb 任务）
+        return post_action_response(cmd, seq, Action::EnterUpdate, 0);
 #else
     case Cmd::GetStats:
     case Cmd::GetConfig:
@@ -408,6 +415,7 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
     case Cmd::SetUsbConfig:
     case Cmd::ApplyUsbConfig:
     case Cmd::SetLinkConfig:
+    case Cmd::EnterUpdate:
         // 只读命令与 USB 能力：本目标（无 USB 侧）没有宿主可读的状态可回
         return build_empty_response(cmd, seq, static_cast<u8>(Status::Unsupported));
 #endif

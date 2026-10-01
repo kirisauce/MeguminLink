@@ -13,11 +13,6 @@ using namespace mlink;
 
 constexpr char TAG[] = "mlink::usb_descriptors";
 
-// VID/PID：量产前需注册自有 VID/PID。当前沿用 Espressif TinyUSB 默认值：
-// 0x303A 为 Espressif VID，0x4020 为 esp_tinyusb vendor 接口默认 PID (0x4000 | 1<<5)
-constexpr u16 USB_VID = 0x303A;
-constexpr u16 USB_PID = 0x4020;
-
 // 索引 0 为语言 ID（英文），esp_tinyusb 直接拷贝其原始 2 字节
 constexpr char LANGID[] = {0x09, 0x04};
 

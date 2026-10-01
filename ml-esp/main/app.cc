@@ -1,5 +1,8 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+#include "meguminlink/usb/update_mode.hpp"
+#endif
 #include "meguminlink/usb/usb_capability.hpp"
 #include "meguminlink/wireless/arq_link.hpp"
 #include "meguminlink/wireless/frame.hpp"
@@ -434,6 +437,16 @@ void Application::consume_pending_action()
         vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
         esp_restart();
         break;
+#if CONFIG_MEGUMINLINK_USB_SUPPORT
+    case ConfigChannel::Action::EnterUpdate:
+        // 请求标志先落进 .noinit（软复位后保留），app_main 最前面据此进入更新模式；
+        // 等待与 Reboot 同一个理由：响应帧已交给 EP0，重启前要留出送达余量
+        ESP_LOGI(TAG, "Update mode requested; rebooting into update mode");
+        update_mode::request();
+        vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
+        esp_restart();
+        break;
+#endif
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     case ConfigChannel::Action::ApplyUsbConfig: {
         UsbCapabilitySettings draft;

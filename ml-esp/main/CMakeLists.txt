@@ -21,7 +21,8 @@ if(CONFIG_MEGUMINLINK_USB_SUPPORT)
         ${CMAKE_CURRENT_LIST_DIR}/usb/usb.cc
         ${CMAKE_CURRENT_LIST_DIR}/usb/usb_descriptors.cc
         ${CMAKE_CURRENT_LIST_DIR}/usb/cdc_acm.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_capability.cc)
+        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_capability.cc
+        ${CMAKE_CURRENT_LIST_DIR}/usb/update_mode.cc)
 endif()
 
 # CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2）：无条件编译。

@@ -17,6 +17,16 @@ namespace mlink
 /** DAP vendor 接口号：接口按插入顺序编号，它永远是第一个（MS OS 2.0 圈定的也是它） */
 inline constexpr u8 USB_DAP_INTERFACE = 0;
 
+/**
+ * 设备 VID/PID：正常模式的描述符集与维护模式的最小描述符共用同一组值
+ * （维护模式靠单接口形态与产品名区分，不给主机侧新增匹配规则）。
+ *
+ * 量产前需注册自有 VID/PID。当前沿用 Espressif TinyUSB 默认值：
+ * 0x303A 为 Espressif VID，0x4020 为 esp_tinyusb vendor 接口默认 PID (0x4000 | 1<<5)。
+ */
+inline constexpr u16 USB_VID = 0x303A;
+inline constexpr u16 USB_PID = 0x4020;
+
 #if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
 /**
  * HID 报告长度 = DAP_PACKET_SIZE（64）：CMSIS-DAP v1 的一条命令/响应占满一个
