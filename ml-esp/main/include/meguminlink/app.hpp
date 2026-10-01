@@ -229,6 +229,21 @@ class Application
     /** 配置/遥测通道（统计计数器 + EP0 厂商请求处理，见 config_channel.hpp） */
     ConfigChannel m_config_channel;
 };
+
+/**
+ * 确认当前运行的固件可用：处于待校验（ESP_OTA_IMG_PENDING_VERIFY）状态时把它标记
+ * 为有效，取消引导程序的下一次回滚。
+ *
+ * 启用回滚（CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE，见分区表与 sdkconfig.defaults）
+ * 后，新固件第一次启动会被引导程序置为待校验，在确认之前再复位就退回旧槽。因此调用
+ * 点必须落在"已经能判定这一版固件可用"的时刻：正常模式在 Application 构造完成之后
+ * （NVS、无线、USB、按键与 LED 全部就绪），更新模式在进入时（跑得起更新模式的 USB
+ * 就说明镜像至少是活的；且 esp_ota_begin 在待校验状态下会直接拒绝，必须先确认）。
+ *
+ * 幂等：已经确认过、或引导程序直接启动（状态为 VALID/UNDEFINED）时不做任何事；
+ * 未启用回滚的目标（如无 USB 的 ESP32-C3）上为空实现。
+ */
+void ota_confirm_running_app();
 } // namespace mlink
 
 #endif

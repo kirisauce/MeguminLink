@@ -11,6 +11,7 @@
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
 #include <esp_mac.h> // MACSTR/MAC2STR（接收端 DAP 命令日志）
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <sdkconfig.h>
 
@@ -686,4 +687,28 @@ Application &Application::get_instance()
     // 保证构造函数里的 NVS 读取与 USB 初始化可用。
     static Application instance;
     return instance;
+}
+
+void mlink::ota_confirm_running_app()
+{
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    // 读不到状态（没有 otadata 分区、或运行在 factory 槽）时无从确认，也不影响
+    // 运行：只有引导程序挑选出来的 OTA 镜像才有"待校验，超时回滚"这回事
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) != ESP_OK ||
+        state != ESP_OTA_IMG_PENDING_VERIFY)
+    {
+        return;
+    }
+
+    const esp_err_t ret = esp_ota_mark_app_valid_cancel_rollback();
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Running firmware confirmed, rollback cancelled");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to confirm running firmware: %s", esp_err_to_name(ret));
+    }
+#endif
 }

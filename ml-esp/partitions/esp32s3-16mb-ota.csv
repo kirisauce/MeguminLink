@@ -1,0 +1,8 @@
+# MeguminLink S3（16MB flash）：双 OTA 槽、无 factory，app 由更新模式经 vendor 通道写入空闲槽。
+# nvs 位置与单 app 布局一致，迁移后原有配对/模式/USB 能力等设置原地保留。
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   24K,
+otadata,  data, ota,     0xF000,   8K,
+phy_init, data, phy,     0x11000,  4K,
+ota_0,    app,  ota_0,   0x20000,  4M,
+ota_1,    app,  ota_1,   0x420000, 4M,

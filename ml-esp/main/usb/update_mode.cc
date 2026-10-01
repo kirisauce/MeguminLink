@@ -1,5 +1,6 @@
 #include "meguminlink/usb/update_mode.hpp"
 
+#include "meguminlink/app.hpp"
 #include "meguminlink/usb/usb_descriptors.hpp"
 
 #include <esp_attr.h>
@@ -133,6 +134,11 @@ UpdateMode *UpdateMode::try_instance()
 void UpdateMode::run()
 {
     ESP_LOGI(TAG, "Update mode: one vendor interface, LED gradient (hard reset to leave)");
+
+    // 能进入本模式说明这一版固件至少跑得起 USB：确认它可用，取消引导程序的
+    // 下一次回滚（见 meguminlink/app.hpp）。回滚确认必须早于任何 esp_ota_begin：
+    // 待校验状态下的镜像会被它直接拒绝。
+    ota_confirm_running_app();
 
     // USB 不可用不阻塞模式进入：灯效照常跑，原因看日志
     const esp_err_t usb_ret = init_usb();

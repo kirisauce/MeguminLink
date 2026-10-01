@@ -1,3 +1,9 @@
 # MeguminLink S3 芯片层：两块 S3 板都用 WS2812 指示灯
 # （板级引脚、按钮与 DAP/串口引脚见 sdkconfig.defaults.s3-pv2 / .s3-devboard）
 CONFIG_MEGUMINLINK_LED_DRIVER_WS2812=y
+# S3 板载 flash 16MB：单 app 布局装不下两个槽，改用自定义分区表（见 partitions/ 目录）
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s3-16mb-ota.csv"
+# 双 OTA 槽的回滚：新固件起不来时引导程序退回旧槽（确认时机见 meguminlink/ota_confirm.hpp）
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

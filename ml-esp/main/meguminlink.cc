@@ -25,6 +25,12 @@ void app_main()
     // get_instance() 延迟构造：构造时（NVS 已初始化）自动完成无线链路
     // 初始化（WiFi/ESP-NOW/无线侧 DAP 执行器）、USB 初始化、模式切换按键
     // 注册，并应用模式（USB 常驻，模式差异在 dap_task 的本地执行/无线
-    // 转发分流）；配对由 Wireless 模式内部自动驱动。随后进入主循环。
-    mlink::Application::get_instance().run();
+    // 转发分流）；配对由 Wireless 模式内部自动驱动。
+    mlink::Application &app = mlink::Application::get_instance();
+
+    // 全部子系统已就绪：确认这一版固件可用，取消引导程序的下一次回滚
+    // （见 app.hpp）。随后进入主循环。
+    mlink::ota_confirm_running_app();
+
+    app.run();
 }
