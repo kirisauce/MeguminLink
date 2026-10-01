@@ -6,29 +6,11 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
-#include "meguminlink/common.hpp"
+#include "meguminlink/led/led_types.hpp"
 #include "sdkconfig.h"
 
 namespace mlink
 {
-/** 单颗 WS2812 状态灯的目标效果 */
-enum class Ws2812LedEffect
-{
-    Off,    // 灭
-    On,     // 常亮
-    Blink,  // 周期闪烁（半周期 240ms）
-    Breath, // 呼吸（正弦波亮度渐变，周期 3s）
-};
-
-/** 单颗 WS2812 状态灯的目标状态：颜色（RGB888）+ 效果 */
-struct Ws2812LedTarget
-{
-    u8 r = 0;
-    u8 g = 0;
-    u8 b = 0;
-    Ws2812LedEffect effect = Ws2812LedEffect::Off;
-};
-
 /**
  * 单颗 WS2812 状态灯驱动（MEGUMINLINK_LED_DRIVER_WS2812，RMT）。
  *
@@ -39,41 +21,43 @@ struct Ws2812LedTarget
  *   - 帧间低电平 ≥50µs（复位信号）。
  * RMT 通道分辨率 10MHz（100ns/tick），S3/C3 均支持。
  *
- * 效果实现：
- *   - Off/On：立即传输一次静态帧并停止动画定时器；
- *   - Blink：周期开关（半周期 = BLINK_HALF_PERIOD_FRAMES × 30ms）；
- *   - Breath：正弦波亮度呼吸（周期 = BREATH_PERIOD_FRAMES × 30ms）。
- * 动画由周期 esp_timer 回调（运行在 esp_timer 任务上下文）驱动，
- * 每帧经 rmt_transmit 异步入队（帧仅 24 symbol，队列深度足够）。
- * 与 GPIO 驱动一致，共享状态用 portMUX 临界区保护。
+ * 场景渲染（本驱动独自决定表现，上层只报场景）：
+ *   - Local 绿常亮 / Wireless 蓝常亮 / Pairing 蓝呼吸；
+ *   - 更新模式：空闲 9s 调色板渐变循环、接收中蓝→青按进度、校验中琥珀常亮、
+ *     成功绿闪、失败红闪。
+ * 呼吸、闪烁与渐变由周期 esp_timer 回调按 30ms 一帧推进；静态场景只在场景变化时
+ * 发一帧，不把定时器常驻挂着。与 GPIO 驱动一致，共享状态用 portMUX 临界区保护。
  */
-class Ws2812LedDriver
+class Ws2812LedDriver : public LedDriverBase<Ws2812LedDriver>
 {
   public:
     esp_err_t init();
-    void apply(const Ws2812LedTarget &target);
+
+    /** 场景渲染（由基类 apply 调用，勿直接调用：绕过它会丢掉下发去重） */
+    void apply_impl(const LedRequest &request);
 
   private:
-    /** 定时器回调（esp_timer 任务上下文）：按当前效果刷一帧 */
+    /** 定时器回调（esp_timer 任务上下文）：按当前场景刷一帧 */
     static void timer_cb(void *arg);
 
-    /** 送一帧静止颜色（写入 RMT 队列，异步完成） */
-    void send_frame(u8 r, u8 g, u8 b);
+    /** 该场景是否需要持续动画（呼吸/闪烁/渐变）；静态场景只在场景变化时刷一帧 */
+    static bool scene_animated(LedScene scene);
 
-    /**
-     * 按当前效果计算本帧颜色（Breath/Blink 依赖内部相位计数器）。
-     * 无动画时返回静止色。
-     */
+    /** 按当前场景、进度与相位算本帧颜色（相位由动画定时器推进） */
     void frame_color(u8 &r, u8 &g, u8 &b);
+
+    /** 送一帧颜色（写入 RMT 队列，异步完成） */
+    void send_frame(u8 r, u8 g, u8 b);
 
     gpio_num_t m_io = static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_LED_DRIVER_WS2812_GPIO);
     rmt_channel_handle_t m_tx_channel = nullptr;
     rmt_encoder_handle_t m_encoder = nullptr;
     esp_timer_handle_t m_timer = nullptr;
 
-    Ws2812LedTarget m_target{};  /**< 当前目标状态（apply 写入，定时器读取） */
-    bool m_anim_running = false; /**< 动画定时器当前是否运行 */
-    u32 m_phase = 0;             /**< 动画相位计数（30ms 一帧递增） */
+    LedScene m_scene = LedScene::Local; /**< 当前场景（场景下发写入，定时器读取） */
+    u8 m_progress = 0;                  /**< 接收进度（同上） */
+    bool m_anim_running = false;        /**< 动画定时器当前是否运行 */
+    u32 m_phase = 0;                    /**< 动画相位计数（30ms 一帧递增） */
     portMUX_TYPE m_lock = portMUX_INITIALIZER_UNLOCKED;
 };
 

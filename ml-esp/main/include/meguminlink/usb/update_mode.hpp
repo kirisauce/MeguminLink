@@ -14,9 +14,7 @@
 
 #include <array>
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-#include "meguminlink/led/ws2812_led_driver.hpp"
-#endif
+#include "meguminlink/led/led_driver.hpp"
 
 namespace mlink
 {
@@ -26,12 +24,12 @@ namespace mlink
  *
  * 它不是 Application 的一个模式，而是 app_main 最前面的分支：进入后不初始化 NVS、
  * 无线、串口桥与 Application，只安装一套最小 USB（一个 CDC ACM 接口，无 vendor、
- * 无 HID、无 CMSIS-DAP）并驱动板载 WS2812。因此任何可能触及 Application 的 TinyUSB
+ * 无 HID、无 CMSIS-DAP）并驱动板载指示灯。因此任何可能触及 Application 的 TinyUSB
  * 回调都必须先用 UpdateMode::try_instance() 路由到本对象（见 usb.cc）。
  *
  * 那条 CDC 串口跑固件升级协议（FirmwareUpdater，协议见 firmware_updater.cc）：主机
- * 把 app 镜像推进空闲 OTA 槽，两级校验通过后设备自行复位进新固件。灯效随会话阶段
- * 变化：空闲渐变、接收按进度、成功绿、失败红闪。
+ * 把 app 镜像推进空闲 OTA 槽，两级校验通过后设备自行复位进新固件。本模式只向 LED
+ * 门面报告设备场景（空闲/接收/校验/成功/失败），具体颜色与闪烁由所选驱动决定。
  *
  * 用 CDC 而不是 vendor 接口是为了主机侧免折腾：CDC ACM 由系统串口驱动接管，主机按
  * 普通串口设备访问（Linux 的 /dev/serial/by-id、Windows 的 COM 口），不需要 udev
@@ -132,13 +130,11 @@ class UpdateMode
     /** 把最近组好的响应帧写进 CDC TX FIFO 并 flush 出去 */
     void send_response();
 
-    /** 按当前会话阶段下发一帧灯效（WS2812 驱动未选时为空实现） */
-    void apply_led_frame();
+    /** 按当前升级阶段下发灯效（场景与进度都没变时不写驱动） */
+    void apply_led(LedScene scene);
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    /** 当前会话阶段对应的灯效目标 */
-    Ws2812LedTarget led_target();
-#endif
+    /** 当前升级阶段对应的设备场景 */
+    LedScene led_scene() const;
 
     /** 常驻描述符缓冲：esp_tinyusb 安装时取走指针，主机枚举按内容读取 */
     tusb_desc_device_t m_device = {};
@@ -162,12 +158,7 @@ class UpdateMode
     /** 当前处理中的请求帧（从队列取出，不占任务栈） */
     u8 m_frame_buf[UPDATE_FRAME_MAX] = {};
 
-    /** 灯效相位起点：相位按真实时间推进，主任务写 flash 期间节奏也不漂 */
-    i64 m_led_epoch_us = 0;
-
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    Ws2812LedDriver m_led; /**< 板载 WS2812（渐变节奏由 run 的循环掌握） */
-#endif
+    LedDriver m_leds; /**< 板载指示灯驱动（本模式只报告场景，下发去重由驱动入口负责） */
 };
 } // namespace mlink
 

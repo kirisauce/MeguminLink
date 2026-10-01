@@ -10,6 +10,25 @@ namespace
 constexpr char TAG[] = "mlink::led";
 } // namespace
 
+GpioLedDriver::Effects GpioLedDriver::scene_effects(LedScene scene)
+{
+    switch (scene)
+    {
+    case LedScene::Local:
+        // 本地调试：模式灯常亮，配对灯灭
+        return Effects{Effect::On, Effect::Off};
+    case LedScene::Wireless:
+        // 无线调试已配对：模式灯灭，连接灯常亮
+        return Effects{Effect::Off, Effect::On};
+    case LedScene::Pairing:
+        // 配对流程中：连接灯闪烁
+        return Effects{Effect::Off, Effect::Blink};
+    default:
+        // 更新模式的各个阶段（空闲/接收/校验/成功/失败）：两盏灯都灭
+        return Effects{Effect::Off, Effect::Off};
+    }
+}
+
 esp_err_t GpioLedDriver::init()
 {
     m_active_low = CONFIG_MEGUMINLINK_LED_DRIVER_GPIO_ACTIVE_LOW;
@@ -58,23 +77,25 @@ esp_err_t GpioLedDriver::init()
     return ESP_OK;
 }
 
-void GpioLedDriver::apply(const LedEffects &effects)
+void GpioLedDriver::apply_impl(const LedRequest &request)
 {
+    const Effects effects = scene_effects(request.scene);
+
     portENTER_CRITICAL(&m_lock);
     m_effects = effects;
     // 立即同步静态效果；Blink 的相位由定时器维护（不重置），
-    // 使闪烁节奏与 update 的调用频率完全解耦
+    // 使闪烁节奏与上层下发频率完全解耦
     for (int i = 0; i < 2; i++)
     {
         switch (effects[i])
         {
-        case LedEffect::On:
+        case Effect::On:
             write_level(i, true);
             break;
-        case LedEffect::Off:
+        case Effect::Off:
             write_level(i, false);
             break;
-        case LedEffect::Blink:
+        case Effect::Blink:
             break;
         }
     }
@@ -88,7 +109,7 @@ void GpioLedDriver::timer_cb(void *arg)
     portENTER_CRITICAL(&self->m_lock);
     for (int i = 0; i < 2; i++)
     {
-        if (self->m_effects[i] == LedEffect::Blink)
+        if (self->m_effects[i] == Effect::Blink)
         {
             self->m_level[i] = !self->m_level[i];
             gpio_set_level(self->m_io[i], self->m_level[i]);

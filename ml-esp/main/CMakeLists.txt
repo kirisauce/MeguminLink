@@ -32,18 +32,13 @@ endif()
 file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
 list(APPEND __src ${__dap_src})
 
-# LED 指示灯模块：LED 驱动被选中时编译（choice 非 NONE）；Disabled 时整个模块不参与构建。
-# 各驱动源文件仅在对应的 CONFIG 选项选中时加入（led_controller.cc 为门面，任何
-# 非 NONE 配置都需要）。
-if(NOT CONFIG_MEGUMINLINK_LED_DRIVER_NONE)
-    list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/led_controller.cc)
-    if(CONFIG_MEGUMINLINK_LED_DRIVER_GPIO)
-        list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/gpio_led_driver.cc)
-    endif()
-    if(CONFIG_MEGUMINLINK_LED_DRIVER_WS2812)
-        list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/led/ws2812_led_driver.cc)
-    endif()
-endif()
+# LED 指示灯模块：两个驱动的源文件都无条件编译——公共接口（led_types.hpp 的基类与
+# concept）改动时，未被选中的那个驱动也必须在编译期暴露出来，否则它会在没有板子使用
+# 的情况下悄悄腐烂。未被选中的驱动不会被引用，链接器不会把它取进镜像；Disabled 时
+# 选型回退到空驱动（见 NullLedDriver），调用方也不必判断 LED 是否编进固件。
+list(APPEND __src
+    ${CMAKE_CURRENT_LIST_DIR}/led/gpio_led_driver.cc
+    ${CMAKE_CURRENT_LIST_DIR}/led/ws2812_led_driver.cc)
 
 idf_component_register(SRCS ${__src}
                     INCLUDE_DIRS "./include" "./cmsis_dap/Include" "./cmsis_dap/Config")

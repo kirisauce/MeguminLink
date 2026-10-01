@@ -1,7 +1,10 @@
 # MeguminLink S3 芯片层：两块 S3 板都用 WS2812 指示灯
 # （板级引脚、按钮与 DAP/串口引脚见 sdkconfig.defaults.s3-pv2 / .s3-devboard）
 CONFIG_MEGUMINLINK_LED_DRIVER_WS2812=y
-# S3 板载 flash 16MB：单 app 布局装不下两个槽，改用自定义分区表（见 partitions/ 目录）
+# S3 板载 flash 16MB：单 app 布局装不下两个槽，改用自定义分区表（见 partitions/ 目录）。
+# 必须选中 choice 项本身，只写字符串投影（CONFIG_ESPTOOLPY_FLASHSIZE）对一个全新的
+# 构建目录不够：默认仍是 2MB，8.1MB 的分区表会直接生成失败。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/esp32s3-16mb-ota.csv"

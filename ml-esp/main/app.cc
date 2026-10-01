@@ -85,9 +85,7 @@ Application::Application()
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
-#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
-    ESP_ERROR_CHECK(m_leds.init(*this));
-#endif
+    ESP_ERROR_CHECK(m_leds.init());
     apply_mode();
 }
 
@@ -132,6 +130,16 @@ void Application::apply_mode()
     // 对接，Wireless 把本机端口的数据转发给配对 peer、把对端来的数据写回本机
     // 对侧端口。
     ESP_LOGI(TAG, "Mode: %s", mode_to_string(m_mode));
+}
+
+LedRequest Application::led_request() const
+{
+    // 模式与配对状态 → 设备场景：场景长什么样（颜色/闪烁/渐变）由 LED 驱动决定
+    if (m_mode != Mode::Wireless)
+    {
+        return LedRequest{LedScene::Local, 0}; // 本地调试：USB CMSIS-DAP 已就绪
+    }
+    return LedRequest{m_pairing_active ? LedScene::Pairing : LedScene::Wireless, 0};
 }
 
 SemaphoreHandle_t Application::main_task_wake()
@@ -540,10 +548,8 @@ void Application::run()
         // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
         m_config_channel.poll_ping_timeout();
 
-#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
-        m_leds.update();
-#endif
+        m_leds.apply(led_request());
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
         // 按键事件由 m_button（状态机）识别，这里只消费并执行动作：

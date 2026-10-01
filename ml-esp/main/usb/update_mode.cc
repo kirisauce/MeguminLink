@@ -8,7 +8,6 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_system.h>
-#include <esp_timer.h>
 #include <tinyusb.h>
 #include <tinyusb_cdc_acm.h>
 #include <tinyusb_default_config.h>
@@ -56,49 +55,13 @@ void usb_event_callback([[maybe_unused]] tinyusb_event_t *event, [[maybe_unused]
 {
 }
 
-// ---- 灯效 ----
-
-/** 灯效帧间隔（毫秒）：更新模式循环的节拍（与 WS2812 驱动的动画帧同一粒度） */
-constexpr u32 LED_FRAME_MS = 30;
-
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-/** 一轮渐变的帧数：三段等分，100 帧 × 30ms = 3s 每段，一轮 9s */
-constexpr u32 LED_CYCLE_FRAMES = 300;
-
-/** 渐变调色板：红 → 橙 → 粉（末段由粉插值回红） */
-constexpr u8 PALETTE[][3] = {
-    {255, 0, 0},
-    {255, 128, 0},
-    {255, 64, 160},
-};
-constexpr u32 PALETTE_SIZE = sizeof(PALETTE) / sizeof(PALETTE[0]);
-constexpr u32 SEGMENT_FRAMES = LED_CYCLE_FRAMES / PALETTE_SIZE;
-
-static_assert(LED_CYCLE_FRAMES % PALETTE_SIZE == 0,
-              "gradient cycle must split evenly into one segment per palette entry");
-
-/** 整数线性插值：step ∈ [0, span)，结果只落在 from 与 to 之间 */
-u8 lerp(u8 from, u8 to, u32 step, u32 span)
-{
-    const i32 delta = static_cast<i32>(to) - static_cast<i32>(from);
-    return static_cast<u8>(static_cast<i32>(from) + delta * static_cast<i32>(step) / static_cast<i32>(span));
-}
-
-/** 第 phase 帧的渐变目标色：调色板线性插值循环（调色板三段都在红色通道拉满） */
-Ws2812LedTarget gradient_target(u32 phase)
-{
-    const u32 position = phase % LED_CYCLE_FRAMES;
-    const u32 segment = position / SEGMENT_FRAMES;
-    const u32 step = position % SEGMENT_FRAMES;
-    const u8 *from = PALETTE[segment];
-    const u8 *to = PALETTE[(segment + 1) % PALETTE_SIZE];
-
-    return Ws2812LedTarget{lerp(from[0], to[0], step, SEGMENT_FRAMES), lerp(from[1], to[1], step, SEGMENT_FRAMES),
-                           lerp(from[2], to[2], step, SEGMENT_FRAMES), Ws2812LedEffect::On};
-}
-#endif
-
 // ---- 时序 ----
+
+/**
+ * 主循环等帧的节拍（毫秒）：灯效动画由驱动自己的定时器推进，这个节拍只决定没有
+ * 请求时多久醒一次检查升级会话超时与失败态到期。
+ */
+constexpr u32 IDLE_POLL_MS = 30;
 
 /** 校验通过、启动分区已切换后，留给主机读走最后一条响应再复位的时间 */
 constexpr u32 REBOOT_DELAY_MS = 1000;
@@ -142,7 +105,7 @@ UpdateMode *UpdateMode::try_instance()
 
 void UpdateMode::run()
 {
-    ESP_LOGI(TAG, "Update mode: firmware update channel on one vendor interface");
+    ESP_LOGI(TAG, "Update mode: firmware update channel on one CDC interface");
 
     // 能进入本模式说明这一版固件至少跑得起 USB：确认它可用，取消引导程序的
     // 下一次回滚（见 meguminlink/app.hpp）。回滚确认必须早于任何 esp_ota_begin：
@@ -163,37 +126,26 @@ void UpdateMode::run()
         ESP_LOGE(TAG, "Update-mode USB unavailable: %s", esp_err_to_name(usb_ret));
     }
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    const esp_err_t led_ret = m_led.init();
+    const esp_err_t led_ret = m_leds.init();
     if (led_ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Update-mode LED unavailable: %s", esp_err_to_name(led_ret));
     }
-#endif
-
-    m_led_epoch_us = esp_timer_get_time();
-    i64 next_led_us = m_led_epoch_us;
+    apply_led(led_scene()); // 立即进入空闲灯效，不等第一个节拍
 
     while (true)
     {
-        // 等帧的时长刚好是到下一帧灯效的时刻：有帧立刻醒（写 flash 的间隙也持续
-        // 刷灯），没帧就睡到该刷灯的时候，不做空转轮询
-        i64 wait_us = next_led_us - esp_timer_get_time();
-        if (wait_us < 0)
-        {
-            wait_us = 0;
-        }
-        const u32 wait_ms = static_cast<u32>((wait_us + 999) / 1000);
-
-        if (m_frame_queue != nullptr && xQueueReceive(m_frame_queue, m_frame_buf, pdMS_TO_TICKS(wait_ms)) == pdTRUE)
+        // 有帧立刻醒（写 flash 期间灯效由驱动自己的定时器继续刷），没帧就睡一个
+        // 节拍等超时检查，不做空转轮询
+        if (m_frame_queue != nullptr &&
+            xQueueReceive(m_frame_queue, m_frame_buf, pdMS_TO_TICKS(IDLE_POLL_MS)) == pdTRUE)
         {
             handle_frame(m_frame_buf);
             continue;
         }
 
-        apply_led_frame();
+        apply_led(led_scene());
         m_updater.poll();
-        next_led_us = esp_timer_get_time() + LED_FRAME_MS * 1000;
     }
 }
 
@@ -319,23 +271,21 @@ void UpdateMode::handle_frame(const u8 *frame)
     const u8 type = frame[2];
     const usize length = UPDATE_FRAME_HEADER_LEN + (static_cast<usize>(frame[4]) << 8) + frame[5];
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    // Finish 要读回整个分区校验，主任务会在这几百毫秒里阻塞、循环刷不了灯：
-    // 先钉住"正在校验"的颜色，让现场一眼看出设备没有卡死
+    // Finish 要读回整个分区校验，主任务会在这几百毫秒里阻塞、刷不了灯：先钉住
+    // “正在校验”的场景，让现场一眼看出设备没有卡死
     if (type == static_cast<u8>(UpdateCommand::Finish))
     {
-        m_led.apply(Ws2812LedTarget{255, 192, 0, Ws2812LedEffect::On});
+        apply_led(LedScene::UpdateVerifying);
     }
-#endif
 
     m_updater.handle(frame, length);
     send_response();
 
     if (m_updater.phase() == FirmwareUpdater::Phase::Done)
     {
-        // 校验通过、启动分区已切换：先给成功色，留出主机读走最后一条响应的
+        // 校验通过、启动分区已切换：先切到成功场景，留出主机读走最后一条响应的
         // 余量，然后进新固件
-        apply_led_frame();
+        apply_led(led_scene());
         vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
         ESP_LOGI(TAG, "Restarting into the new firmware");
         esp_restart();
@@ -368,37 +318,28 @@ void UpdateMode::send_response()
     }
 }
 
-void UpdateMode::apply_led_frame()
+void UpdateMode::apply_led(LedScene scene)
 {
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    m_led.apply(led_target());
-#endif
+    // 阶段 → 场景后交给门面：下发去重与驱动调用都在门面里，本模式不碰具体驱动
+    m_leds.apply(LedRequest{scene, m_updater.progress_percent()});
 }
 
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-Ws2812LedTarget UpdateMode::led_target()
+LedScene UpdateMode::led_scene() const
 {
+    // 升级阶段 → 设备场景：该场景长什么样（颜色、闪烁、渐变）与本映射无关
     switch (m_updater.phase())
     {
-    case FirmwareUpdater::Phase::Receiving: {
-        // 蓝 → 青：绿灯分量跟着进度走，一眼看出还剩多少
-        const u8 progress = m_updater.progress_percent();
-        return Ws2812LedTarget{0, lerp(64, 255, progress, 100), 255, Ws2812LedEffect::On};
-    }
+    case FirmwareUpdater::Phase::Receiving:
+        return LedScene::UpdateReceiving;
     case FirmwareUpdater::Phase::Done:
-        // 闪光而不是常亮：复位前只有 REBOOT_DELAY_MS 这一小段，闪烁更容易被看见
-        return Ws2812LedTarget{0, 255, 0, Ws2812LedEffect::Blink};
+        return LedScene::UpdateDone;
     case FirmwareUpdater::Phase::Failed:
-        return Ws2812LedTarget{255, 0, 0, Ws2812LedEffect::Blink};
+        return LedScene::UpdateFailed;
     case FirmwareUpdater::Phase::Idle:
-    default: {
-        // 相位跟真实时间走：主循环忙于写 flash 时帧不会挤在一起，9s 一轮不漂
-        const i64 elapsed_us = esp_timer_get_time() - m_led_epoch_us;
-        return gradient_target(static_cast<u32>(elapsed_us / (LED_FRAME_MS * 1000)));
-    }
+    default:
+        return LedScene::UpdateIdle;
     }
 }
-#endif
 
 esp_err_t UpdateMode::init_usb()
 {

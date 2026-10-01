@@ -19,9 +19,7 @@
 
 #include "meguminlink/uart/uart_bridge.hpp"
 
-#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
-#include "meguminlink/led/led_controller.hpp"
-#endif
+#include "meguminlink/led/led_driver.hpp"
 
 #include <freertos/FreeRTOS.h>
 #include <vector>
@@ -153,7 +151,7 @@ class Application
 
     void run();
 
-    /** 是否处于配对流程（供 LedController 自行读取） */
+    /** 是否处于配对流程（LED 场景映射读取） */
     bool pairing_active() const;
 
     /** 配对成功落盘后由 PairingState 回调：统一退出配对流程 */
@@ -184,6 +182,9 @@ class Application
     /** 按当前模式应用系统行为（USB 启用/禁用）；构造与 set_mode 复用 */
     void apply_mode();
 
+    /** 当前模式与配对状态对应的设备场景（主循环交给 LED 门面下发） */
+    LedRequest led_request() const;
+
     /** 消费配置通道投递的动作（主循环调用；NVS/wifi/重启都只在这里做） */
     void consume_pending_action();
 
@@ -212,9 +213,7 @@ class Application
     ButtonState m_button; /**< 模式切换按键状态机（防抖/双击/长按识别） */
 #endif
 
-#if !CONFIG_MEGUMINLINK_LED_DRIVER_NONE
-    LedController m_leds; /**< LED 指示灯控制器（主循环周期刷新，内部读本对象状态） */
-#endif
+    LedDriver m_leds; /**< 板载指示灯驱动（主循环每拍上报场景，下发去重由驱动入口负责） */
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb m_usb;

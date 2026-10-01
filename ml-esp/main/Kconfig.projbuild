@@ -351,12 +351,11 @@ config MEGUMINLINK_LED_DRIVER_WS2812
         One WS2812 addressable LED driven by the RMT peripheral (protocol
         sampling: bit0 = 300ns high/900ns low, bit1 = 700ns high/500ns
         low, GRB byte order). The single LED encodes the device status
-        (mode/pairing) with color and effect (see LedController).
+        (mode/pairing) with color and effect (see led_types.hpp).
 
 endchoice
 
 menu "LED Indicator (GPIO)"
-    depends on MEGUMINLINK_LED_DRIVER_GPIO
 
 config MEGUMINLINK_LED_DRIVER_GPIO_LED1_IO
     int "LED1 (mode) GPIO number"
@@ -384,7 +383,6 @@ config MEGUMINLINK_LED_DRIVER_GPIO_BLINK_PERIOD_MS
 endmenu
 
 menu "LED Indicator (WS2812)"
-    depends on MEGUMINLINK_LED_DRIVER_WS2812
 
 config MEGUMINLINK_LED_DRIVER_WS2812_GPIO
     int "WS2812 data (DIN) GPIO number"
