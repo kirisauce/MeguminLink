@@ -16,7 +16,7 @@
     mlinkctl unpair              清除配对记录并重新配对（cmd 0x12）
     mlinkctl reset               恢复出厂设置：清除配对、模式与 USB 能力记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
-    mlinkctl update             进入更新模式：软复位后只保留一个 vendor 接口并显示渐变灯效（cmd 0x1C）
+    mlinkctl update             进入更新模式：软复位后只保留一个 CDC 串口并显示渐变灯效（cmd 0x1C）
     mlinkctl flash <file>       刷入固件：自动进更新模式，把 app 镜像推给设备，校验通过后设备自行复位
 
 `mlinkctl --help` 与 `mlinkctl <command> --help` 由 argparse 生成。
@@ -87,6 +87,14 @@ UPDATE_MAGIC = 0x4D4F
 UPDATE_HEADER = ">HBBHH"
 UPDATE_HEADER_SIZE = 8
 UPDATE_CHUNK_MAX = 4096
+
+# Info 响应载荷布局：槽位大小 u32 | 分块上限 u32 | 版本串 32B | 设备 MAC 6B。
+# MAC 是后加的尾部字段，老固件只回前 40 字节，那时无法校验目标身份。
+UPDATE_INFO_SLOT_OFFSET = 0
+UPDATE_INFO_VERSION_OFFSET = 8
+UPDATE_INFO_VERSION_LEN = 32
+UPDATE_INFO_MAC_OFFSET = UPDATE_INFO_VERSION_OFFSET + UPDATE_INFO_VERSION_LEN
+UPDATE_INFO_MAC_LEN = 6
 
 CMD_UPDATE_INFO = 0x01
 CMD_UPDATE_BEGIN = 0x02
@@ -278,7 +286,7 @@ ACTIONS = {
     "unpair": (CMD_CLEAR_PAIR, "清除配对记录并重新配对"),
     "reset": (CMD_RESET, "恢复出厂设置：清除配对、模式与 USB 能力记录"),
     "reboot": (CMD_REBOOT, "重启设备"),
-    "update": (CMD_ENTER_UPDATE, "进入更新模式：重启后只保留一个 vendor 接口，硬复位退出"),
+    "update": (CMD_ENTER_UPDATE, "进入更新模式：重启后只保留一个 CDC 串口，硬复位退出"),
 }
 # 执行后设备会重新枚举的子命令
 REBOOTING = {"reset", "reboot", "update"}
@@ -466,6 +474,11 @@ def render_arq_state(values):
     return parts
 
 
+def format_mac(raw):
+    """MAC 字节串 → "aa:bb:cc:dd:ee:ff"；空字节串返回 None。"""
+    return ":".join(f"{byte:02x}" for byte in raw) if raw else None
+
+
 def render_config(values):
     parts = []
     for tag, name in CONFIG_FIELDS:
@@ -473,7 +486,7 @@ def render_config(values):
         if name == "mode":
             value = MODE.get(int.from_bytes(raw, "big"), "?") if raw is not None else "?"
         elif name == "peer_mac":
-            value = ":".join(f"{byte:02x}" for byte in raw) if raw else "unpaired"
+            value = format_mac(raw) or "unpaired"
         elif name == "wifi_rate":
             # 未知档位（固件比本文件新）按原始值显示，不猜名字
             code = int.from_bytes(raw, "big") if raw else None
@@ -881,7 +894,7 @@ def wait_for_running_device(mac, timeout_s):
 
 
 def cmd_flash(args):
-    """把 app 镜像刷进设备：进更新模式 → Info 预检 → Begin → Data 分块 → Finish。"""
+    """把 app 镜像刷进设备：进更新模式 → Info 预检（含目标身份核对）→ Begin → Data 分块 → Finish。"""
     path = Path(args.firmware)
     if not path.is_file():
         die(f"{args.firmware} 不是文件")
@@ -895,12 +908,19 @@ def cmd_flash(args):
     port = serial.Serial(port_path, UPDATE_BAUD, timeout=UPDATE_TIMEOUT_S)
     try:
         info = update_request(port, CMD_UPDATE_INFO, 1, timeout_s=args.timeout / 1000)
-        partition_size, max_chunk = struct.unpack(">II", info[:8])
-        version = info[8:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        partition_size, max_chunk = struct.unpack(">II", info[UPDATE_INFO_SLOT_OFFSET:UPDATE_INFO_VERSION_OFFSET])
+        version = (
+            info[UPDATE_INFO_VERSION_OFFSET:UPDATE_INFO_MAC_OFFSET].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        )
         if partition_size == 0:
             die("设备没有可写的 OTA 槽（分区表里没有第二个 app 分区）")
         if len(image) > partition_size:
             die(f"镜像 {len(image)} 字节超过槽位 {partition_size} 字节")
+
+        # 串口名里的 MAC 只是路径约定，这里再让设备自报一次身份：认错了就一个字节都不写
+        device_mac = info[UPDATE_INFO_MAC_OFFSET:UPDATE_INFO_MAC_OFFSET + UPDATE_INFO_MAC_LEN]
+        if len(device_mac) == UPDATE_INFO_MAC_LEN and any(device_mac) and format_mac(device_mac) != mac:
+            die(f"串口 {port_path} 上的设备是 {format_mac(device_mac)}，不是目标 {mac}")
 
         chunk = min(args.chunk or max_chunk, max_chunk, UPDATE_CHUNK_MAX)
         if chunk <= 0:

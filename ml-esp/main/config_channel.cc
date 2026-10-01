@@ -239,7 +239,7 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //                        由主机下发本机，本机再经会话重置帧同步给对端
 //   0x1A SetLoss        参数 = 注入丢包率千分比 0-255（0.1% 步进），0 = 关闭；
 //                        仅在 CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE 下存在
-//   0x1C EnterUpdate   软复位进入更新模式：重启后 USB 只暴露一个 vendor 接口并
+//   0x1C EnterUpdate   软复位进入更新模式：重启后 USB 只暴露一个 CDC 串口并
 //                        显示渐变灯效，硬复位退出；仅 USB 目标支持（无 USB 侧回
 //                        unsupported）。进入请求跨软复位传递，见 update_mode.cc
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，

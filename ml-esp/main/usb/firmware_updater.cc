@@ -4,6 +4,7 @@
 
 #include <esp_app_desc.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_timer.h>
 #include <sdkconfig.h>
 
@@ -15,7 +16,7 @@ static constexpr char TAG[] = "mlink::updater";
 
 // ---- 协议（固件与上位机的唯一契约，上位机见 tools/mlinkctl.py 的 flash 子命令）----
 //
-// 传输：更新模式 vendor 接口的 bulk 端点（OUT 0x02 / IN 0x83），严格停等——主机发
+// 传输：更新模式的 CDC 串口（数据端点 OUT 0x02 / IN 0x83），严格停等——主机发
 // 一帧、等一帧响应，读到响应才发下一帧。请求与响应同构。
 //
 // 帧（8B 头 + 载荷，整数一律大端）：
@@ -24,7 +25,9 @@ static constexpr char TAG[] = "mlink::updater";
 //   响应原样回填），后接 length 字节载荷。
 //
 // 命令表：
-//   0x01 Info    请求空；响应 = 槽位大小 u32 | 分块上限 u32 | 当前固件版本 32B
+//   0x01 Info    请求空；响应 = 槽位大小 u32 | 分块上限 u32 | 当前固件版本 32B |
+//                设备 MAC 6B（与 USB 串号同源，读取失败时为全 0）。MAC 追加在尾部：
+//                老上位机按固定偏移读槽位与版本，不受影响
 //   0x02 Begin   请求 = 镜像大小 u32 | 整镜像 SHA-256 32B；响应 = 槽位大小 u32 |
 //                分块上限 u32。申报大小超过槽位直接拒绝，一个字节都不擦
 //   0x03 Data    请求 = 一段镜像数据（≤ 分块上限）；响应 = 累计已写入 u32
@@ -93,11 +96,20 @@ void FirmwareUpdater::handle_info(u16 seq)
     u8 version[UPDATE_VERSION_LEN] = {};
     std::memcpy(version, esp_app_get_description()->version, sizeof(version) - 1);
 
-    u8 payload[2 * sizeof(u32) + UPDATE_VERSION_LEN] = {};
+    // 设备 MAC 与 USB 串号同源：主机据此确认当前打开的是它要刷的那一台。工厂 MAC
+    // 读取几乎不会失败，真失败时留全 0，主机把全 0 当作"未上报"而不是一个身份
+    u8 mac[UPDATE_MAC_LEN] = {};
+    if (esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to read factory MAC; reporting no identity");
+    }
+
+    u8 payload[2 * sizeof(u32) + UPDATE_VERSION_LEN + UPDATE_MAC_LEN] = {};
     BinSerializer out(payload, sizeof(payload));
     out.write_u32((partition != nullptr) ? partition->size : 0);
     out.write_u32(UPDATE_CHUNK_MAX);
     out.write_bytes(version, sizeof(version));
+    out.write_bytes(mac, sizeof(mac));
 
     respond(UpdateCommand::Info, UpdateStatus::Ok, seq, payload, sizeof(payload));
 }

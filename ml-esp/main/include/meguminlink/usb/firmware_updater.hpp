@@ -10,7 +10,7 @@
 
 namespace mlink
 {
-/** 升级协议帧头的魔数（"MO"）：更新模式 vendor bulk 通道上唯一的成帧标识 */
+/** 升级协议帧头的魔数（"MO"）：更新模式 CDC 串口上唯一的成帧标识 */
 inline constexpr u16 UPDATE_FRAME_MAGIC = 0x4D4F;
 
 /** 升级协议帧头长度：帧头 + 载荷 = 一帧 */
@@ -31,8 +31,12 @@ inline constexpr usize UPDATE_DIGEST_LEN = 32;
 /** 固件版本串长度（esp_app_desc_t::version 的字段宽度） */
 inline constexpr usize UPDATE_VERSION_LEN = 32;
 
-/** 响应帧最大字节数：Info 响应 = 槽位大小 + 分块上限 + 版本串 */
-inline constexpr usize UPDATE_RESPONSE_MAX = UPDATE_FRAME_HEADER_LEN + 2 * sizeof(u32) + UPDATE_VERSION_LEN;
+/** Info 响应尾部的设备 MAC 长度：与 USB 串号同源 */
+inline constexpr usize UPDATE_MAC_LEN = 6;
+
+/** 响应帧最大字节数：Info 响应 = 槽位大小 + 分块上限 + 版本串 + 设备 MAC */
+inline constexpr usize UPDATE_RESPONSE_MAX =
+    UPDATE_FRAME_HEADER_LEN + 2 * sizeof(u32) + UPDATE_VERSION_LEN + UPDATE_MAC_LEN;
 
 /** 传输空闲多久没有数据即放弃本次会话（主机掉线/卡死时不把半成品状态一直挂着） */
 inline constexpr u32 UPDATE_SESSION_TIMEOUT_MS = 10000;
@@ -69,7 +73,7 @@ enum class UpdateStatus : u8
 };
 
 /**
- * 更新模式 vendor bulk 通道上的固件升级接收端（协议见 firmware_updater.cc 顶部）。
+ * 更新模式 CDC 串口上的固件升级接收端（协议见 firmware_updater.cc 顶部）。
  *
  * 一个会话把主机推来的 app 镜像写进空闲 OTA 槽：Begin 申报大小与整镜像 SHA-256，
  * Data 分块写入并同步累计摘要，Finish 先比摘要、再由 esp_ota_end 读回 flash 校验

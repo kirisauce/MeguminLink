@@ -12,7 +12,7 @@ void app_main()
 {
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     // 更新模式请求优先于一切初始化（进入请求在本调用里读出并清除）：该分支不
-    // 初始化 NVS、无线、串口桥与 Application，只安装一个 vendor 接口的 USB
+    // 初始化 NVS、无线、串口桥与 Application，只安装一个 CDC 串口的 USB
     // 并显示渐变灯效。见 meguminlink/usb/update_mode.hpp。
     if (mlink::update_mode::consume_request())
     {
