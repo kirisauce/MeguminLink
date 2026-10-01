@@ -135,13 +135,13 @@ void UpdateMode::run()
 
     while (true)
     {
-        // 有帧立刻醒（写 flash 期间灯效由驱动自己的定时器继续刷），没帧就睡一个
-        // 节拍等超时检查，不做空转轮询
+        // 有帧立刻醒，没帧就睡一个节拍等超时检查，不做空转轮询。每轮都上报一次
+        // 场景：进度灯要跟着 Data 帧走，而主机停等的帧间隔短于这个节拍，等帧超时
+        // 那一刻不会到来，刷灯不能只挂在超时分支上。
         if (m_frame_queue != nullptr &&
             xQueueReceive(m_frame_queue, m_frame_buf, pdMS_TO_TICKS(IDLE_POLL_MS)) == pdTRUE)
         {
             handle_frame(m_frame_buf);
-            continue;
         }
 
         apply_led(led_scene());

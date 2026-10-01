@@ -42,10 +42,12 @@ constexpr LedColor VERIFY_COLOR{255, 192, 0}; // 校验镜像：琥珀色
 constexpr LedColor DONE_COLOR{0, 255, 0};     // 升级成功：绿色闪烁
 constexpr LedColor FAILED_COLOR{255, 0, 0};   // 升级失败：红色闪烁
 
-// 接收进度配色：绿灯分量跟着进度从 64 涨到 255（蓝→青），一眼看出还剩多少
-constexpr u8 RECEIVE_GREEN_FROM = 64;
-constexpr u8 RECEIVE_GREEN_TO = 255;
-constexpr u8 RECEIVE_BLUE = 255;
+// 接收进度配色：橙色 → 绿色（终点与成功灯同色相，切到完成态时不跳色），
+// 亮度同时随进度爬起来，进得越多越亮
+constexpr LedColor RECEIVE_FROM{255, 128, 0};
+constexpr LedColor RECEIVE_TO{0, 255, 0};
+constexpr u8 RECEIVE_BRIGHTNESS_FROM = 20;
+constexpr u8 RECEIVE_BRIGHTNESS_TO = 100;
 
 // 空闲渐变调色板：红 → 橙 → 粉（末段由粉插值回红）
 constexpr LedColor PALETTE[] = {
@@ -76,6 +78,20 @@ LedColor scale(const LedColor &color, f32 alpha)
     return LedColor{static_cast<u8>(static_cast<f32>(color.r) * alpha),
                     static_cast<u8>(static_cast<f32>(color.g) * alpha),
                     static_cast<u8>(static_cast<f32>(color.b) * alpha)};
+}
+
+/** 逐分量线性插值：step ∈ [0, span)，色相沿着 from→to 走 */
+LedColor lerp_color(const LedColor &from, const LedColor &to, u32 step, u32 span)
+{
+    return LedColor{lerp(from.r, to.r, step, span), lerp(from.g, to.g, step, span), lerp(from.b, to.b, step, span)};
+}
+
+/** 颜色按百分比（0-100）缩放，用于进度亮度 */
+LedColor scale_percent(const LedColor &color, u32 percent)
+{
+    return LedColor{static_cast<u8>(static_cast<u32>(color.r) * percent / 100),
+                    static_cast<u8>(static_cast<u32>(color.g) * percent / 100),
+                    static_cast<u8>(static_cast<u32>(color.b) * percent / 100)};
 }
 
 /** 闪烁当前应处于亮半周期还是暗半周期 */
@@ -265,9 +281,13 @@ void Ws2812LedDriver::frame_color(u8 &r, u8 &g, u8 &b)
     case LedScene::UpdateIdle:
         color = gradient_color(phase);
         break;
-    case LedScene::UpdateReceiving:
-        color = LedColor{0, lerp(RECEIVE_GREEN_FROM, RECEIVE_GREEN_TO, progress, 100), RECEIVE_BLUE};
+    case LedScene::UpdateReceiving: {
+        // 色相沿 橙 → 绿 走，亮度同时从暗爬到满亮：到 100% 就是满亮绿，
+        // 与成功灯的绿闪同一色相，切过去不跳色
+        const LedColor hue = lerp_color(RECEIVE_FROM, RECEIVE_TO, progress, 100);
+        color = scale_percent(hue, lerp(RECEIVE_BRIGHTNESS_FROM, RECEIVE_BRIGHTNESS_TO, progress, 100));
         break;
+    }
     case LedScene::UpdateVerifying:
         color = VERIFY_COLOR;
         break;
