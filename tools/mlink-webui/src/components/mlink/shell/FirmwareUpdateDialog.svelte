@@ -20,6 +20,11 @@
 	 */
 	type Stage = 'idle' | 'checking' | 'entering' | 'waiting' | 'port' | 'flashing' | 'done' | 'failed';
 
+	/** 挂起期间顶栏与提示条上写的那句话 */
+	const SUSPEND_MESSAGE = '正在烧录固件，设备会重启一次~';
+	/** 等设备回到正常模式、读回版本号的上限 */
+	const VERSION_WAIT_MS = 20000;
+
 	const PHASE_TEXT: Readonly<Record<FlashPhase, string>> = {
 		info: '读取设备信息',
 		erase: '设备正在擦除目标槽',
@@ -40,6 +45,10 @@
 	let percent = $state<number | null>(null);
 	let rate = $state<number | null>(null);
 	let elapsed = $state<number | null>(null);
+	/** 烧录后设备报回来的版本核对结果；null = 还在等它回来 */
+	let reboot = $state<{ tone: 'ok' | 'warn'; text: string } | null>(null);
+	/** 本次流程的令牌：关掉窗口再打开、或重新开始时它会变，晚到的异步结果据此丢弃 */
+	let attempt = 0;
 
 	let panel = $state<HTMLElement | null>(null);
 	/** 写入阶段的起点：擦除耗时不该算进速率。 */
@@ -74,6 +83,8 @@
 
 	/** 清掉上一次的进度；选好的文件留着（连续刷两次同一份是常见动作）。 */
 	function resetProgress(): void {
+		attempt += 1;
+		reboot = null;
 		stage = 'idle';
 		detail = '';
 		error = null;
@@ -153,6 +164,9 @@
 			await flashThroughPort();
 		} catch (cause) {
 			fail(cause);
+		} finally {
+			// 任何一条失败路径都要把设备交回会话，否则页面会一直挂在「烧录中」
+			session.resume();
 		}
 	}
 
@@ -180,6 +194,7 @@
 	async function ensureUpdateMode(): Promise<void> {
 		if (session.device === null) {
 			startedWith = null;
+			session.suspend(SUSPEND_MESSAGE);
 			return;
 		}
 
@@ -189,6 +204,8 @@
 		if (session.commandError !== null) {
 			throw new Error(`设备没有接受进入更新模式：${session.commandError}`);
 		}
+		// 后面这段设备对 vendor 请求只有 STALL：让会话停手，别把它当成故障反复重试
+		session.suspend(SUSPEND_MESSAGE);
 
 		stage = 'waiting';
 		detail = '等设备以更新模式重新枚举';
@@ -251,9 +268,53 @@
 			elapsed = (Date.now() - startedAt) / 1000;
 			written = result.bytes;
 			percent = 100;
+
+			// 镜像已经写完、分区也切了：把设备交回会话，等它回来核一次版本
+			session.resume();
+			const token = attempt;
+			const reported = await waitForFirmwareVersion(VERSION_WAIT_MS);
+			if (token !== attempt) return;
+			reboot = describeVersion(image.version, reported);
 		} finally {
 			await port.close();
 		}
+	}
+
+	function delay(ms: number): Promise<void> {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	/** 等设备回到正常模式并读到固件版本；超时返回 null。 */
+	async function waitForFirmwareVersion(timeoutMs: number): Promise<string | null> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (session.state === 'streaming') {
+				await session.refreshConfig();
+				const version = session.config?.fwVersion ?? '';
+				if (version !== '') return version;
+			}
+			await delay(400);
+		}
+		return null;
+	}
+
+	/**
+	 * 把设备报回来的版本跟镜像里写的那份对上。
+	 *
+	 * 对不上最可能的情况不是"刷错了"，而是新固件没起来、分区表的回滚确认把旧固件带
+	 * 回来了——所以这句要把它说出来，而不是只说版本不一样。
+	 */
+	function describeVersion(expected: string, reported: string | null): { tone: 'ok' | 'warn'; text: string } {
+		if (reported === null) {
+			return { tone: 'warn', text: '没等到设备回到正常模式，看看设备上的灯是不是在正常跑~' };
+		}
+		if (reported === expected) {
+			return { tone: 'ok', text: `设备已回到正常模式，正在跑 ${reported}` };
+		}
+		return {
+			tone: 'warn',
+			text: `设备回来了，但报的版本是 ${reported}（镜像里写的是 ${expected}）—— 可能是新固件没起来、已经回滚到旧的了`,
+		};
 	}
 
 	function dismiss(): void {
@@ -394,7 +455,11 @@
 		<p class="error">{error}</p>
 	{/if}
 	{#if stage === 'done'}
-		<p class="ok">设备重启后页面会自动接回这台，等它回来就能看到新版本号了。</p>
+		{#if reboot === null}
+			<p class="hint">设备重启后页面会自动接回这台，等它回来会核一次版本。</p>
+		{:else}
+			<p class={reboot.tone === 'ok' ? 'ok' : 'warn'}>{reboot.text}</p>
+		{/if}
 	{/if}
 
 	<div class="buttons">

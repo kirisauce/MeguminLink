@@ -174,6 +174,8 @@ export class MlinkSession {
 	#seq = 0;
 	#listenersBound = false;
 	#destroyed = false;
+	/** 烧录这类独占设备的过程期间为 true：轮询、重试、归因全部让路（见 suspend） */
+	#suspended = false;
 	/** 连续失败次数：决定退避节奏，任何一次成功都归零。 */
 	#attempt = 0;
 	/**
@@ -693,11 +695,43 @@ export class MlinkSession {
 	/**
 	 * 让设备软复位进更新模式（随后由烧录流程接管串口）。
 	 *
-	 * 只发命令：设备重启后这段 WebUSB 会话会失去目标并自行进入等待态，页面不做
-	 * 额外处理——烧录过程中它与串口各走各的通道，互不占用。
+	 * 发完命令由调用方 suspend()：设备一进更新模式，vendor 请求就只剩 STALL，
+	 * 让轮询继续跑只会刷出一串假故障。
 	 */
 	async enterUpdateMode(): Promise<void> {
 		await this.#sendCommand(CMD_ENTER_UPDATE);
+	}
+
+	/**
+	 * 挂起：把设备让给调用方独占（网页烧录）。
+	 *
+	 * 更新模式对 vendor 请求一律 STALL，轮询与重试会把它当成故障反复刷错误提示；
+	 * 而且设备接下来要重新枚举，旧句柄必然作废。挂起期间本对象不碰设备，只把状态
+	 * 停在等待态、提示条写上一句人话，恢复后照常按序列号接回来。
+	 */
+	suspend(message: string): void {
+		if (this.#suspended) return;
+		this.#suspended = true;
+		this.#generation++;
+		this.#cancel();
+		this.#reenumerating = false;
+		this.device = null;
+		this.stats = null;
+		this.rates = null;
+		this.config = null;
+		this.commandError = null;
+		this.#attempt = 0;
+		this.error = message;
+		if (this.state !== 'unsupported') this.state = 'waiting';
+	}
+
+	/** 恢复：立刻试一次接回；设备还没回来的话照常按退避重试。 */
+	resume(): void {
+		if (!this.#suspended) return;
+		this.#suspended = false;
+		this.#attempt = 0;
+		if (this.#destroyed || this.currentKey === null) return;
+		void this.#retry();
 	}
 
 	/**
@@ -793,7 +827,7 @@ export class MlinkSession {
 	}
 
 	#schedule(delay = this.intervalMs): void {
-		if (this.#timer !== null || this.#destroyed) return;
+		if (this.#timer !== null || this.#destroyed || this.#suspended) return;
 		this.#timer = setTimeout(() => {
 			this.#timer = null;
 			void this.#poll();
@@ -802,7 +836,7 @@ export class MlinkSession {
 
 	async #poll(): Promise<void> {
 		const device = this.device;
-		if (device === null) return;
+		if (device === null || this.#suspended) return;
 		const generation = this.#generation;
 		try {
 			const stats = await readStats(device, this.#seq);
@@ -919,6 +953,8 @@ export class MlinkSession {
 	 * 因此重新枚举后的新对象也能接上。
 	 */
 	#recover(error: unknown, phase: FailurePhase): void {
+		// 挂起期间的失败是调用方自己的事（例如更新模式的 STALL），页面不许插手
+		if (this.#suspended) return;
 		const plan = planRecovery({
 			phase,
 			errorName: error instanceof DOMException ? error.name : null,
@@ -954,7 +990,7 @@ export class MlinkSession {
 	}
 
 	#scheduleRetry(delay: number): void {
-		if (this.#retryTimer !== null || this.#destroyed) return;
+		if (this.#retryTimer !== null || this.#destroyed || this.#suspended) return;
 		this.#retryTimer = setTimeout(() => {
 			this.#retryTimer = null;
 			void this.#retry();
@@ -963,7 +999,7 @@ export class MlinkSession {
 
 	/** 退避到点后重试：句柄还在就原地重开，句柄没了就按序列号重新解析。 */
 	async #retry(): Promise<void> {
-		if (this.#destroyed) return;
+		if (this.#destroyed || this.#suspended) return;
 		const key = this.currentKey;
 		if (key === null) return;
 
@@ -1043,6 +1079,7 @@ export class MlinkSession {
 
 	/** 本会话的设备被拔掉：松开句柄、清空面板，按身份继续找它。 */
 	#onDeviceGone(device: USBDevice): void {
+		if (this.#suspended) return;
 		// 按身份字段比对，而不是对象同一性：$state 会把设备对象包成 Proxy，事件里带的
 		// 原始对象与状态里读到的不可能是同一个引用
 		if (this.device === null || deviceKey(device) !== this.currentKey) return;
