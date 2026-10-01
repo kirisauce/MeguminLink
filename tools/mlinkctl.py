@@ -60,6 +60,7 @@ VID = 0x303A
 PID = 0x4020
 
 VENDOR_CODE = 0x4D
+SERIAL_HELP = "目标设备的序列号（多台在线时用它指定；默认要求只有一台）"
 CMD_GET_STATS = 0x01
 CMD_GET_CONFIG = 0x02
 CMD_SET_LINK_CONFIG = 0x1B
@@ -288,14 +289,47 @@ def die(message):
     sys.exit(1)
 
 
-def find_device():
-    devices = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+def list_devices():
+    """当前在线的 MeguminLink 设备（正常模式与更新模式共用同一 VID:PID）。"""
+    return list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+
+
+def device_serial(dev):
+    """设备身份：USB iSerialNumber。固件两个模式报的都是芯片 factory MAC，前后一致。"""
+    try:
+        return str(dev.serial_number)
+    except (usb.core.USBError, ValueError):
+        return None  # 描述符还没读全：这台设备无法参与身份匹配
+
+
+def find_device(serial=None):
+    """挑出目标设备：serial 给定时必须在线，不给则要求只有一台。
+
+    只回答"是哪台"，不回答"它现在处于哪个模式"——正常模式与更新模式的 VID:PID
+    相同，模式判定交给调用方（见 enter_update_mode）。
+    """
+    devices = list_devices()
     if not devices:
         die(f"no MeguminLink device ({VID:04x}:{PID:04x}) found")
+
+    online = ", ".join(filter(None, (device_serial(dev) for dev in devices)))
+    if serial is not None:
+        for dev in devices:
+            if device_serial(dev) == serial:
+                return dev
+        die(f"没有序列号为 {serial} 的设备（在线：{online or '无'}）")
+
     if len(devices) > 1:
-        serials = ", ".join(str(dev.serial_number) for dev in devices)
-        die(f"{len(devices)} MeguminLink devices found ({serials}), connect only one")
+        die(f"发现 {len(devices)} 台设备（{online}），用 --serial 指定目标")
     return devices[0]
+
+
+def target_serial(args):
+    """本次操作的目标设备序列号：--serial 给了就用它，否则要求只有一台在线。"""
+    mac = device_serial(find_device(args.serial))
+    if mac is None:
+        die("读不到设备序列号（USB 描述符未就绪）")
+    return mac
 
 
 def fetch(dev, cmd, arg=0):
@@ -526,20 +560,20 @@ def check_device_name(name):
 
 
 def cmd_read_stats(_args):
-    print(render_stats(decode(fetch(find_device(), CMD_GET_STATS))))
+    print(render_stats(decode(fetch(find_device(args.serial), CMD_GET_STATS))))
 
 
 def cmd_read_config(_args):
-    print(render_config(decode(fetch(find_device(), CMD_GET_CONFIG))))
+    print(render_config(decode(fetch(find_device(args.serial), CMD_GET_CONFIG))))
 
 
 def cmd_read_usb(_args):
-    print(render_usb(decode(fetch(find_device(), CMD_GET_USB_CONFIG))))
+    print(render_usb(decode(fetch(find_device(args.serial), CMD_GET_USB_CONFIG))))
 
 
 def cmd_arq(_args):
     """可靠传输的聚焦视图：状态、RTO 估计与全部计数各一行，便于盯链路质量。"""
-    dev = find_device()
+    dev = find_device(args.serial)
     stats = decode(fetch(dev, CMD_GET_STATS))
     config = decode(fetch(dev, CMD_GET_CONFIG))
 
@@ -616,7 +650,7 @@ def cmd_set_link(args):
     if not payload:
         die("至少要指定一个参数（--window / --rto-min / --max-retx / …）")
 
-    dev = find_device()
+    dev = find_device(args.serial)
     generation = u32_of(decode(fetch(dev, CMD_GET_CONFIG)), TAG_ARQ_GENERATION)
 
     try:
@@ -652,7 +686,7 @@ def cmd_set_usb(args):
     ):
         die("至少要指定 --webusb / --winusb / --hid-compat / --landing-page / --name 之一")
 
-    dev = find_device()
+    dev = find_device(args.serial)
     current = decode(fetch(dev, CMD_GET_USB_CONFIG))
 
     webusb = u8_of(current, TAG_USB_WEBUSB)
@@ -706,7 +740,7 @@ def cmd_set_usb(args):
 
 
 def cmd_set_mode(args):
-    decode(fetch(find_device(), CMD_SET_MODE, MODE_ARG[args.mode]))
+    decode(fetch(find_device(args.serial), CMD_SET_MODE, MODE_ARG[args.mode]))
     print("status=ok")
 
 
@@ -731,7 +765,7 @@ def cmd_set_rate(args):
 
     # 设备端应用到本地单播 peer，并把同一条控制请求转发给对端：两端跑同一档位，
     # 上行与下行的丢包率才可比。转发是尽力而为的，对端没跟上时重发一次即可。
-    decode(fetch(find_device(), CMD_SET_WIFI_RATE, value))
+    decode(fetch(find_device(args.serial), CMD_SET_WIFI_RATE, value))
     print(f"status=ok rate={WIFI_RATE_NAMES.get(value, 'unknown')}(0x{value:02x})")
     print("mlinkctl: 档位已下发本机并转发对端（对端未跟随时重发一次）", file=sys.stderr)
 
@@ -754,48 +788,49 @@ def cmd_set_loss(args):
     # 设备端按千分比存放，并把同一条控制请求转发给对端：注入只在发送端生效，
     # 两端必须各自持有同一个值，否则只有单方向的帧会被丢。转发是尽力而为的，
     # 对端没跟上时重发一次即可。
-    decode(fetch(find_device(), CMD_SET_LOSS, permille))
+    decode(fetch(find_device(args.serial), CMD_SET_LOSS, permille))
     print(f"status=ok loss={percent:.1f}%")
     print("mlinkctl: 已下发本机并转发对端；两端固件都需编译该功能（见 Kconfig 的 Wireless 菜单）", file=sys.stderr)
 
 
 def cmd_action(args):
-    decode(fetch(find_device(), args.cmd_code))
+    decode(fetch(find_device(args.serial), args.cmd_code))
     print("status=ok")
     if args.command in REBOOTING:
         print("mlinkctl: 设备正在重启，稍后需重新枚举", file=sys.stderr)
 
 
-def find_update_port(timeout_s):
-    """等更新模式的 CDC 串口出现：设备名里带更新模式专有的产品名，据此认端口。
+def find_update_port(mac, timeout_s):
+    """等这台设备的更新模式 CDC 串口出现。
 
-    返回 None 表示超时（timeout_s 为 0 时只查一次）。
+    端口名要同时带更新模式产品名与这台设备的序列号才算数：同机插多台时不会拿错，
+    别的设备处于更新模式也不会被当成目标。返回 None 表示超时（timeout_s 为 0 时只查一次）。
     """
     deadline = time.monotonic() + timeout_s
     while True:
         for path in sorted(glob.glob("/dev/serial/by-id/*")):
-            if UPDATE_PORT_MATCH in path:
+            if UPDATE_PORT_MATCH in path and mac in path:
                 return path
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.2)
 
 
-def enter_update_mode():
-    """返回更新模式 CDC 串口的设备路径：已在更新模式就直接用，否则软复位后等串口出现。
+def enter_update_mode(mac):
+    """返回该设备更新模式 CDC 串口的设备路径：已在更新模式就直接用，否则软复位后等它出现。
 
     进更新模式这一步只能走配置通道（正常模式 vendor 接口上的 EP0 厂商请求），仍然
     需要那个设备节点的访问权限；升级数据本身走 CDC，不再需要。
     """
-    port = find_update_port(0.0)
+    port = find_update_port(mac, 0.0)
     if port is not None:
         return port
 
-    decode(fetch(find_device(), CMD_ENTER_UPDATE))
+    decode(fetch(find_device(mac), CMD_ENTER_UPDATE))
     print("mlinkctl: 设备正在软复位进更新模式", file=sys.stderr)
-    port = find_update_port(UPDATE_ENTER_TIMEOUT_S)
+    port = find_update_port(mac, UPDATE_ENTER_TIMEOUT_S)
     if port is None:
-        die(f"等待 {UPDATE_ENTER_TIMEOUT_S:.0f}s 未见更新模式的 CDC 串口（设备名含 {UPDATE_PORT_MATCH}）")
+        die(f"等待 {UPDATE_ENTER_TIMEOUT_S:.0f}s 未见 {mac} 的更新模式 CDC 串口")
     return port
 
 
@@ -830,11 +865,11 @@ def update_request(port, frame_type, seq, payload=b"", timeout_s=UPDATE_TIMEOUT_
     return resp_payload
 
 
-def wait_for_running_device(timeout_s):
-    """等设备复位回正常模式并能应答配置通道：读到配置快照才算真的回来了。"""
+def wait_for_running_device(mac, timeout_s):
+    """等这台设备复位回正常模式并能应答配置通道：读到配置快照才算真的回来了。"""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        dev = next((candidate for candidate in list_devices() if device_serial(candidate) == mac), None)
         if dev is not None:
             try:
                 raw = dev.ctrl_transfer(0xC0, VENDOR_CODE, CMD_GET_CONFIG, 0, MAX_RESPONSE, TIMEOUT_MS)
@@ -855,7 +890,8 @@ def cmd_flash(args):
         die(f"{args.firmware} 是空文件")
     digest = hashlib.sha256(image).digest()
 
-    port_path = enter_update_mode()
+    mac = target_serial(args)
+    port_path = enter_update_mode(mac)
     port = serial.Serial(port_path, UPDATE_BAUD, timeout=UPDATE_TIMEOUT_S)
     try:
         info = update_request(port, CMD_UPDATE_INFO, 1, timeout_s=args.timeout / 1000)
@@ -870,7 +906,7 @@ def cmd_flash(args):
         if chunk <= 0:
             die(f"分块大小非法：{chunk}")
         print(
-            f"mlinkctl: 设备当前固件 {version}，经 {port_path} 写入 {len(image)} 字节（分块 {chunk}）",
+            f"mlinkctl: 目标 {mac}，设备当前固件 {version}，经 {port_path} 写入 {len(image)} 字节（分块 {chunk}）",
             file=sys.stderr,
         )
 
@@ -913,7 +949,7 @@ def cmd_flash(args):
     )
     print("mlinkctl: 镜像已校验、启动分区已切换，设备正在复位进新固件", file=sys.stderr)
 
-    values = wait_for_running_device(UPDATE_RETURN_TIMEOUT_S)
+    values = wait_for_running_device(mac, UPDATE_RETURN_TIMEOUT_S)
     if values is None:
         print(f"mlinkctl: 等待 {UPDATE_RETURN_TIMEOUT_S:.0f}s 未见设备回到正常模式，请查设备日志", file=sys.stderr)
         return
@@ -953,7 +989,7 @@ def cmd_ping(args):
     if args.count < 1:
         die("探测次数至少为 1")
 
-    dev = find_device()
+    dev = find_device(args.serial)
     rtt_ms = []
     for index in range(args.count):
         if index > 0:
@@ -983,6 +1019,7 @@ def build_parser():
         description="MeguminLink 配置通道探针：读统计/配置，或投递控制动作。",
         epilog="协议见 ml-esp/main/config_channel.cc 顶部；本文件与固件一一对应。",
     )
+    parser.add_argument("--serial", metavar="MAC", help=SERIAL_HELP)
     # 无子命令 = 读一次统计快照（历史行为，也是日常用得最多的那件事）
     parser.set_defaults(handler=cmd_read_stats)
 
@@ -1067,6 +1104,10 @@ def build_parser():
 
     for name, (code, help_text) in ACTIONS.items():
         subparsers.add_parser(name, help=help_text).set_defaults(handler=cmd_action, cmd_code=code)
+
+    # 目标选择写在子命令后面也认：mlinkctl flash fw.bin --serial <MAC>
+    for sub in subparsers.choices.values():
+        sub.add_argument("--serial", metavar="MAC", help=SERIAL_HELP)
 
     return parser
 
