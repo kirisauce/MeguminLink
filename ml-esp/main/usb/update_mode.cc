@@ -1,12 +1,16 @@
 #include "meguminlink/usb/update_mode.hpp"
 
 #include "meguminlink/app.hpp"
+#include "meguminlink/binfmt.hpp"
 #include "meguminlink/usb/usb_descriptors.hpp"
 
 #include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <tinyusb.h>
+#include <tinyusb_cdc_acm.h>
 #include <tinyusb_default_config.h>
 
 #include <freertos/FreeRTOS.h>
@@ -80,8 +84,8 @@ u8 lerp(u8 from, u8 to, u32 step, u32 span)
     return static_cast<u8>(static_cast<i32>(from) + delta * static_cast<i32>(step) / static_cast<i32>(span));
 }
 
-/** 第 phase 帧的灯效目标：调色板线性插值循环（调色板三段都在红色通道拉满） */
-Ws2812LedTarget led_target(u32 phase)
+/** 第 phase 帧的渐变目标色：调色板线性插值循环（调色板三段都在红色通道拉满） */
+Ws2812LedTarget gradient_target(u32 phase)
 {
     const u32 position = phase % LED_CYCLE_FRAMES;
     const u32 segment = position / SEGMENT_FRAMES;
@@ -93,6 +97,11 @@ Ws2812LedTarget led_target(u32 phase)
                            lerp(from[2], to[2], step, SEGMENT_FRAMES), Ws2812LedEffect::On};
 }
 #endif
+
+// ---- 时序 ----
+
+/** 校验通过、启动分区已切换后，留给主机读走最后一条响应再复位的时间 */
+constexpr u32 REBOOT_DELAY_MS = 1000;
 
 /** UpdateMode 单例访问点：TinyUSB 回调借它判断是否处于更新模式 */
 UpdateMode *&instance_slot()
@@ -133,12 +142,19 @@ UpdateMode *UpdateMode::try_instance()
 
 void UpdateMode::run()
 {
-    ESP_LOGI(TAG, "Update mode: one vendor interface, LED gradient (hard reset to leave)");
+    ESP_LOGI(TAG, "Update mode: firmware update channel on one vendor interface");
 
     // 能进入本模式说明这一版固件至少跑得起 USB：确认它可用，取消引导程序的
     // 下一次回滚（见 meguminlink/app.hpp）。回滚确认必须早于任何 esp_ota_begin：
     // 待校验状态下的镜像会被它直接拒绝。
     ota_confirm_running_app();
+
+    // 帧队列在 USB 之前建好：RX 回调随时可能投帧
+    m_frame_queue = xQueueCreate(UPDATE_FRAME_QUEUE_DEPTH, UPDATE_FRAME_MAX);
+    if (m_frame_queue == nullptr)
+    {
+        ESP_LOGE(TAG, "Frame queue allocation failed, firmware update unavailable");
+    }
 
     // USB 不可用不阻塞模式进入：灯效照常跑，原因看日志
     const esp_err_t usb_ret = init_usb();
@@ -155,12 +171,29 @@ void UpdateMode::run()
     }
 #endif
 
-    u32 phase = 0;
+    m_led_epoch_us = esp_timer_get_time();
+    i64 next_led_us = m_led_epoch_us;
+
     while (true)
     {
-        apply_led_frame(phase);
-        phase += 1;
-        vTaskDelay(pdMS_TO_TICKS(LED_FRAME_MS));
+        // 等帧的时长刚好是到下一帧灯效的时刻：有帧立刻醒（写 flash 的间隙也持续
+        // 刷灯），没帧就睡到该刷灯的时候，不做空转轮询
+        i64 wait_us = next_led_us - esp_timer_get_time();
+        if (wait_us < 0)
+        {
+            wait_us = 0;
+        }
+        const u32 wait_ms = static_cast<u32>((wait_us + 999) / 1000);
+
+        if (m_frame_queue != nullptr && xQueueReceive(m_frame_queue, m_frame_buf, pdMS_TO_TICKS(wait_ms)) == pdTRUE)
+        {
+            handle_frame(m_frame_buf);
+            continue;
+        }
+
+        apply_led_frame();
+        m_updater.poll();
+        next_led_us = esp_timer_get_time() + LED_FRAME_MS * 1000;
     }
 }
 
@@ -168,7 +201,7 @@ bool UpdateMode::usb_control(u8 rhport, u8 stage, const tusb_control_request_t *
 {
     (void)rhport;
     (void)stage;
-    // 维护通道本轮没有厂商协议：不接管该请求，由协议栈对 EP0 发 STALL
+    // 升级协议走 bulk 端点，EP0 上没有厂商协议：不接管该请求，由协议栈对 EP0 发 STALL
     ESP_LOGD(TAG, "Vendor control 0x%02X ignored in update mode", request->bRequest);
     return false;
 }
@@ -179,23 +212,193 @@ const u8 *UpdateMode::usb_bos()
     return nullptr;
 }
 
-void UpdateMode::usb_rx(u8 idx)
+void UpdateMode::cdc_rx_callback(int itf, [[maybe_unused]] cdcacm_event_t *event)
 {
-    // FIFO 模式（CFG_TUD_VENDOR_TXRX_BUFFERED=1）：回调不携带数据，必须读空内部
-    // FIFO，否则主机后续写入会被流控挡住。本轮没有协议，读掉的数据只记字节数，
-    // 便于确认主机侧写入确实到达。
-    u8 tmp[64];
-    u32 total = 0;
-    u32 n = 0;
-    while ((n = tud_vendor_n_read(idx, tmp, sizeof(tmp))) > 0)
+    if (itf != TINYUSB_CDC_ACM_0)
     {
-        total += n;
+        return;
     }
-    if (total > 0)
+    // 本回调只在本模式下注册，那时实例必然已构造
+    if (auto *mode = try_instance())
     {
-        ESP_LOGD(TAG, "Update-mode bulk RX: %u bytes discarded", static_cast<unsigned>(total));
+        mode->on_cdc_rx();
     }
 }
+
+void UpdateMode::on_cdc_rx()
+{
+    // 回调不携带数据：必须读空内部 FIFO，否则主机后续写入会被流控挡住。切片成帧
+    // 在本任务里做，写 flash 只由主循环做（flash 操作会阻塞任务，不能压在 USB 任务上）。
+    for (;;)
+    {
+        u8 chunk[256];
+        size_t rx_size = 0;
+        const esp_err_t ret = tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, chunk, sizeof(chunk), &rx_size);
+        if (ret != ESP_OK || rx_size == 0)
+        {
+            return;
+        }
+        feed_rx(chunk, rx_size);
+    }
+}
+
+void UpdateMode::feed_rx(const u8 *data, usize len)
+{
+    while (len > 0)
+    {
+        const usize space = sizeof(m_rx_buf) - m_rx_len;
+        const usize take = (len < space) ? len : space;
+        if (take == 0)
+        {
+            // 缓冲已满且切不出帧（声明长度非法）：丢一字节腾地方，避免卡死
+            drop_rx(1);
+            continue;
+        }
+        std::memcpy(m_rx_buf + m_rx_len, data, take);
+        m_rx_len += take;
+        data += take;
+        len -= take;
+
+        // 反复从缓冲开头切帧：收齐一条就投一条，收不齐就留着等后续 USB 包
+        for (;;)
+        {
+            if (m_rx_len < UPDATE_FRAME_HEADER_LEN)
+            {
+                break;
+            }
+
+            BinDeserializer in(m_rx_buf, m_rx_len);
+            if (in.read_u16() != UPDATE_FRAME_MAGIC)
+            {
+                drop_rx(1); // 残包或噪声：丢一字节重新找魔数
+                continue;
+            }
+
+            in.read_u8();
+            in.read_u8();
+            const usize frame_len = UPDATE_FRAME_HEADER_LEN + in.read_u16();
+            if (frame_len > sizeof(m_rx_buf))
+            {
+                // 这个"帧头"声明的长度超过单帧上限：不是真帧头，继续重同步
+                drop_rx(1);
+                continue;
+            }
+            if (m_rx_len < frame_len)
+            {
+                if (m_rx_len == sizeof(m_rx_buf))
+                {
+                    drop_rx(1); // 缓冲满了都凑不齐：这段字节里没有合法帧
+                    continue;
+                }
+                break; // 还没收齐
+            }
+
+            if (m_frame_queue == nullptr || xQueueSend(m_frame_queue, m_rx_buf, 0) != pdTRUE)
+            {
+                // 队列满说明主机没守停等：丢弃本条，它等不到响应会自行重试
+                ESP_LOGW(TAG, "Frame queue full, %u-byte frame dropped", static_cast<unsigned>(frame_len));
+            }
+            drop_rx(frame_len);
+        }
+    }
+}
+
+void UpdateMode::drop_rx(usize n)
+{
+    if (n >= m_rx_len)
+    {
+        m_rx_len = 0;
+        return;
+    }
+    std::memmove(m_rx_buf, m_rx_buf + n, m_rx_len - n);
+    m_rx_len -= n;
+}
+
+void UpdateMode::handle_frame(const u8 *frame)
+{
+    const u8 type = frame[2];
+    const usize length = UPDATE_FRAME_HEADER_LEN + (static_cast<usize>(frame[4]) << 8) + frame[5];
+
+#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
+    // Finish 要读回整个分区校验，主任务会在这几百毫秒里阻塞、循环刷不了灯：
+    // 先钉住"正在校验"的颜色，让现场一眼看出设备没有卡死
+    if (type == static_cast<u8>(UpdateCommand::Finish))
+    {
+        m_led.apply(Ws2812LedTarget{255, 192, 0, Ws2812LedEffect::On});
+    }
+#endif
+
+    m_updater.handle(frame, length);
+    send_response();
+
+    if (m_updater.phase() == FirmwareUpdater::Phase::Done)
+    {
+        // 校验通过、启动分区已切换：先给成功色，留出主机读走最后一条响应的
+        // 余量，然后进新固件
+        apply_led_frame();
+        vTaskDelay(pdMS_TO_TICKS(REBOOT_DELAY_MS));
+        ESP_LOGI(TAG, "Restarting into the new firmware");
+        esp_restart();
+    }
+}
+
+void UpdateMode::send_response()
+{
+    const u8 *data = m_updater.response();
+    const usize len = m_updater.response_length();
+    if (len == 0 || !m_usb_installed)
+    {
+        return;
+    }
+
+    // 写队列同步拷贝进 CDC TX FIFO：响应只有几十字节，远小于 FIFO，停等协议下主机
+    // 总会及时取走，因此不等 TX 完成
+    const size_t queued = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data, len);
+    if (queued < len)
+    {
+        ESP_LOGW(TAG, "CDC TX queue full, dropped %u of %u bytes", static_cast<unsigned>(len - queued),
+                 static_cast<unsigned>(len));
+        return;
+    }
+    // 写入字节数 < 端点包长时不会自动发起 IN 传输，必须显式 flush
+    const esp_err_t ret = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "CDC flush failed: %s", esp_err_to_name(ret));
+    }
+}
+
+void UpdateMode::apply_led_frame()
+{
+#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
+    m_led.apply(led_target());
+#endif
+}
+
+#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
+Ws2812LedTarget UpdateMode::led_target()
+{
+    switch (m_updater.phase())
+    {
+    case FirmwareUpdater::Phase::Receiving: {
+        // 蓝 → 青：绿灯分量跟着进度走，一眼看出还剩多少
+        const u8 progress = m_updater.progress_percent();
+        return Ws2812LedTarget{0, lerp(64, 255, progress, 100), 255, Ws2812LedEffect::On};
+    }
+    case FirmwareUpdater::Phase::Done:
+        // 闪光而不是常亮：复位前只有 REBOOT_DELAY_MS 这一小段，闪烁更容易被看见
+        return Ws2812LedTarget{0, 255, 0, Ws2812LedEffect::Blink};
+    case FirmwareUpdater::Phase::Failed:
+        return Ws2812LedTarget{255, 0, 0, Ws2812LedEffect::Blink};
+    case FirmwareUpdater::Phase::Idle:
+    default: {
+        // 相位跟真实时间走：主循环忙于写 flash 时帧不会挤在一起，9s 一轮不漂
+        const i64 elapsed_us = esp_timer_get_time() - m_led_epoch_us;
+        return gradient_target(static_cast<u32>(elapsed_us / (LED_FRAME_MS * 1000)));
+    }
+    }
+}
+#endif
 
 esp_err_t UpdateMode::init_usb()
 {
@@ -231,7 +434,7 @@ esp_err_t UpdateMode::init_usb()
     m_device.iSerialNumber = static_cast<u8>(UpdateStringIndex::SerialNumber);
     m_device.bNumConfigurations = 0x01;
 
-    // 配置描述符 = 配置头 + 一个 vendor specific 接口（class 0xFF + 一对 bulk 端点），
+    // 配置描述符 = 配置头 + 一个 CDC 接口段（通信接口 + 数据接口），
     // bNumInterfaces 与 wTotalLength 收尾回填
     constexpr tusb_desc_configuration_t HEADER = {
         .bLength = TUD_CONFIG_DESC_LEN,
@@ -245,18 +448,18 @@ esp_err_t UpdateMode::init_usb()
     };
     static_assert(sizeof(HEADER) == TUD_CONFIG_DESC_LEN);
 
-    constexpr u8 VENDOR_INTERFACE[]{
-        TUD_VENDOR_DESCRIPTOR(0, static_cast<u8>(UpdateStringIndex::InterfaceName), UPDATE_EP_OUT, UPDATE_EP_IN, 64)};
-    static_assert(sizeof(HEADER) + sizeof(VENDOR_INTERFACE) <= UPDATE_CONFIG_DESCRIPTOR_LEN);
+    constexpr u8 CDC_INTERFACE[]{TUD_CDC_DESCRIPTOR(0, static_cast<u8>(UpdateStringIndex::InterfaceName),
+                                                    UPDATE_EP_CDC_NOTIF, 64, UPDATE_EP_CDC_OUT, UPDATE_EP_CDC_IN, 64)};
+    static_assert(sizeof(HEADER) + sizeof(CDC_INTERFACE) <= UPDATE_CONFIG_DESCRIPTOR_LEN);
 
     std::memcpy(m_config, &HEADER, sizeof(HEADER));
-    std::memcpy(m_config + sizeof(HEADER), VENDOR_INTERFACE, sizeof(VENDOR_INTERFACE));
-    const auto total_length = static_cast<u16>(sizeof(HEADER) + sizeof(VENDOR_INTERFACE));
+    std::memcpy(m_config + sizeof(HEADER), CDC_INTERFACE, sizeof(CDC_INTERFACE));
+    const auto total_length = static_cast<u16>(sizeof(HEADER) + sizeof(CDC_INTERFACE));
     // ESP 目标为小端，与 USB 描述符一致
     std::memcpy(m_config + offsetof(tusb_desc_configuration_t, wTotalLength), &total_length, sizeof(total_length));
-    m_config[offsetof(tusb_desc_configuration_t, bNumInterfaces)] = 1;
+    m_config[offsetof(tusb_desc_configuration_t, bNumInterfaces)] = UPDATE_INTERFACE_COUNT;
 
-    // 只安装 usb 描述符：不装 CDC、不建 DAP 任务（更新模式不做 CMSIS-DAP）
+    // 只装 CDC：不建 DAP 任务（更新模式不做 CMSIS-DAP），也没有 vendor/HID 接口
     tinyusb_config_t tinyusb_config = TINYUSB_DEFAULT_CONFIG(usb_event_callback);
     tinyusb_config.descriptor.device = &m_device;
     tinyusb_config.descriptor.string = m_string_table.data();
@@ -276,17 +479,17 @@ esp_err_t UpdateMode::init_usb()
         return ret;
     }
 
-    m_usb_installed = true;
-    ESP_LOGI(TAG, "Update-mode USB installed: VID:PID %04X:%04X, 1 vendor interface", USB_VID, USB_PID);
-    return ESP_OK;
-}
+    // CDC 收发回调必须在驱动安装之后注册：CDC 实例随驱动建立
+    tinyusb_config_cdcacm_t cdc_config = {};
+    cdc_config.callback_rx = cdc_rx_callback;
+    const esp_err_t cdc_ret = tinyusb_cdcacm_init(&cdc_config);
+    if (cdc_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "tinyusb_cdcacm_init failed: %s", esp_err_to_name(cdc_ret));
+        return cdc_ret;
+    }
 
-void UpdateMode::apply_led_frame(u32 phase)
-{
-#if CONFIG_MEGUMINLINK_LED_DRIVER_WS2812
-    // 逐帧下发静止色：渐变节奏由 run 的循环掌握，驱动只需最基础的 On 效果
-    m_led.apply(led_target(phase));
-#else
-    (void)phase;
-#endif
+    m_usb_installed = true;
+    ESP_LOGI(TAG, "Update-mode USB installed: VID:PID %04X:%04X, 1 CDC interface", USB_VID, USB_PID);
+    return ESP_OK;
 }

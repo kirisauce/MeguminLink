@@ -560,7 +560,13 @@ void dap_task(void *arg)
 
 void tud_vendor_tx_cb(u8 idx, u32 sent_bytes)
 {
-    (void)sent_bytes;
+    // 更新模式没有 vendor 接口（升级协议走 CDC）：回调不应到达；这里防的是万一
+    // 到达时落到 Application::get_instance() 上——那会在更新模式里构造 NVS/无线/串口桥
+    if (mlink::UpdateMode::try_instance() != nullptr)
+    {
+        return;
+    }
+
     if (idx == USB_DAP_INTERFACE)
     {
         s_vendor_tx_bytes = s_vendor_tx_bytes + sent_bytes;
@@ -572,12 +578,10 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
     (void)buffer;
     (void)buffer_size;
 
-    // 更新模式：唯一的 vendor 接口由 UpdateMode 接管（本轮只把 FIFO 读空），
-    // 分流必须发生在 Application 之前——更新模式没有构造 Application，取它
-    // 会连带初始化 NVS、无线与串口桥
-    if (auto *update = mlink::UpdateMode::try_instance())
+    // 更新模式没有 vendor 接口（升级协议走 CDC）：分流必须发生在 Application 之前，
+    // 更新模式没有构造 Application，取它会连带初始化 NVS、无线与串口桥
+    if (mlink::UpdateMode::try_instance() != nullptr)
     {
-        update->usb_rx(idx);
         return;
     }
 

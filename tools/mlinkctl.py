@@ -17,6 +17,7 @@
     mlinkctl reset               恢复出厂设置：清除配对、模式与 USB 能力记录后重启（cmd 0x13）
     mlinkctl reboot              重启设备（cmd 0x14）
     mlinkctl update             进入更新模式：软复位后只保留一个 vendor 接口并显示渐变灯效（cmd 0x1C）
+    mlinkctl flash <file>       刷入固件：自动进更新模式，把 app 镜像推给设备，校验通过后设备自行复位
 
 `mlinkctl --help` 与 `mlinkctl <command> --help` 由 argparse 生成。
 
@@ -33,8 +34,8 @@ ping 是唯一的例外：设备端异步执行探测（主循环发 Ping、等 
 
 动作命令的 status=ok 只表示设备已接受投递：执行发生在设备主循环，
 结果看设备日志与行为；reset / reboot / update 之后设备会重新枚举，注意等待。
-更新模式（update）没有配置通道：那里的设备只暴露一个 vendor 接口，本工具对
-它发命令会得到传输错误，属预期；硬复位/断电即回正常模式。
+更新模式（update）没有配置通道：那里的设备只暴露一条 CDC 串口（升级协议走它），
+本工具对它的控制请求会得到传输错误，属预期；硬复位/断电即回正常模式。
 
 Linux 非 root 访问需要在 /etc/udev/rules.d/99-meguminlink.rules 写一行：
 
@@ -44,10 +45,16 @@ Linux 非 root 访问需要在 /etc/udev/rules.d/99-meguminlink.rules 写一行�
 """
 
 import argparse
+import glob
+import hashlib
+import struct
 import sys
 import time
+from pathlib import Path
 
+import serial
 import usb.core
+import usb.util
 
 VID = 0x303A
 PID = 0x4020
@@ -69,6 +76,46 @@ CMD_PING = 0x18
 CMD_SET_WIFI_RATE = 0x19
 CMD_SET_LOSS = 0x1A
 CMD_ENTER_UPDATE = 0x1C
+
+# 更新模式的固件升级协议（见 ml-esp/main/usb/firmware_updater.cc 顶部；与固件一一对应）：
+# 8B 帧头 + 载荷，CDC 串口上一问一答，整数一律大端。设备侧用 CDC 而不是 vendor
+# 接口，主机因此按普通串口访问，不需要 udev 规则或 WinUSB 驱动。
+UPDATE_PORT_MATCH = "MeguminLink_Update"
+UPDATE_BAUD = 115200
+UPDATE_MAGIC = 0x4D4F
+UPDATE_HEADER = ">HBBHH"
+UPDATE_HEADER_SIZE = 8
+UPDATE_CHUNK_MAX = 4096
+
+CMD_UPDATE_INFO = 0x01
+CMD_UPDATE_BEGIN = 0x02
+CMD_UPDATE_DATA = 0x03
+CMD_UPDATE_FINISH = 0x04
+CMD_UPDATE_ABORT = 0x05
+
+UPDATE_STATUS = {
+    0x00: "ok",
+    0x02: "malformed",
+    0x03: "internal",
+    0x04: "unsupported",
+    0x06: "no-partition",
+    0x07: "hash-mismatch",
+    0x08: "image-invalid",
+    0x09: "size-exceeded",
+    0x0A: "sequence",
+    0x0B: "flash-error",
+}
+
+# 单帧响应超时（秒）：Begin 要擦除镜像覆盖的范围、Finish 要读回整个分区校验，都比数据帧慢
+UPDATE_TIMEOUT_S = 10.0
+# 数据帧只做一段 flash 写入：给一个较短的上限，异常时不必陪跑长时间
+UPDATE_DATA_TIMEOUT_S = 3.0
+# 等设备软复位后以更新模式重新枚举
+UPDATE_ENTER_TIMEOUT_S = 15.0
+# 刷完等设备复位回正常模式（引导 + 无线/USB 初始化）
+UPDATE_RETURN_TIMEOUT_S = 20.0
+# 进度输出步长（百分比）
+UPDATE_PROGRESS_STEP = 5
 
 MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
@@ -719,6 +766,163 @@ def cmd_action(args):
         print("mlinkctl: 设备正在重启，稍后需重新枚举", file=sys.stderr)
 
 
+def find_update_port(timeout_s):
+    """等更新模式的 CDC 串口出现：设备名里带更新模式专有的产品名，据此认端口。
+
+    返回 None 表示超时（timeout_s 为 0 时只查一次）。
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        for path in sorted(glob.glob("/dev/serial/by-id/*")):
+            if UPDATE_PORT_MATCH in path:
+                return path
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def enter_update_mode():
+    """返回更新模式 CDC 串口的设备路径：已在更新模式就直接用，否则软复位后等串口出现。
+
+    进更新模式这一步只能走配置通道（正常模式 vendor 接口上的 EP0 厂商请求），仍然
+    需要那个设备节点的访问权限；升级数据本身走 CDC，不再需要。
+    """
+    port = find_update_port(0.0)
+    if port is not None:
+        return port
+
+    decode(fetch(find_device(), CMD_ENTER_UPDATE))
+    print("mlinkctl: 设备正在软复位进更新模式", file=sys.stderr)
+    port = find_update_port(UPDATE_ENTER_TIMEOUT_S)
+    if port is None:
+        die(f"等待 {UPDATE_ENTER_TIMEOUT_S:.0f}s 未见更新模式的 CDC 串口（设备名含 {UPDATE_PORT_MATCH}）")
+    return port
+
+
+def recv_exact(port, size, timeout_s):
+    """按字节数收满：CDC 是字节流，响应帧边界由帧头声明的长度决定。"""
+    port.timeout = timeout_s
+    data = port.read(size)
+    if len(data) != size:
+        die(f"串口读超时：期望 {size} 字节，收到 {len(data)}")
+    return data
+
+
+def recv_update_frame(port, timeout_s):
+    header = recv_exact(port, UPDATE_HEADER_SIZE, timeout_s)
+    magic, frame_type, status, length, seq = struct.unpack(UPDATE_HEADER, header)
+    if magic != UPDATE_MAGIC:
+        die(f"响应帧魔数错误：0x{magic:04x}")
+    payload = recv_exact(port, length, timeout_s) if length else b""
+    return frame_type, status, seq, payload
+
+
+def update_request(port, frame_type, seq, payload=b"", timeout_s=UPDATE_TIMEOUT_S):
+    """发一条命令并等它对应的响应：响应错位或状态非 ok 都在这里终止。"""
+    header = struct.pack(UPDATE_HEADER, UPDATE_MAGIC, frame_type, 0x00, len(payload), seq)
+    port.write(header + payload)
+
+    resp_type, status, resp_seq, resp_payload = recv_update_frame(port, timeout_s)
+    if resp_type != frame_type or resp_seq != seq:
+        die(f"响应错位：命令 0x{frame_type:02x}/seq {seq} 收到 0x{resp_type:02x}/seq {resp_seq}")
+    if status != 0x00:
+        die(f"设备返回 status={UPDATE_STATUS.get(status, hex(status))}")
+    return resp_payload
+
+
+def wait_for_running_device(timeout_s):
+    """等设备复位回正常模式并能应答配置通道：读到配置快照才算真的回来了。"""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        if dev is not None:
+            try:
+                raw = dev.ctrl_transfer(0xC0, VENDOR_CODE, CMD_GET_CONFIG, 0, MAX_RESPONSE, TIMEOUT_MS)
+                return decode(bytes(raw))
+            except usb.core.USBError:
+                pass  # 还在初始化：配置通道没起来，继续等
+        time.sleep(0.3)
+    return None
+
+
+def cmd_flash(args):
+    """把 app 镜像刷进设备：进更新模式 → Info 预检 → Begin → Data 分块 → Finish。"""
+    path = Path(args.firmware)
+    if not path.is_file():
+        die(f"{args.firmware} 不是文件")
+    image = path.read_bytes()
+    if not image:
+        die(f"{args.firmware} 是空文件")
+    digest = hashlib.sha256(image).digest()
+
+    port_path = enter_update_mode()
+    port = serial.Serial(port_path, UPDATE_BAUD, timeout=UPDATE_TIMEOUT_S)
+    try:
+        info = update_request(port, CMD_UPDATE_INFO, 1, timeout_s=args.timeout / 1000)
+        partition_size, max_chunk = struct.unpack(">II", info[:8])
+        version = info[8:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        if partition_size == 0:
+            die("设备没有可写的 OTA 槽（分区表里没有第二个 app 分区）")
+        if len(image) > partition_size:
+            die(f"镜像 {len(image)} 字节超过槽位 {partition_size} 字节")
+
+        chunk = min(args.chunk or max_chunk, max_chunk, UPDATE_CHUNK_MAX)
+        if chunk <= 0:
+            die(f"分块大小非法：{chunk}")
+        print(
+            f"mlinkctl: 设备当前固件 {version}，经 {port_path} 写入 {len(image)} 字节（分块 {chunk}）",
+            file=sys.stderr,
+        )
+
+        seq = 2
+        update_request(
+            port, CMD_UPDATE_BEGIN, seq, struct.pack(">I", len(image)) + digest, timeout_s=args.timeout / 1000
+        )
+
+        sent = 0
+        next_mark = UPDATE_PROGRESS_STEP
+        started = time.monotonic()
+        while sent < len(image):
+            block = image[sent : sent + chunk]
+            seq += 1
+            update_request(port, CMD_UPDATE_DATA, seq, block, timeout_s=UPDATE_DATA_TIMEOUT_S)
+            sent += len(block)
+
+            percent = sent * 100 // len(image)
+            if percent >= next_mark or sent == len(image):
+                elapsed = time.monotonic() - started
+                rate = sent / elapsed / 1024 if elapsed > 0 else 0.0
+                print(
+                    f"\r  {percent:3d}%  {sent / 1024:7.1f} KiB  {rate:6.1f} KiB/s",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                next_mark = percent + UPDATE_PROGRESS_STEP
+
+        seq += 1
+        update_request(port, CMD_UPDATE_FINISH, seq, timeout_s=args.timeout / 1000)
+        elapsed = time.monotonic() - started
+        print(file=sys.stderr)
+    finally:
+        port.close()
+
+    print(
+        f"status=ok bytes={len(image)} sha256={digest.hex()} "
+        f"elapsed_s={elapsed:.1f} rate_kb_s={len(image) / elapsed / 1024:.1f}"
+    )
+    print("mlinkctl: 镜像已校验、启动分区已切换，设备正在复位进新固件", file=sys.stderr)
+
+    values = wait_for_running_device(UPDATE_RETURN_TIMEOUT_S)
+    if values is None:
+        print(f"mlinkctl: 等待 {UPDATE_RETURN_TIMEOUT_S:.0f}s 未见设备回到正常模式，请查设备日志", file=sys.stderr)
+        return
+    print(
+        f"mlinkctl: 设备已回到正常模式，fw_version={values.get(0x41, b'').decode('utf-8', 'replace')}",
+        file=sys.stderr,
+    )
+
+
 def probe_once(dev, timeout_ms):
     """发一次对端探测并等设备结算，返回 (online, rtt_us)。
 
@@ -848,6 +1052,18 @@ def build_parser():
         help="单次探测等待设备结算的毫秒（默认 1000，需大于设备端探测超时）",
     )
     ping.set_defaults(handler=cmd_ping)
+
+    flash = subparsers.add_parser("flash", help="刷入固件：自动进更新模式，校验通过后设备自行复位")
+    flash.add_argument("firmware", metavar="FILE", help="app 镜像，如 build-s3-pv2/megumin-link-esp.bin")
+    flash.add_argument("--chunk", type=int, metavar="N", help="单帧数据字节数（默认用设备上报的上限）")
+    flash.add_argument(
+        "--timeout",
+        type=int,
+        default=int(UPDATE_TIMEOUT_S * 1000),
+        metavar="MS",
+        help=f"单帧响应超时毫秒（默认 {int(UPDATE_TIMEOUT_S * 1000)}，Begin 擦除与 Finish 校验较慢）",
+    )
+    flash.set_defaults(handler=cmd_flash)
 
     for name, (code, help_text) in ACTIONS.items():
         subparsers.add_parser(name, help=help_text).set_defaults(handler=cmd_action, cmd_code=code)
