@@ -572,19 +572,19 @@ def check_device_name(name):
             die("设备名只能是可打印 ASCII 字符")
 
 
-def cmd_read_stats(_args):
+def cmd_read_stats(args):
     print(render_stats(decode(fetch(find_device(args.serial), CMD_GET_STATS))))
 
 
-def cmd_read_config(_args):
+def cmd_read_config(args):
     print(render_config(decode(fetch(find_device(args.serial), CMD_GET_CONFIG))))
 
 
-def cmd_read_usb(_args):
+def cmd_read_usb(args):
     print(render_usb(decode(fetch(find_device(args.serial), CMD_GET_USB_CONFIG))))
 
 
-def cmd_arq(_args):
+def cmd_arq(args):
     """可靠传输的聚焦视图：状态、RTO 估计与全部计数各一行，便于盯链路质量。"""
     dev = find_device(args.serial)
     stats = decode(fetch(dev, CMD_GET_STATS))
