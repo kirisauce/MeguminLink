@@ -106,7 +106,7 @@ src/lib/rate.ts               速率差分、u32 回绕、数值与时长格式�
 src/lib/update.ts             更新模式串口上的升级协议：帧编解码、停止等待通道、镜像本地预检
 src/lib/update_port.ts        烧录通道的获取：认出更新模式的设备、拿到它的 CDC 串口（碰 navigator）
 src/styles/tokens.css         M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
-src/components/ui/            通用组件（SegmentedControl / ConfirmDialog），不含设备协议知识，可整块复用
+src/components/ui/            通用组件（SegmentedControl / ConfirmDialog / PopoverMenu），不含设备协议知识，可整块复用
 src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar / DeviceMenu / FirmwareUpdateDialog）
 src/components/mlink/panel/   主面板区，Dashboard 直接渲染（StatusStrip / StatCard / StatTable / RateChart）
 src/components/mlink/drawer/  配置抽屉区（ConfigDrawer / ConfigActions / UsbSettings）
