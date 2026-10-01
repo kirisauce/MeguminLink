@@ -118,7 +118,7 @@
 </script>
 
 <div class="page">
-	<DeviceBar {session} onconfig={() => (configOpen = true)} />
+	<DeviceBar {session} onconfig={() => (configOpen = true)} onupdate={openUpdate} />
 
 	<main>
 		{#if downloadHref !== null}
@@ -184,7 +184,7 @@
 		</section>
 	</main>
 
-	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} onupdate={openUpdate} />
+	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} />
 
 	<FirmwareUpdateDialog {session} open={updateOpen} onclose={() => (updateOpen = false)} />
 

@@ -64,6 +64,14 @@
 		flashable = canFlashFromBrowser();
 	});
 
+	/**
+	 * 上一次失败卡在取串口这一步（选择器里没有目标口、或串口打不开）。
+	 *
+	 * 这时重试只重来取串口：设备已经在更新模式里等着，再发一次进入命令既发不出去
+	 * （更新模式下没有控制请求协议），也会把它白重启一遍。
+	 */
+	let stuckAtPort = $state(false);
+
 	/** 清掉上一次的进度；选好的文件留着（连续刷两次同一份是常见动作）。 */
 	function resetProgress(): void {
 		stage = 'idle';
@@ -76,6 +84,7 @@
 		elapsed = null;
 		writeStartedAt = null;
 		startedWith = null;
+		stuckAtPort = false;
 	}
 
 	// 每次打开都从待机开始：上一次的绿色成功条不该跟着新一次会话
@@ -129,47 +138,95 @@
 	}
 
 	/**
-	 * 进更新模式 → 取串口 → 刷入。
+	 * 开始烧录：连着设备就先请它进更新模式，没连着就直接去取串口。
 	 *
-	 * 身份核对放在 Info 之后、Begin 之前：设备在这个回调里被拒绝时还一个字节都没写，
-	 * 只是白重启了一次。
+	 * 后一条路是给「已经处于更新模式」的设备留的——那时 WebUSB 侧根本没有它，进入
+	 * 命令发不出去，但它本来就在等着升级数据。这种情况页面不知道目标是谁，身份只能
+	 * 靠设备自报的 MAC 让你自己核。
 	 */
 	async function start(): Promise<void> {
-		const image = firmware;
-		if (image === null || busy) return;
-
+		if (firmware === null || busy) return;
 		resetProgress();
 		stage = 'entering';
+		try {
+			await ensureUpdateMode();
+			await flashThroughPort();
+		} catch (cause) {
+			fail(cause);
+		}
+	}
+
+	/** 失败后重来：卡在取串口就只重来取串口，否则整条流程再来一遍。 */
+	async function retry(): Promise<void> {
+		if (firmware === null || busy) return;
+		if (!stuckAtPort) {
+			await start();
+			return;
+		}
+		error = null;
+		try {
+			await flashThroughPort();
+		} catch (cause) {
+			fail(cause);
+		}
+	}
+
+	function fail(cause: unknown): void {
+		stage = 'failed';
+		error = cause instanceof Error ? cause.message : String(cause);
+	}
+
+	/** 页面连着设备时才请它进更新模式；没连着说明它多半已经在更新模式里等数据了。 */
+	async function ensureUpdateMode(): Promise<void> {
+		if (session.device === null) {
+			startedWith = null;
+			return;
+		}
+
+		startedWith = session.deviceSerial;
+		detail = '让设备重启进更新模式';
+		await session.enterUpdateMode();
+		if (session.commandError !== null) {
+			throw new Error(`设备没有接受进入更新模式：${session.commandError}`);
+		}
+
+		stage = 'waiting';
+		detail = '等设备以更新模式重新枚举';
+		if (!(await waitForUpdateMode(startedWith))) {
+			throw new Error('10 秒内没等到设备进更新模式，看看设备上的灯是不是在跑渐变');
+		}
+	}
+
+	/**
+	 * 取串口并刷到底（串口一定关掉）。
+	 *
+	 * 身份核对放在 Info 之后、Begin 之前：设备在这个回调里被拒绝时还一个字节都没写。
+	 */
+	async function flashThroughPort(): Promise<void> {
+		const image = firmware;
+		if (image === null) return;
+
+		stage = 'port';
+		detail = '等更新模式的串口就绪';
 		let port: UpdatePort | null = null;
+		try {
+			port = await acquireUpdatePort();
+		} catch (cause) {
+			stuckAtPort = true;
+			throw cause;
+		}
+		if (port === null) {
+			// 选择器里没有目标口（多半是弹得比枚举快）：停在失败态，让「重新选串口」可点
+			stuckAtPort = true;
+			stage = 'failed';
+			error = '没有选择串口。选择器里如果没有 MeguminLink Update，等两秒再点「重新选串口」。';
+			return;
+		}
 
 		try {
-			if (session.device === null) throw new Error('设备已经断开，先重新连接再烧录');
-			startedWith = session.deviceSerial;
-
-			detail = '让设备重启进更新模式';
-			await session.enterUpdateMode();
-			if (session.commandError !== null) {
-				throw new Error(`设备没有接受进入更新模式：${session.commandError}`);
-			}
-
-			stage = 'waiting';
-			detail = '等设备以更新模式重新枚举';
-			if (!(await waitForUpdateMode(startedWith))) {
-				throw new Error('10 秒内没等到设备进更新模式，看看设备上的灯是不是在跑渐变');
-			}
-
-			stage = 'port';
-			detail = '取更新模式的串口';
-			port = await acquireUpdatePort();
-			if (port === null) {
-				// 用户在选择器里点了取消：回到待机，什么都没发生
-				stage = 'idle';
-				detail = '';
-				return;
-			}
-
 			stage = 'flashing';
 			detail = '读取设备信息';
+			stuckAtPort = false;
 			const expected = startedWith;
 			const startedAt = Date.now();
 			const result = await flashFirmware(port.streams, image, {
@@ -178,7 +235,11 @@
 						identityNote = '设备没有上报 MAC（老固件），这次没法确认是不是同一台';
 						return;
 					}
-					if (expected !== null && info.mac.toLowerCase() !== expected.toLowerCase()) {
+					if (expected === null) {
+						identityNote = `页面没连着设备，这一台自报 ${info.mac}，自己确认一下是不是要刷的那块`;
+						return;
+					}
+					if (info.mac.toLowerCase() !== expected.toLowerCase()) {
 						throw new UpdateError(`串口上那台是 ${info.mac}，不是当前设备 ${expected}：一个字节都没写`);
 					}
 				},
@@ -190,11 +251,8 @@
 			elapsed = (Date.now() - startedAt) / 1000;
 			written = result.bytes;
 			percent = 100;
-		} catch (cause) {
-			stage = 'failed';
-			error = cause instanceof Error ? cause.message : String(cause);
 		} finally {
-			await port?.close();
+			await port.close();
 		}
 	}
 
@@ -257,7 +315,7 @@
 	<h2 id="update-title">烧录固件</h2>
 
 	<p class="hint">
-		只能刷 app 镜像（<code>megumin-link-esp.bin</code>）。设备会先软复位进更新模式，烧完自己重启回正常模式。
+		只能刷 app 镜像（<code>megumin-link-esp.bin</code>）。连着设备就先请它软复位进更新模式；设备已经在更新模式里的话，直接取串口就行。
 	</p>
 
 	<label
@@ -286,7 +344,7 @@
 			<div><dt>大小</dt><dd>{formatBytes(firmware.size)}</dd></div>
 			<div><dt>版本</dt><dd>{firmware.version === '' ? '—' : firmware.version}</dd></div>
 			<div><dt>工程</dt><dd>{firmware.projectName === '' ? '—' : firmware.projectName}</dd></div>
-			<div><dt>目标设备</dt><dd>{target ?? '—'}</dd></div>
+			<div><dt>目标设备</dt><dd>{target ?? '未连接'}</dd></div>
 		</dl>
 		{#if foreign}
 			<p class="warn">这个镜像的工程名不是 {APP_PROJECT_NAME}，刷进去设备可能起不来。</p>
@@ -347,9 +405,9 @@
 			class="button filled"
 			type="button"
 			disabled={busy || firmware === null || !flashable}
-			onclick={() => void start()}
+			onclick={() => void (stage === 'failed' ? retry() : start())}
 		>
-			{stage === 'failed' ? '重试' : '开始烧录'}
+			{stage !== 'failed' ? '开始烧录' : stuckAtPort ? '重新选串口' : '重试'}
 		</button>
 	</div>
 </div>

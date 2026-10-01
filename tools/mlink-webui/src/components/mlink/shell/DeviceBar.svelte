@@ -1,8 +1,13 @@
 <script lang="ts">
 	import { STATE_TEXT, type MlinkSession } from '../../../lib/session.svelte';
+	import PopoverMenu from '../../ui/PopoverMenu.svelte';
 	import DeviceMenu from './DeviceMenu.svelte';
 
-	let { session, onconfig }: { session: MlinkSession; onconfig: () => void } = $props();
+	let {
+		session,
+		onconfig,
+		onupdate,
+	}: { session: MlinkSession; onconfig: () => void; onupdate: () => void } = $props();
 
 	const tone = $derived(
 		session.state === 'streaming'
@@ -24,6 +29,12 @@
 	<DeviceMenu {session} />
 
 	<div class="actions">
+		<!-- 烧录不依赖当前连接：设备已经在更新模式时 WebUSB 侧根本没有它，这条入口仍要能用 -->
+		<PopoverMenu
+			label="操作"
+			align="end"
+			items={[{ key: 'update', label: '烧录固件…', run: onupdate }]}
+		/>
 		{#if session.state === 'streaming'}
 			<button class="button" onclick={onconfig}>配置</button>
 			<button class="button" onclick={() => void session.close()}>断开</button>

@@ -23,6 +23,15 @@ const ENTER_TIMEOUT_MS = 10000;
 /** 设备从授权列表里消失后，再等它带着新描述符回来。 */
 const REENUMERATE_MS = 1200;
 const POLL_MS = 150;
+/**
+ * 已授权过的串口：等它重新出现。比固定等待准——设备刚报出更新模式时 tty 往往还没建好。
+ */
+const GRANTED_WAIT_MS = 1500;
+/**
+ * 从没用过的串口：选择器只列"此刻已连接"的口，弹早了会是空的。Web Serial 看不到未
+ * 授权的口，没法主动探测它何时出现，所以这里只能再留一段落定时间。
+ */
+const CHOOSER_SETTLE_MS = 500;
 
 /** 打开好的串口：字节流交给升级协议，close 交回浏览器。 */
 export type UpdatePort = {
@@ -112,6 +121,9 @@ async function openPort(port: SerialPort): Promise<UpdatePort> {
 /**
  * 拿到更新模式的串口。
  *
+ * 分两条路：本 origin 授权过的口轮询等它回来（第二次起走这条，不弹选择器）；没授权过
+ * 的只能等一段落定时间再弹选择器，否则选择器里会是空的。
+ *
  * 返回 null 表示用户在选择器里点了取消（不是错误，调用方回到待机即可）；打不开、
  * 浏览器不支持等情况抛 Error。
  */
@@ -120,15 +132,22 @@ export async function acquireUpdatePort(): Promise<UpdatePort | null> {
 		throw new Error('这个浏览器没有 Web Serial，烧录需要 Chrome 或 Edge');
 	}
 
-	const granted = await navigator.serial.getPorts();
-	let port: SerialPort | null = granted.find(isMlinkPort) ?? null;
-	if (port === null) {
-		try {
-			port = await navigator.serial.requestPort({ filters: UPDATE_PORT_FILTERS });
-		} catch (cause) {
-			if (cause instanceof DOMException && cause.name === 'NotFoundError') return null;
-			throw new Error(`打开串口选择器失败：${describe(cause)}`);
-		}
+	const deadline = Date.now() + GRANTED_WAIT_MS;
+	for (;;) {
+		const granted = await navigator.serial.getPorts();
+		const known = granted.find(isMlinkPort);
+		if (known !== undefined) return await openPort(known);
+		if (Date.now() >= deadline) break;
+		await delay(POLL_MS);
+	}
+
+	await delay(CHOOSER_SETTLE_MS);
+	let port: SerialPort;
+	try {
+		port = await navigator.serial.requestPort({ filters: UPDATE_PORT_FILTERS });
+	} catch (cause) {
+		if (cause instanceof DOMException && cause.name === 'NotFoundError') return null;
+		throw new Error(`打开串口选择器失败：${describe(cause)}`);
 	}
 	return await openPort(port);
 }

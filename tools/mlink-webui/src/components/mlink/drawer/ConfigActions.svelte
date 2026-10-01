@@ -4,7 +4,7 @@
 	import ConfirmDialog from '../../ui/ConfirmDialog.svelte';
 	import SegmentedControl from '../../ui/SegmentedControl.svelte';
 
-	let { session, onupdate }: { session: MlinkSession; onupdate: () => void } = $props();
+	let { session }: { session: MlinkSession } = $props();
 
 	const busy = $derived(session.commandPending || session.device === null);
 	const mode = $derived(session.stats?.mode ?? null);
@@ -66,15 +66,6 @@
 				confirmLabel: '重启',
 			},
 			run: () => session.reboot(),
-		},
-		{
-			// 烧录自己就是一个流程：这里只把窗口打开，确认与进度都在那边
-			key: 'update',
-			label: '烧录固件…',
-			danger: true,
-			disabled: false,
-			confirm: null,
-			run: async () => onupdate(),
 		},
 		{
 			key: 'reset',

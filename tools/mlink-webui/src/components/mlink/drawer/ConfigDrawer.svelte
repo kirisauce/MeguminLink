@@ -5,12 +5,7 @@
 	import ConfigActions from './ConfigActions.svelte';
 	import UsbSettings from './UsbSettings.svelte';
 
-	let {
-		session,
-		open,
-		onclose,
-		onupdate,
-	}: { session: MlinkSession; open: boolean; onclose: () => void; onupdate: () => void } = $props();
+	let { session, open, onclose }: { session: MlinkSession; open: boolean; onclose: () => void } = $props();
 
 	// 面板标题充当无障碍名：文案只留标题这一处，不再另写一份 aria-label
 	const uid = $props.id();
@@ -81,7 +76,7 @@
 
 	<AdvancedSettings {session} />
 
-	<ConfigActions {session} {onupdate} />
+	<ConfigActions {session} />
 </div>
 
 <style>
