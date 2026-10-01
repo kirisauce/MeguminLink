@@ -92,11 +92,7 @@ export type UpdateFrame = {
 };
 
 /** 组一条请求帧；请求侧 status 恒为 0。 */
-export function encodeFrame(
-	command: number,
-	seq: number,
-	payload: Uint8Array<ArrayBuffer> = new Uint8Array(0)
-): Uint8Array<ArrayBuffer> {
+export function encodeFrame(command: number, seq: number, payload: Uint8Array = new Uint8Array(0)): Uint8Array {
 	const frame = new Uint8Array(FRAME_HEADER_SIZE + payload.byteLength);
 	const header = new DataView(frame.buffer);
 	header.setUint16(0, FRAME_MAGIC, false);
@@ -228,12 +224,12 @@ export async function readFirmwareImage(bytes: Uint8Array<ArrayBuffer>): Promise
  * 传输；一次 read 拿到的分片数完全由主机侧调度决定，不能假设一条帧一次到齐。
  */
 class ByteQueue {
-	#chunks: Uint8Array<ArrayBuffer>[] = [];
+	#chunks: Uint8Array[] = [];
 	#buffered = 0;
 	#failure: unknown = null;
 	#wake: (() => void) | null = null;
 
-	push(chunk: Uint8Array<ArrayBuffer>): void {
+	push(chunk: Uint8Array): void {
 		this.#chunks.push(chunk);
 		this.#buffered += chunk.byteLength;
 		this.#signal();
@@ -266,7 +262,7 @@ class ByteQueue {
 	}
 
 	/** 等够 n 字节再原子取出；超时或流已断都在这里失败。 */
-	async take(count: number, timeoutMs: number, what: string): Promise<Uint8Array<ArrayBuffer>> {
+	async take(count: number, timeoutMs: number, what: string): Promise<Uint8Array> {
 		const deadline = Date.now() + timeoutMs;
 		while (this.#buffered < count) {
 			if (this.#failure !== null) {
@@ -305,8 +301,8 @@ function describe(error: unknown): string {
 
 /** 串口打开后交出的一对字节流；Web Serial 的 port.readable / port.writable 结构上满足它。 */
 export type UpdateStreams = {
-	readable: ReadableStream<Uint8Array<ArrayBuffer>>;
-	writable: WritableStream<Uint8Array<ArrayBuffer>>;
+	readable: ReadableStream<Uint8Array>;
+	writable: WritableStream<Uint8Array>;
 };
 
 /**
@@ -316,8 +312,8 @@ export type UpdateStreams = {
  * 写下去只会把镜像写歪，所以一律失败。
  */
 export class UpdateChannel {
-	#reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>;
-	#writer: WritableStreamDefaultWriter<Uint8Array<ArrayBuffer>>;
+	#reader: ReadableStreamDefaultReader<Uint8Array>;
+	#writer: WritableStreamDefaultWriter<Uint8Array>;
 	#queue = new ByteQueue();
 	#pump: Promise<void>;
 	#seq = 0;
@@ -342,7 +338,7 @@ export class UpdateChannel {
 		}
 	}
 
-	async #write(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
+	async #write(bytes: Uint8Array): Promise<void> {
 		try {
 			await this.#writer.write(bytes);
 		} catch (error) {
@@ -351,7 +347,7 @@ export class UpdateChannel {
 	}
 
 	/** 发一条命令并等它对应的响应；超时、错位、status 非 ok 都抛 UpdateError。 */
-	async request(command: number, payload: Uint8Array<ArrayBuffer>, timeoutMs: number): Promise<DataView> {
+	async request(command: number, payload: Uint8Array, timeoutMs: number): Promise<DataView> {
 		const seq = (this.#seq = (this.#seq + 1) & 0xffff);
 		const label = `命令 0x${command.toString(16).padStart(2, '0')}/seq ${seq} 的响应`;
 
@@ -429,6 +425,18 @@ export type FlashResult = {
 };
 
 /**
+ * Begin 载荷：镜像大小 u32 | 整镜像 SHA-256。
+ *
+ * 固件按 `sizeof(u32) + UPDATE_DIGEST_LEN` 严格校验长度，多一个字节都回 malformed。
+ */
+export function encodeBegin(size: number, digest: Uint8Array): Uint8Array {
+	const payload = new Uint8Array(4 + digest.byteLength);
+	new DataView(payload.buffer).setUint32(0, size, false);
+	payload.set(digest, 4);
+	return payload;
+}
+
+/**
  * 把镜像推进空闲 OTA 槽：Info 预检 → Begin（擦除）→ Data 分块 → Finish（校验并切换启动分区）。
  *
  * 设备在 Finish 之后自行软复位进新固件，本函数不负责等它回来。任何一步失败都抛
@@ -454,13 +462,8 @@ export async function flashFirmware(
 		const chunk = Math.min(info.maxChunk, UPDATE_CHUNK_MAX, total);
 		if (chunk <= 0) throw new UpdateError(`设备上报的分块上限非法：${info.maxChunk}`);
 
-		const begin = new Uint8Array(8 + image.digest.byteLength);
-		const beginView = new DataView(begin.buffer);
-		beginView.setUint32(0, total, false);
-		begin.set(image.digest, 8);
-
 		hooks.onProgress?.({ phase: 'erase', written: 0, total });
-		await channel.request(CMD_UPDATE_BEGIN, begin, UPDATE_LONG_TIMEOUT_MS);
+		await channel.request(CMD_UPDATE_BEGIN, encodeBegin(total, image.digest), UPDATE_LONG_TIMEOUT_MS);
 
 		const block = new Uint8Array(chunk);
 		let written = 0;

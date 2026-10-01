@@ -5,6 +5,7 @@
 	import { formatBytes, formatCount, formatLineCoding, formatRate, formatUartOpen, type CounterKey } from '../../../lib/rate';
 	import { STANDALONE_HREF } from '../../../lib/standalone';
 	import StandaloneDownloadDialog from './StandaloneDownloadDialog.svelte';
+	import FirmwareUpdateDialog from './FirmwareUpdateDialog.svelte';
 	import DeviceBar from './DeviceBar.svelte';
 	import ConfigDrawer from '../drawer/ConfigDrawer.svelte';
 	import StatusStrip from '../panel/StatusStrip.svelte';
@@ -24,6 +25,14 @@
 
 	/** 单文件下载弹窗的开关。 */
 	let downloadOpen = $state(false);
+
+	/** 烧录窗口的开关；它盖在抽屉之上，打开时把抽屉收掉。 */
+	let updateOpen = $state(false);
+
+	function openUpdate(): void {
+		configOpen = false;
+		updateOpen = true;
+	}
 
 	onMount(() => {
 		void session.restore();
@@ -175,7 +184,9 @@
 		</section>
 	</main>
 
-	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} />
+	<ConfigDrawer {session} open={configOpen} onclose={() => (configOpen = false)} onupdate={openUpdate} />
+
+	<FirmwareUpdateDialog {session} open={updateOpen} onclose={() => (updateOpen = false)} />
 
 	{#if downloadHref !== null}
 		<StandaloneDownloadDialog

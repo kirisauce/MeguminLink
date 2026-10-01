@@ -35,6 +35,11 @@ export const CMD_PING = 0x18;
 export const CMD_SET_WIFI_RATE = 0x19;
 export const CMD_SET_LOSS = 0x1a;
 export const CMD_SET_LINK_CONFIG = 0x1b;
+/**
+ * 软复位进更新模式：设备重启后 USB 只暴露一个 CDC 串口（产品名 MeguminLink Update），
+ * 升级协议跑在那个口上（见 update.ts）。硬复位即退回正常模式。
+ */
+export const CMD_ENTER_UPDATE = 0x1c;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 

@@ -62,6 +62,22 @@ WebUSB / WinUSB 两项能力的**编译期总开关**在固件的 `MEGUMINLINK_U
 
 对应命令行工具是 `mlinkctl usb`（读）与 `mlinkctl set-usb [--webusb on|off] [--winusb on|off] [--hid-compat on|off] [--landing-page URL] [--name NAME]`；`--hid-compat` 与 `--name` 不带时设备沿用当前值。
 
+## 烧录固件
+
+配置抽屉里点 **烧录固件…**，选一个 app 镜像（板子对应的 `build-s3-*/megumin-link-esp.bin`），再点「开始烧录」：
+
+1. 页面经 WebUSB 让设备软复位进更新模式
+2. 设备重新枚举后弹出串口选择器，选 `MeguminLink Update` 那个口；授权过一次之后就不再弹
+3. 写入、校验、切换启动分区，设备自己重启回正常模式，页面自动接回
+
+**只刷 app 镜像**。合并镜像、分区表、bootloader 都刷不了：镜像自身的魔数、app 描述结构与尾部 SHA-256 都在发第一个字节之前先验一遍。
+
+写入过程中设备自报一次 MAC，跟当前连着的这台对不上就停住，同样一个字节都不写；老固件不上报 MAC 时只提示，不拦。
+
+更新模式只保留一个 CDC 串口，所以数据面走 Web Serial（`navigator.serial`），进更新模式那一步仍走 WebUSB 的 EP0 厂商请求 —— CDC 接口被系统串口驱动占着，WebUSB 打不开它。需要 Chrome 或 Edge；离线单文件版本同样可以烧。
+
+命令行对照是 `mlinkctl flash <file>`：同样的两步，只是用 `/dev/serial/by-id` 自己找口，不需要选择器。
+
 ## 显示约定
 
 - 轮询间隔 200ms；页面切到后台降为 1s。曲线窗口固定 60 秒。
@@ -87,9 +103,11 @@ src/lib/devices.ts            授权设备条目与「没有选择时该接哪�
 src/lib/session_recovery.ts   失败归因（占用 / 驱动 / 设备不在 / 要用户动手）与 1s→2s→5s 退避节奏（纯逻辑）
 src/lib/session.svelte.ts     WebUSB 会话：授权、轮询、设备切换、按序列号接回、可见性降频、60 秒采样窗口
 src/lib/rate.ts               速率差分、u32 回绕、数值与时长格式化
+src/lib/update.ts             更新模式串口上的升级协议：帧编解码、停止等待通道、镜像本地预检
+src/lib/update_port.ts        烧录通道的获取：认出更新模式的设备、拿到它的 CDC 串口（碰 navigator）
 src/styles/tokens.css         M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
 src/components/ui/            通用组件（SegmentedControl / ConfirmDialog），不含设备协议知识，可整块复用
-src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar / DeviceMenu）
+src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar / DeviceMenu / FirmwareUpdateDialog）
 src/components/mlink/panel/   主面板区，Dashboard 直接渲染（StatusStrip / StatCard / StatTable / RateChart）
 src/components/mlink/drawer/  配置抽屉区（ConfigDrawer / ConfigActions / UsbSettings）
 src/pages/index.astro         唯一页面，挂载 Dashboard island
@@ -97,4 +115,4 @@ src/pages/index.astro         唯一页面，挂载 Dashboard island
 
 ## 依赖
 
-`astro`、`@astrojs/svelte` + `svelte`（island）、`uplot`（曲线）、`@types/w3c-web-usb`（TypeScript 的 `lib.dom.d.ts` 不含 WebUSB 类型）。
+`astro`、`@astrojs/svelte` + `svelte`（island）、`uplot`（曲线）、`@types/w3c-web-usb`（TypeScript 的 `lib.dom.d.ts` 不含 WebUSB 类型）、`@types/w3c-web-serial`（同理不含 Web Serial）。

@@ -17,6 +17,7 @@ import { deviceEntries, deviceKey, isMlinkDevice, pickKey, type DeviceEntry } fr
 import {
 	CMD_CLEAR_PAIR,
 	CMD_ENTER_PAIRING,
+	CMD_ENTER_UPDATE,
 	CMD_EXIT_PAIRING,
 	CMD_REBOOT,
 	CMD_RESET,
@@ -276,6 +277,14 @@ export class MlinkSession {
 		const device = this.device;
 		if (device === null) return '';
 		return [device.productName ?? '', deviceKey(device)].filter((part) => part !== '').join(' · ');
+	}
+
+	/**
+	 * 当前设备的 USB 串号（固件填的是芯片 MAC），没有设备或描述符里没给时为 null。
+	 * 两种启动模式共用同一个串号，因此它是"进更新模式前后是不是同一台"的比对依据。
+	 */
+	get deviceSerial(): string | null {
+		return this.device?.serialNumber ?? null;
 	}
 
 	/**
@@ -679,6 +688,16 @@ export class MlinkSession {
 
 	async reboot(): Promise<void> {
 		await this.#sendCommand(CMD_REBOOT);
+	}
+
+	/**
+	 * 让设备软复位进更新模式（随后由烧录流程接管串口）。
+	 *
+	 * 只发命令：设备重启后这段 WebUSB 会话会失去目标并自行进入等待态，页面不做
+	 * 额外处理——烧录过程中它与串口各走各的通道，互不占用。
+	 */
+	async enterUpdateMode(): Promise<void> {
+		await this.#sendCommand(CMD_ENTER_UPDATE);
 	}
 
 	/**
