@@ -68,8 +68,9 @@ WebUSB / WinUSB 两项能力的**编译期总开关**在固件的 `MEGUMINLINK_U
 
 连着设备时，页面先经 WebUSB 让它软复位进更新模式；**页面没连着设备就直接去取串口** —— 设备已经停在更新模式里时走的就是这条路（刷失败之后它不会自己回来）。
 
-1. 设备重新枚举后弹出串口选择器，选 `MeguminLink Update` 那个口；授权过一次就不再弹
-2. 写入、校验、切换启动分区，设备自己重启回正常模式，页面自动接回
+1. 取串口：授权过的口逐个握一次手，接不上话的直接跳过 —— 授权列表里可能记着另一块板子，它的口一样是 `303a:4020`
+2. 一个都没认下才弹选择器，选 `MeguminLink Update` 那个口；授权过一次就不再弹
+3. 写入、校验、切换启动分区，设备自己重启回正常模式，页面自动接回
 
 烧录期间页面**不碰设备**：更新模式对 vendor 请求只有 STALL，让 200ms 轮询继续跑只会刷出一串假故障，所以这段时间会话整个挂起，顶栏停在「等待设备」。烧完等设备回来读一次版本号，跟镜像里写的那份对上才给绿字；对不上多半不是刷错了，而是新固件没起来、被回滚确认带回了旧固件。
 
@@ -77,7 +78,7 @@ WebUSB / WinUSB 两项能力的**编译期总开关**在固件的 `MEGUMINLINK_U
 
 **只刷 app 镜像**。合并镜像、分区表、bootloader 都刷不了：镜像自身的魔数、app 描述结构与尾部 SHA-256 都在发第一个字节之前先验一遍。
 
-连着设备烧时，设备自报的 MAC 会跟当前这台核对，对不上就停住、一个字节都不写；没连着设备时没有比对基准，页面会把设备自报的 MAC 显示出来让你自己认。老固件不上报 MAC 只提示，不拦。
+连着设备烧时，设备自报的 MAC 会跟当前这台核对，对不上就换下一个口试，全都对不上才停住、一个字节都不写；没连着设备时没有比对基准，页面会把设备自报的 MAC 显示出来让你自己认。老固件不上报 MAC 只提示，不拦。
 
 更新模式只保留一个 CDC 串口，所以数据面走 Web Serial（`navigator.serial`），进更新模式那一步仍走 WebUSB 的 EP0 厂商请求 —— CDC 接口被系统串口驱动占着，WebUSB 打不开它。需要 Chrome 或 Edge；离线单文件版本同样可以烧。
 
@@ -108,8 +109,8 @@ src/lib/devices.ts            授权设备条目与「没有选择时该接哪�
 src/lib/session_recovery.ts   失败归因（占用 / 驱动 / 设备不在 / 要用户动手）与 1s→2s→5s 退避节奏（纯逻辑）
 src/lib/session.svelte.ts     WebUSB 会话：授权、轮询、设备切换、按序列号接回、可见性降频、60 秒采样窗口
 src/lib/rate.ts               速率差分、u32 回绕、数值与时长格式化
-src/lib/update.ts             更新模式串口上的升级协议：帧编解码、停止等待通道、镜像本地预检
-src/lib/update_port.ts        烧录通道的获取：认出更新模式的设备、拿到它的 CDC 串口（碰 navigator）
+src/lib/update.ts             更新模式串口上的升级协议：帧编解码、停止等待通道、会话握手、镜像本地预检
+src/lib/update_port.ts        烧录通道的获取：认出更新模式的设备、握手确认身份、拿到它的 CDC 串口（碰 navigator）
 src/styles/tokens.css         M3 token（Megumin 红主色、明暗两套、图表序列色）与元素级基础样式
 src/components/ui/            通用组件（SegmentedControl / ConfirmDialog / PopoverMenu），不含设备协议知识，可整块复用
 src/components/mlink/shell/   页面骨架与顶栏（Dashboard / DeviceBar / DeviceMenu / FirmwareUpdateDialog）

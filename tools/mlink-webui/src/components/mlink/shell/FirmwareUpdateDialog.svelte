@@ -3,14 +3,17 @@
 	import type { MlinkSession } from '../../../lib/session.svelte';
 	import {
 		APP_PROJECT_NAME,
-		UpdateError,
-		flashFirmware,
 		readFirmwareImage,
 		type FirmwareImage,
 		type FlashPhase,
 		type FlashProgress,
 	} from '../../../lib/update';
-	import { acquireUpdatePort, canFlashFromBrowser, waitForUpdateMode, type UpdatePort } from '../../../lib/update_port';
+	import {
+		acquireUpdatePort,
+		canFlashFromBrowser,
+		waitForUpdateMode,
+		type VerifiedUpdatePort,
+	} from '../../../lib/update_port';
 
 	let { session, open, onclose }: { session: MlinkSession; open: boolean; onclose: () => void } = $props();
 
@@ -217,17 +220,18 @@
 	/**
 	 * 取串口并刷到底（串口一定关掉）。
 	 *
-	 * 身份核对放在 Info 之后、Begin 之前：设备在这个回调里被拒绝时还一个字节都没写。
+	 * 身份在取口那一步就核过了：认错设备、口上没人应答都在动手之前失败，一个字节都没写。
 	 */
 	async function flashThroughPort(): Promise<void> {
 		const image = firmware;
 		if (image === null) return;
 
+		const expected = startedWith;
 		stage = 'port';
-		detail = '等更新模式的串口就绪';
-		let port: UpdatePort | null = null;
+		detail = '确认串口上是不是这台设备';
+		let port: VerifiedUpdatePort | null = null;
 		try {
-			port = await acquireUpdatePort();
+			port = await acquireUpdatePort(expected);
 		} catch (cause) {
 			stuckAtPort = true;
 			throw cause;
@@ -240,28 +244,20 @@
 			return;
 		}
 
+		// 取口时已经核对过 MAC；这里只管把"没法核对"的两种情况说给主人听
+		const info = port.session.info;
+		if (info.mac === null) {
+			identityNote = '设备没有上报 MAC（老固件），这次没法确认是不是同一台';
+		} else if (expected === null) {
+			identityNote = `页面没连着设备，这一台自报 ${info.mac}，自己确认一下是不是要刷的那块`;
+		}
+
 		try {
 			stage = 'flashing';
-			detail = '读取设备信息';
+			detail = '准备写入';
 			stuckAtPort = false;
-			const expected = startedWith;
 			const startedAt = Date.now();
-			const result = await flashFirmware(port.streams, image, {
-				onInfo: (info) => {
-					if (info.mac === null) {
-						identityNote = '设备没有上报 MAC（老固件），这次没法确认是不是同一台';
-						return;
-					}
-					if (expected === null) {
-						identityNote = `页面没连着设备，这一台自报 ${info.mac}，自己确认一下是不是要刷的那块`;
-						return;
-					}
-					if (info.mac.toLowerCase() !== expected.toLowerCase()) {
-						throw new UpdateError(`串口上那台是 ${info.mac}，不是当前设备 ${expected}：一个字节都没写`);
-					}
-				},
-				onProgress,
-			});
+			const result = await port.session.flash(image, { onProgress });
 
 			stage = 'done';
 			detail = '设备已切换启动分区，正在重启进新固件';

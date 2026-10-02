@@ -5,12 +5,12 @@
  *
  * 1. **等设备真的换成更新模式**。两种启动模式的 VID:PID 与串号完全相同，产品名是
  *    唯一能观测到的模式信号；而串口选择器只列"此刻已连接"的口，早弹了会看不到目标。
- * 2. **取串口**。先看本 origin 授权过的口里有没有 VID/PID 匹配的（第二次起不再弹
- *    选择器），没有才 requestPort()。Web Serial 拿不到串口的串号，所以"选中的口是
- *    不是刚才那台"只能靠升级协议里 Info 自报的 MAC 来核对（见 update.ts）。
+ * 2. **取串口**。已授权的口里可能混着别的板子（两种启动模式共用 VID:PID，Web Serial
+ *    又只给 VID/PID），所以每个候选口都握一次手：自报 MAC 对得上的才留下，都不行才
+ *    弹选择器让主人自己挑。
  */
 
-import { UPDATE_BAUD, UPDATE_PID, UPDATE_VID, type UpdateStreams } from './update';
+import { UPDATE_BAUD, UPDATE_PID, UPDATE_VID, UpdateError, UpdateSession, type UpdateStreams } from './update';
 
 /** 更新模式的 USB 产品名（固件 update_mode.cc 里那份）。 */
 export const UPDATE_PRODUCT_NAME = 'MeguminLink Update';
@@ -34,8 +34,18 @@ const GRANTED_WAIT_MS = 1500;
 const CHOOSER_SETTLE_MS = 500;
 
 /** 打开好的串口：字节流交给升级协议，close 交回浏览器。 */
-export type UpdatePort = {
+type OpenedPort = {
 	streams: UpdateStreams;
+	close: () => Promise<void>;
+};
+
+/**
+ * 取到的更新模式串口：身份已经握过手，session 可以直接往下烧。
+ *
+ * 目标未知时（页面看不到设备）只要求对面接得上话，自报 MAC 由界面交给主人核。
+ */
+export type VerifiedUpdatePort = {
+	session: UpdateSession;
 	close: () => Promise<void>;
 };
 
@@ -97,7 +107,7 @@ export async function waitForUpdateMode(serial: string | null, timeoutMs = ENTER
 	}
 }
 
-async function openPort(port: SerialPort): Promise<UpdatePort> {
+async function openPort(port: SerialPort): Promise<OpenedPort> {
 	try {
 		await port.open({ baudRate: UPDATE_BAUD });
 	} catch (cause) {
@@ -118,36 +128,124 @@ async function openPort(port: SerialPort): Promise<UpdatePort> {
 	};
 }
 
+/** 握手结果：认下来了、接话的另有其人、还是根本没接话。 */
+type ProbeResult =
+	| { kind: 'ready'; port: VerifiedUpdatePort }
+	| { kind: 'foreign'; mac: string }
+	| { kind: 'silent'; reason: string };
+
 /**
- * 拿到更新模式的串口。
+ * 打开一个候选口，问它一句"你是谁"。
  *
- * 分两条路：本 origin 授权过的口轮询等它回来（第二次起走这条，不弹选择器）；没授权过
- * 的只能等一段落定时间再弹选择器，否则选择器里会是空的。
- *
- * 返回 null 表示用户在选择器里点了取消（不是错误，调用方回到待机即可）；打不开、
- * 浏览器不支持等情况抛 Error。
+ * 认下来就把会话原样交出去——口在设备重新枚举前后未必还能再开一次，所以不关掉重开；
+ * 认不下来就关干净，把原因交回去让调用方接着试。
  */
-export async function acquireUpdatePort(): Promise<UpdatePort | null> {
+async function probePort(port: SerialPort, expectedMac: string | null): Promise<ProbeResult> {
+	let opened: OpenedPort;
+	try {
+		opened = await openPort(port);
+	} catch (cause) {
+		return { kind: 'silent', reason: describe(cause) };
+	}
+
+	let session: UpdateSession;
+	try {
+		session = await UpdateSession.open(opened.streams);
+	} catch (cause) {
+		await opened.close();
+		return { kind: 'silent', reason: describe(cause) };
+	}
+
+	if (expectedMac !== null && session.info.mac !== null && !sameSerial(session.info.mac, expectedMac)) {
+		const mac = session.info.mac;
+		await session.close();
+		await opened.close();
+		return { kind: 'foreign', mac };
+	}
+
+	return {
+		kind: 'ready',
+		port: {
+			session,
+			close: async () => {
+				await session.close();
+				await opened.close();
+			},
+		},
+	};
+}
+
+/**
+ * 一个候选口都没认下时的说法。
+ *
+ * "接话的是别人"和"没人接话"是两回事：前者多半是目标没进更新模式或选错了口，后者更像
+ * 口被占着、设备刚走。两种都摊开写，主人一眼能对上现场。
+ */
+function describeMisses(expectedMac: string | null, foreign: string[], silent: number, reason: string | null): string {
+	const parts: string[] = [];
+	if (foreign.length > 0) {
+		const who = foreign.join('、');
+		parts.push(
+			expectedMac === null ? `串口上应答的是 ${who}` : `串口上应答的是 ${who}，不是当前设备 ${expectedMac}`
+		);
+	}
+	if (silent > 0) {
+		parts.push(`${silent} 个串口上没有更新模式在应答${reason === null ? '' : `（${reason}）`}`);
+	}
+	if (parts.length === 0) parts.push('没有可用的串口');
+	return `没能接上更新模式的设备：${parts.join('；')}。一个字节都没写。`;
+}
+
+/**
+ * 拿到更新模式的串口，并且确认它就是目标那台。
+ *
+ * 授权过的口逐个握手（第二次起走这条，不弹选择器）；一个都认不下才弹选择器。返回 null
+ * 表示主人在选择器里点了取消（不是错误，调用方回到待机即可）。
+ */
+export async function acquireUpdatePort(expectedMac: string | null): Promise<VerifiedUpdatePort | null> {
 	if (typeof navigator === 'undefined' || navigator.serial === undefined) {
 		throw new Error('这个浏览器没有 Web Serial，烧录需要 Chrome 或 Edge');
 	}
 
+	/** 这一轮看到的情况，最后拼进失败文案 */
+	const foreign: string[] = [];
+	let silent = 0;
+	let reason: string | null = null;
+
+	const tryPorts = async (candidates: SerialPort[]): Promise<VerifiedUpdatePort | null> => {
+		for (const candidate of candidates) {
+			const probed = await probePort(candidate, expectedMac);
+			if (probed.kind === 'ready') return probed.port;
+			if (probed.kind === 'foreign') {
+				foreign.push(probed.mac);
+			} else {
+				silent += 1;
+				reason ??= probed.reason;
+			}
+		}
+		return null;
+	};
+
 	const deadline = Date.now() + GRANTED_WAIT_MS;
+	let granted: SerialPort[] = [];
 	for (;;) {
-		const granted = await navigator.serial.getPorts();
-		const known = granted.find(isMlinkPort);
-		if (known !== undefined) return await openPort(known);
-		if (Date.now() >= deadline) break;
+		granted = (await navigator.serial.getPorts()).filter(isMlinkPort);
+		if (granted.length > 0 || Date.now() >= deadline) break;
 		await delay(POLL_MS);
 	}
+	const known = await tryPorts(granted);
+	if (known !== null) return known;
 
 	await delay(CHOOSER_SETTLE_MS);
-	let port: SerialPort;
+	let chosen: SerialPort;
 	try {
-		port = await navigator.serial.requestPort({ filters: UPDATE_PORT_FILTERS });
+		chosen = await navigator.serial.requestPort({ filters: UPDATE_PORT_FILTERS });
 	} catch (cause) {
 		if (cause instanceof DOMException && cause.name === 'NotFoundError') return null;
 		throw new Error(`打开串口选择器失败：${describe(cause)}`);
 	}
-	return await openPort(port);
+	const picked = await tryPorts([chosen]);
+	if (picked !== null) return picked;
+
+	throw new UpdateError(describeMisses(expectedMac, foreign, silent, reason));
 }

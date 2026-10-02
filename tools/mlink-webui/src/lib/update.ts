@@ -32,6 +32,8 @@ export const CMD_UPDATE_FINISH = 0x04;
 export const UPDATE_LONG_TIMEOUT_MS = 10000;
 /** 数据帧只做一段 flash 写入：给一个较短的上限，异常时不必陪跑。 */
 export const UPDATE_DATA_TIMEOUT_MS = 3000;
+/** 挑串口时的握手超时：只问一句"这个口上有没有更新模式在听"，不碰 flash，按毫秒级的应答量级给。 */
+export const UPDATE_PROBE_TIMEOUT_MS = 400;
 
 export const UPDATE_STATUS_NAMES: Readonly<Record<number, string>> = {
 	0x00: 'ok',
@@ -437,22 +439,45 @@ export function encodeBegin(size: number, digest: Uint8Array): Uint8Array {
 }
 
 /**
- * 把镜像推进空闲 OTA 槽：Info 预检 → Begin（擦除）→ Data 分块 → Finish（校验并切换启动分区）。
+ * 已经握过手的更新会话：身份拿在手里，通道还开着。
  *
- * 设备在 Finish 之后自行软复位进新固件，本函数不负责等它回来。任何一步失败都抛
- * UpdateError：设备侧的两级校验（收到的字节流对申报摘要、镜像对自身尾部摘要）都
- * 不通过就不切换启动分区，旧固件照常运行。
+ * 先开会话再灌镜像，是因为串口那头未必是目标设备——Begin 会把槽擦掉，认错了就白擦。
  */
-export async function flashFirmware(
-	streams: UpdateStreams,
-	image: FirmwareImage,
-	hooks: FlashHooks = {}
-): Promise<FlashResult> {
-	const channel = new UpdateChannel(streams);
-	const total = image.size;
-	try {
-		hooks.onProgress?.({ phase: 'info', written: 0, total });
-		const info = decodeInfo(await channel.request(CMD_UPDATE_INFO, new Uint8Array(0), UPDATE_LONG_TIMEOUT_MS));
+export class UpdateSession {
+	readonly info: UpdateInfo;
+	readonly #channel: UpdateChannel;
+
+	private constructor(channel: UpdateChannel, info: UpdateInfo) {
+		this.#channel = channel;
+		this.info = info;
+	}
+
+	/**
+	 * 开一条会话：第一条 Info 就是握手。
+	 *
+	 * 失败时通道在这里收干净；成功时留给 flash 复用，同一个口不重开。
+	 */
+	static async open(streams: UpdateStreams, timeoutMs = UPDATE_PROBE_TIMEOUT_MS): Promise<UpdateSession> {
+		const channel = new UpdateChannel(streams);
+		try {
+			const info = decodeInfo(await channel.request(CMD_UPDATE_INFO, new Uint8Array(0), timeoutMs));
+			return new UpdateSession(channel, info);
+		} catch (cause) {
+			await channel.close();
+			throw cause;
+		}
+	}
+
+	/**
+	 * 把镜像推进空闲 OTA 槽：Begin（擦除）→ Data 分块 → Finish（校验并切换启动分区）。
+	 *
+	 * 设备两级校验（字节流对申报摘要、镜像对自身尾部摘要）不过就不切换启动分区，旧固件
+	 * 照常运行；Finish 之后设备自行软复位，本函数不负责等它回来。
+	 */
+	async flash(image: FirmwareImage, hooks: FlashHooks = {}): Promise<FlashResult> {
+		const channel = this.#channel;
+		const total = image.size;
+		const info = this.info;
 		hooks.onInfo?.(info);
 		if (info.slotSize === 0) throw new UpdateError(UPDATE_STATUS_TEXT[0x06]);
 		if (total > info.slotSize) {
@@ -488,7 +513,25 @@ export async function flashFirmware(
 		hooks.onProgress?.({ phase: 'done', written, total });
 
 		return { bytes: total, chunk, deviceVersion: info.version, deviceMac: info.mac };
+	}
+
+	/** 结束会话并释放流上的锁；端口本身由调用方关闭。 */
+	async close(): Promise<void> {
+		await this.#channel.close();
+	}
+}
+
+/** 一次性的刷入：开会话（Info 按正式命令的量级等）→ 灌镜像 → 关会话。 */
+export async function flashFirmware(
+	streams: UpdateStreams,
+	image: FirmwareImage,
+	hooks: FlashHooks = {}
+): Promise<FlashResult> {
+	hooks.onProgress?.({ phase: 'info', written: 0, total: image.size });
+	const session = await UpdateSession.open(streams, UPDATE_LONG_TIMEOUT_MS);
+	try {
+		return await session.flash(image, hooks);
 	} finally {
-		await channel.close();
+		await session.close();
 	}
 }
