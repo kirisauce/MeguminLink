@@ -76,7 +76,7 @@
 
 	<AdvancedSettings {session} />
 
-	<ConfigActions {session} />
+	<ConfigActions {session} onclose={onclose} />
 </div>
 
 <style>

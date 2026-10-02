@@ -355,7 +355,7 @@ export class MlinkSession {
 		await this.refreshDevices();
 		if (key === this.currentKey) {
 			if (this.device !== null) return;
-			this.#attempt = 0;
+			this.#clearSuspend();
 			void this.#retry();
 			return;
 		}
@@ -424,6 +424,7 @@ export class MlinkSession {
 	async #select(device: USBDevice): Promise<void> {
 		const key = deviceKey(device);
 		if (this.device !== null && key === this.currentKey) return;
+		this.#clearSuspend();
 		const previous = this.device;
 		if (previous !== null) {
 			this.#generation++;
@@ -707,7 +708,7 @@ export class MlinkSession {
 	 *
 	 * 更新模式对 vendor 请求一律 STALL，轮询与重试会把它当成故障反复刷错误提示；
 	 * 而且设备接下来要重新枚举，旧句柄必然作废。挂起期间本对象不碰设备，只把状态
-	 * 停在等待态、提示条写上一句人话，恢复后照常按序列号接回来。
+	 * 停在等待态、提示条写上一句人话；恢复（resume，或用户显式重连）后照常按序列号接回来。
 	 */
 	suspend(message: string): void {
 		if (this.#suspended) return;
@@ -728,10 +729,20 @@ export class MlinkSession {
 	/** 恢复：立刻试一次接回；设备还没回来的话照常按退避重试。 */
 	resume(): void {
 		if (!this.#suspended) return;
-		this.#suspended = false;
-		this.#attempt = 0;
+		this.#clearSuspend();
 		if (this.#destroyed || this.currentKey === null) return;
 		void this.#retry();
+	}
+
+	/**
+	 * 退出挂起态（不触发接回，接回由调用方决定）。
+	 *
+	 * 挂起只是"设备暂时归烧录或更新模式独占"，不是禁止用户接手：硬复位回来之后
+	 * 从顶栏「连接设备」或设备菜单显式重连，就该照常接上。
+	 */
+	#clearSuspend(): void {
+		this.#suspended = false;
+		this.#attempt = 0;
 	}
 
 	/**

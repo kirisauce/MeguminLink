@@ -4,7 +4,10 @@
 	import ConfirmDialog from '../../ui/ConfirmDialog.svelte';
 	import SegmentedControl from '../../ui/SegmentedControl.svelte';
 
-	let { session }: { session: MlinkSession } = $props();
+	let { session, onclose = () => {} }: { session: MlinkSession; onclose?: () => void } = $props();
+
+	/** 挂起期间提示条上的说明：进更新模式后设备不再响应 vendor 请求，页面只能等用户动手。 */
+	const UPDATE_MODE_NOTICE = '设备已进入更新模式，请使用「操作 → 烧录固件…」或手动重连设备';
 
 	const busy = $derived(session.commandPending || session.device === null);
 	const mode = $derived(session.stats?.mode ?? null);
@@ -79,6 +82,18 @@
 			},
 			run: () => session.reset(),
 		},
+		{
+			key: 'update',
+			label: '进入更新模式',
+			danger: true,
+			disabled: false,
+			confirm: {
+				title: '进入更新模式？',
+				message: '设备会重启进更新模式：USB 只剩一个升级串口，页面在这期间看不到它。要回正常模式，按复位键或重新插拔一次。',
+				confirmLabel: '进入',
+			},
+			run: enterUpdateMode,
+		},
 	]);
 
 	/** 待确认动作的 key（actions 每次重算都会重建对象，只能靠 key 找回）；null = 弹窗关闭。 */
@@ -108,6 +123,20 @@
 	function setMode(value: number): void {
 		dismiss();
 		void session.setMode(value);
+	}
+
+	/**
+	 * 命令被设备接受才挂起会话：更新模式对 vendor 请求一律 STALL，让轮询继续跑
+	 * 只会把 STALL 当成故障反复刷提示。这里不接管串口，回正常模式由用户显式重连。
+	 *
+	 * 顺手收起抽屉：设备已经不在，面板上的字段与按钮只会剩一片「—」和禁用态，
+	 * 让位给面板上那句提示更有用。
+	 */
+	async function enterUpdateMode(): Promise<void> {
+		await session.enterUpdateMode();
+		if (session.commandError !== null) return;
+		session.suspend(UPDATE_MODE_NOTICE);
+		onclose();
 	}
 </script>
 
