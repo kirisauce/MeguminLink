@@ -125,13 +125,13 @@ void UartBridge::rx_task_fn(void *arg)
                 if (app.mode() == Mode::Local)
                 {
                     // Local：本机串口与主机 CDC 直通，不经过无线
-                    app.config_channel().add_uart_tx(static_cast<u16>(app.usb().cdc().send_uart_data(buffer, n)));
+                    app.config_channel().add_uart_rx(static_cast<u16>(app.usb().cdc().send_uart_data(buffer, n)));
                     continue;
                 }
 #endif
                 // 无线：本机目标串口的字节交给对端 CDC
                 app.forward_uart_data_from_port(buffer, n, UartSource::Target);
-                app.config_channel().add_uart_wireless_rx(static_cast<u16>(n));
+                app.config_channel().add_uart_wireless_tx(static_cast<u16>(n));
             }
             break;
         }
@@ -194,7 +194,7 @@ void UartBridge::tx_task_fn(void *arg)
 #if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
         // 来自目标侧方向的帧写本机 CDC（无 USB 或 CDC 接口未编译的一端没有落点，丢弃）
         auto &app = Application::get_instance();
-        app.config_channel().add_uart_wireless_tx(
+        app.config_channel().add_uart_wireless_rx(
             static_cast<u16>(app.usb().cdc().send_uart_data(frame.data, frame.len)));
 #endif
     }
@@ -229,16 +229,16 @@ void UartBridge::send_uart_data(const u8 *data, size_t len)
         done += static_cast<size_t>(written);
     }
 
-    // 统计按当前模式落口径：Local 是主机 CDC → 本机 UART 的写入量，
-    // Wireless 是无线数据写回本机 UART TX 的量。只计真正写进去的部分。
+    // 统计按当前模式落口径：Local 是本机 UART TX 引脚的发出量，
+    // Wireless 是空口写回本机 UART 的量。只计真正写进去的部分。
     auto &app = Application::get_instance();
     if (app.mode() == Mode::Local)
     {
-        app.config_channel().add_uart_rx(static_cast<u16>(done));
+        app.config_channel().add_uart_tx(static_cast<u16>(done));
     }
     else
     {
-        app.config_channel().add_uart_wireless_tx(static_cast<u16>(done));
+        app.config_channel().add_uart_wireless_rx(static_cast<u16>(done));
     }
 }
 

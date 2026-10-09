@@ -475,10 +475,10 @@ enum : u8
     TAG_LOSS_FRAMES = 0x26,  // u32：参与丢包注入判定的出向帧数
     TAG_LOSS_DROPPED = 0x27, // u32：被注入丢弃的帧数
 #endif
-    TAG_UART_RX = 0x30,          // u32：Local 模式 CDC → UART 字节数
-    TAG_UART_TX = 0x31,          // u32：Local 模式 UART → CDC 字节数
-    TAG_UART_WIRELESS_RX = 0x32, // u32：Wireless 模式 CDC → 无线 字节数
-    TAG_UART_WIRELESS_TX = 0x33, // u32：Wireless 模式 无线 → CDC 字节数
+    TAG_UART_RX = 0x30,          // u32：Local 模式本机 UART RX 收到的字节数
+    TAG_UART_TX = 0x31,          // u32：Local 模式本机 UART TX 发出的字节数
+    TAG_UART_WIRELESS_RX = 0x32, // u32：Wireless 模式空口写回本机的字节数
+    TAG_UART_WIRELESS_TX = 0x33, // u32：Wireless 模式本机发往空口的字节数
     TAG_UART_HOST_OPEN = 0x34,   // u8：主机是否已打开 CDC 串口（DTR）
     TAG_UART_BAUD = 0x35,        // u32：主机下发的波特率
     TAG_UART_DATA_BITS = 0x36,   // u8：数据位 5-8

@@ -47,16 +47,16 @@ class ConfigChannel
     /** ESP-NOW 一帧接收（wireless/link.cc 的 recv_cb 调用，rssi 取自 rx_ctrl） */
     void add_wireless_rx(u16 bytes, i8 rssi);
 
-    /** Local 模式 UART 桥：CDC → UART */
+    /** Local 模式 UART 桥：本机 UART RX 引脚收到的字节 */
     void add_uart_rx(u16 bytes);
 
-    /** Local 模式 UART 桥：UART → CDC */
+    /** Local 模式 UART 桥：本机 UART TX 引脚发出的字节 */
     void add_uart_tx(u16 bytes);
 
-    /** Wireless 模式 UART 桥：CDC → 无线 */
+    /** Wireless 模式 UART 桥：空口写回本机的串口字节 */
     void add_uart_wireless_rx(u16 bytes);
 
-    /** Wireless 模式 UART 桥：无线 → CDC */
+    /** Wireless 模式 UART 桥：本机发往空口的串口字节 */
     void add_uart_wireless_tx(u16 bytes);
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE

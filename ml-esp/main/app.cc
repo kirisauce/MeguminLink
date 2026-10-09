@@ -256,7 +256,7 @@ void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSo
     }
     else
     {
-        m_config_channel.add_uart_tx(static_cast<u16>(m_usb.cdc().send_uart_data(data, len)));
+        m_config_channel.add_uart_rx(static_cast<u16>(m_usb.cdc().send_uart_data(data, len)));
     }
 #else
     // 直通的另一端不存在：无 USB 的一端（LOCAL_MODE_SUPPORTED 为假，上电即

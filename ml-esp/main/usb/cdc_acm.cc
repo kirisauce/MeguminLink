@@ -34,7 +34,7 @@ void cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
     if (app.mode() == Mode::Wireless)
     {
         app.forward_uart_data_from_port(s_rx_buffer, rx_size, UartSource::Host);
-        app.config_channel().add_uart_wireless_rx(static_cast<u16>(rx_size));
+        app.config_channel().add_uart_wireless_tx(static_cast<u16>(rx_size));
         return;
     }
 
