@@ -385,7 +385,13 @@ Configures the DAP Hardware I/O pins for JTAG mode:
  - TDO to input mode.
 */
 __STATIC_INLINE void PORT_JTAG_SETUP (void) {
-  // TCK/TMS/TDI: 推挽输出，输入缓冲开启（DAP_SWJ_Pins 需读回），默认高
+  // 先写高输出锁存再启用输出：gpio_config 会立刻按锁存值（上电为 0）驱动引脚，
+  // nRESET 直接走这一步会给目标发复位脉冲
+  gpio_set_level(DAP_SWCLK_TCK_GPIO, 1);
+  gpio_set_level(DAP_SWDIO_TMS_GPIO, 1);
+  gpio_set_level(DAP_TDI_GPIO, 1);
+  gpio_set_level(DAP_nRESET_GPIO, 1);
+  // TCK/TMS/TDI: 推挽输出，输入缓冲开启（DAP_SWJ_Pins 需读回）
   gpio_config_t io;
   io.pin_bit_mask = (1ULL << DAP_SWCLK_TCK_GPIO) |
                     (1ULL << DAP_SWDIO_TMS_GPIO) |
@@ -395,9 +401,6 @@ __STATIC_INLINE void PORT_JTAG_SETUP (void) {
   io.pull_down_en = GPIO_PULLDOWN_DISABLE;
   io.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&io);
-  gpio_set_level(DAP_SWCLK_TCK_GPIO, 1);
-  gpio_set_level(DAP_SWDIO_TMS_GPIO, 1);
-  gpio_set_level(DAP_TDI_GPIO, 1);
   // nRESET/nTRST（共用同一根复位线）: 开漏输出 + 上拉（输入缓冲开启以便读回），默认高（释放复位）
   gpio_config_t od;
   od.pin_bit_mask = (1ULL << DAP_nRESET_GPIO);
@@ -406,7 +409,6 @@ __STATIC_INLINE void PORT_JTAG_SETUP (void) {
   od.pull_down_en = GPIO_PULLDOWN_DISABLE;
   od.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&od);
-  gpio_set_level(DAP_nRESET_GPIO, 1);
   // TDO: 输入
   gpio_config_t tdo;
   tdo.pin_bit_mask = (1ULL << DAP_TDO_GPIO);
@@ -423,7 +425,12 @@ Configures the DAP Hardware I/O pins for Serial Wire Debug (SWD) mode:
  - TDI, nTRST to HighZ mode (pins are unused in SWD mode).
 */
 __STATIC_INLINE void PORT_SWD_SETUP (void) {
-  // SWCLK/SWDIO: 推挽输出，输入缓冲开启（SWDIO 读取 / SWCLK 读回），默认高
+  // 先写高输出锁存再启用输出：gpio_config 会立刻按锁存值（上电为 0）驱动引脚，
+  // nRESET 直接走这一步会给目标发复位脉冲
+  gpio_set_level(DAP_SWCLK_TCK_GPIO, 1);
+  gpio_set_level(DAP_SWDIO_TMS_GPIO, 1);
+  gpio_set_level(DAP_nRESET_GPIO, 1);
+  // SWCLK/SWDIO: 推挽输出，输入缓冲开启（SWDIO 读取 / SWCLK 读回）
   gpio_config_t io;
   io.pin_bit_mask = (1ULL << DAP_SWCLK_TCK_GPIO) | (1ULL << DAP_SWDIO_TMS_GPIO);
   io.mode = GPIO_MODE_INPUT_OUTPUT;
@@ -431,8 +438,6 @@ __STATIC_INLINE void PORT_SWD_SETUP (void) {
   io.pull_down_en = GPIO_PULLDOWN_DISABLE;
   io.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&io);
-  gpio_set_level(DAP_SWCLK_TCK_GPIO, 1);
-  gpio_set_level(DAP_SWDIO_TMS_GPIO, 1);
   // nRESET: 开漏输出 + 上拉（输入缓冲开启以便读回），默认高（释放复位）
   gpio_config_t od;
   od.pin_bit_mask = (1ULL << DAP_nRESET_GPIO);
@@ -441,7 +446,6 @@ __STATIC_INLINE void PORT_SWD_SETUP (void) {
   od.pull_down_en = GPIO_PULLDOWN_DISABLE;
   od.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&od);
-  gpio_set_level(DAP_nRESET_GPIO, 1);
   // TDI/TDO/nTRST: 高阻输入（SWD 模式未使用）
   gpio_config_t hz;
   hz.pin_bit_mask = (1ULL << DAP_TDI_GPIO) |
