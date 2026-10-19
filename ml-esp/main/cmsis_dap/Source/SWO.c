@@ -29,6 +29,7 @@
 #include "DAP.h"
 #if (SWO_UART != 0)
 #include "Driver_USART.h"
+#include "esp_attr.h"
 #endif
 #if (SWO_STREAM != 0)
 #include "cmsis_os2.h"
@@ -103,7 +104,8 @@ static          uint32_t TransferSize;      /* Current Transfer Size */
 
 // USART Driver Callback function
 //   event: event mask
-static void USART_Callback (uint32_t event) {
+// ESP32-S3 移植：捕获回调链 IRAM 化，flash cache 禁用（NVS 写）期间捕获不中断
+IRAM_ATTR static void USART_Callback (uint32_t event) {
   uint32_t index_i;
   uint32_t index_o;
   uint32_t count;
@@ -412,7 +414,7 @@ static uint8_t GetTraceStatus (void) {
 
 // Set Trace Error flag(s)
 //   flag:  error flag(s) to set
-static void SetTraceError (uint8_t flag) {
+IRAM_ATTR static void SetTraceError (uint8_t flag) {
   TraceError[TraceError_n] |= flag;
 }
 

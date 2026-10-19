@@ -208,6 +208,7 @@ static const char TargetBoardName    [] = TARGET_BOARD_NAME;
 #define DAP_TDO_GPIO            ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_TDO_IO)    // TDO:        Test Data Output
 #define DAP_nRESET_GPIO         ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_NRESET_IO) // nRESET:     Device Reset
 #define DAP_nTRST_GPIO          DAP_nRESET_GPIO                                // nTRST:      Test Reset（与 nRESET 共用同一根复位线）
+#define DAP_SWO_GPIO            ((gpio_num_t)CONFIG_MEGUMINLINK_DAP_SWO_IO)    // SWO:        Trace Capture Input（SWO UART 捕获，仅本地执行路径使用）
 
 /** Get Vendor Name string.
 \param str Pointer to buffer to store the string (max 60 characters).

@@ -38,6 +38,15 @@ config MEGUMINLINK_DAP_TDO_IO
     int "CMSIS-DAP TDO GPIO number"
     default 8
 
+config MEGUMINLINK_DAP_SWO_IO
+    int "CMSIS-DAP SWO GPIO number"
+    default 7
+    help
+        SWO trace capture pin (SWO UART mode, receive only). Only the local
+        (USB) CMSIS-DAP implementation captures SWO; the wireless executor
+        has no SWO hardware. The capture runs on UART2, so the UART bridge
+        (UART1 by default) must not be moved to port 2.
+
 endmenu
 
 config MEGUMINLINK_USB_SUPPORT

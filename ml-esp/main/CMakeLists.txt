@@ -32,6 +32,10 @@ endif()
 file(GLOB __dap_src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Source/*.c)
 list(APPEND __src ${__dap_src})
 
+# CMSIS-Driver USART 适配层（Driver_USART0，SWO UART 捕获的接收通路）：
+# SWO_UART=0 的构建（非 USB 目标）里文件内容为空，保持登记以维持清单完整。
+list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/cmsis_dap/Config/Driver_USART.cc)
+
 # LED 指示灯模块：两个驱动的源文件都无条件编译——公共接口（led_types.hpp 的基类与
 # concept）改动时，未被选中的那个驱动也必须在编译期暴露出来，否则它会在没有板子使用
 # 的情况下悄悄腐烂。未被选中的驱动不会被引用，链接器不会把它取进镜像；Disabled 时
