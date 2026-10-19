@@ -14,6 +14,6 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(
     megumin-link-esp
-    LANGUAGE C CXX
     VERSION 1.0.0
+    LANGUAGES C CXX
 )
