@@ -142,13 +142,19 @@ This information includes:
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
-#define SWO_UART                0               ///< SWO UART:  1 = available, 0 = not available.
+// USB 支持 depends on IDF_TARGET_ESP32S3：无 USB 目标（ESP32-C3 无线接收端）的
+// sdkconfig.h 不定义该宏，此处补 0 使 SWO_UART 的数值比较在所有目标上可用。
+#ifndef CONFIG_MEGUMINLINK_USB_SUPPORT
+#define CONFIG_MEGUMINLINK_USB_SUPPORT 0
+#endif
+
+#define SWO_UART                CONFIG_MEGUMINLINK_USB_SUPPORT  ///< SWO UART: 1 = available（仅本地 USB 执行路径）, 0 = not available.
 
 /// USART Driver instance number for the UART SWO.
 #define SWO_UART_DRIVER         0               ///< USART Driver instance number (Driver_USART#).
 
 /// Maximum SWO UART Baudrate.
-#define SWO_UART_MAX_BAUDRATE   10000000U       ///< SWO UART Maximum Baudrate in Hz.
+#define SWO_UART_MAX_BAUDRATE   5000000U        ///< SWO UART Maximum Baudrate in Hz（ESP32-S3 UART，APB 时钟上限）.
 
 /// Indicate that Manchester Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.

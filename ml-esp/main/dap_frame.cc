@@ -305,11 +305,34 @@ FrameInfo parse_frame(const u8 *request, size_t avail, bool allow_batch)
     case ID_DAP_JTAG_IDCODE:
         // 响应 [ID][OK] + 4B IDCODE
         return enough(avail, 2) ? frame(2, 6) : need_more();
+    case ID_DAP_SWO_Transport:
+        // [ID][Transport] → [ID][OK/ERR]
+        return enough(avail, 2) ? frame(2, 2) : need_more();
+    case ID_DAP_SWO_Mode:
+        // [ID][Mode] → [ID][OK/ERR]
+        return enough(avail, 2) ? frame(2, 2) : need_more();
+    case ID_DAP_SWO_Baudrate:
+        // [ID][Baudrate 4B] → [ID][Baudrate 4B]
+        return enough(avail, 5) ? frame(5, 5) : need_more();
+    case ID_DAP_SWO_Control:
+        // [ID][Control] → [ID][OK/ERR]
+        return enough(avail, 2) ? frame(2, 2) : need_more();
+    case ID_DAP_SWO_Status:
+        // 无请求参数 → [ID][Status][Count 4B]
+        return frame(1, 6);
+    case ID_DAP_SWO_ExtendedStatus:
+        // [ID][Cmd] → [ID] + 按 Cmd 位回 Status(1B)/Count(4B)/Timestamp(8B)
+        return enough(avail, 2) ? frame(2, 14) : need_more();
+    case ID_DAP_SWO_Data: {
+        // [ID][Count 2B] → [ID][Status][Count 2B] + 数据；数据段在 SWO_Data 内
+        // 被截到 DAP_PACKET_SIZE-4（上游 SWO.c 按 v1 包尺寸的固定上限）
+        return enough(avail, 3) ? frame(3, 3U + DAP_PACKET_SIZE - 4U) : need_more();
+    }
     case ID_DAP_ExecuteCommands:
         return allow_batch ? batch_frame(request, avail) : frame(1, 1);
     default:
-        // SWO / DAP UART / 供应商命令与未定义命令：本固件的 DAP_config.h 中
-        // SWO_UART、SWO_MANCHESTER、DAP_UART 均为 0，DAP_ProcessCommand 不含
+        // DAP UART / 供应商命令与未定义命令：本固件的 DAP_config.h 中
+        // SWO_MANCHESTER、DAP_UART 均为 0，DAP_ProcessCommand 不含
         // 这些分支，按单字节命令消耗并回 Invalid，此处保持同一行为。
         return frame(1, 1);
     }
