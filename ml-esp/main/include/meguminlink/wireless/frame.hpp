@@ -18,24 +18,29 @@ namespace mlink
  * （8 字节头 + 本包）由 arq_link 负责——可靠性、序号、确认都是 ARQ 层的事，业务
  * 包只管"这条消息是什么"。
  *
- * 帧格式：[type:1B][帧体]；DapCommand 的帧体比 DapResponse 多一个主机侧通道标记。
- * 数据段上限由 ESP-NOW v2 单帧上限（1470B）扣掉 ARQ 头、本包的类型/长度字段与
- * 通道标记得出，当前为 1458B。USB 侧命令按 DAP_PACKET_SIZE 分包到达，接收侧由
- * dap_request_size() 重组为完整命令后再转发。
+ * 帧格式：[type:1B][帧体]；DapCommand 的帧体是长度 + 通道标记 + 请求号，DapResponse
+ * 的是长度 + 请求号。请求号由主机侧分配、接收端原样带回，与 ARQ 序号无关，配对只
+ * 认它。数据段上限由 ESP-NOW v2 单帧上限（1470B）扣掉 ARQ 头、本包的类型/长度字段
+ * 与最宽的附加字段（命令 3B）得出，当前为 1456B。USB 侧命令按 DAP_PACKET_SIZE 分包
+ * 到达，接收侧由 dap_request_size() 重组后再转发。
  */
 inline constexpr size_t DAP_FRAME_HEADER_SIZE = 3;
 /** DapCommand 帧体里的通道标记字节（见 payload::DapCommand::channel） */
 inline constexpr size_t DAP_CHANNEL_FIELD_SIZE = 1;
+/** 命令与响应帧体里的请求号字段（见 payload::DapCommand/DapResponse::req_id） */
+inline constexpr size_t DAP_REQUEST_FIELD_SIZE = 2;
+/** 帧体附加字段的最大宽度：命令带 channel + req_id，响应只带 req_id */
+inline constexpr size_t DAP_FRAME_FIELDS_MAX = DAP_CHANNEL_FIELD_SIZE + DAP_REQUEST_FIELD_SIZE;
 inline constexpr size_t MAX_DAP_PAYLOAD_SIZE =
-    ESP_NOW_MAX_DATA_LEN_V2 - ARQ_HEADER_SIZE - DAP_FRAME_HEADER_SIZE - DAP_CHANNEL_FIELD_SIZE;
+    ESP_NOW_MAX_DATA_LEN_V2 - ARQ_HEADER_SIZE - DAP_FRAME_HEADER_SIZE - DAP_FRAME_FIELDS_MAX;
 inline constexpr size_t DAP_FRAME_MAX_SIZE =
-    ARQ_HEADER_SIZE + DAP_FRAME_HEADER_SIZE + DAP_CHANNEL_FIELD_SIZE + MAX_DAP_PAYLOAD_SIZE;
+    ARQ_HEADER_SIZE + DAP_FRAME_HEADER_SIZE + DAP_FRAME_FIELDS_MAX + MAX_DAP_PAYLOAD_SIZE;
 
 /** 执行器请求缓冲（DAP_MAX_REQUEST_SIZE）必须装得下无线单帧能承载的命令 */
 static_assert(MAX_DAP_PAYLOAD_SIZE <= DAP_MAX_REQUEST_SIZE, "wire payload exceeds executor request buffer");
 static_assert(DAP_FRAME_MAX_SIZE <= ESP_NOW_MAX_DATA_LEN_V2, "frame exceeds ESP-NOW v2 single-frame capacity");
 /** 业务包必须装得进 ARQ 层的单条载荷上限 */
-static_assert(DAP_FRAME_HEADER_SIZE + DAP_CHANNEL_FIELD_SIZE + MAX_DAP_PAYLOAD_SIZE <= ArqLink::MAX_PAYLOAD,
+static_assert(DAP_FRAME_HEADER_SIZE + DAP_FRAME_FIELDS_MAX + MAX_DAP_PAYLOAD_SIZE <= ArqLink::MAX_PAYLOAD,
               "wire payload exceeds ARQ payload capacity");
 
 /**
@@ -71,6 +76,7 @@ struct PairingAccepted
  */
 struct DapCommand
 {
+    u16 req_id;     /**< 主机侧为这条命令分配的请求号：响应原样带回，用于精确配对 */
     u16 len;        /**< 有效数据长度（data[0..len-1]） */
     u8 channel;     /**< 主机侧 USB 传输通道（DAP_CHANNEL_*）：对端据此回答 Packet Size */
     const u8 *data; /**< 命令字节流（指向调用方存储） */
@@ -79,6 +85,7 @@ struct DapCommand
 /** 与 DapCommand 同构：接收端执行 DAP 命令后的响应视图 */
 struct DapResponse
 {
+    u16 req_id;     /**< 回应的是哪条命令（命令的请求号） */
     u16 len;        /**< 有效数据长度（data[0..len-1]） */
     const u8 *data; /**< 响应字节流（指向调用方存储） */
 };

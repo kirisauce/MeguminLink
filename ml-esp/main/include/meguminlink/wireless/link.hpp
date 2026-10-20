@@ -30,7 +30,8 @@ inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xf
 struct DapExecuteRequest
 {
     u8 src_mac[ESP_NOW_ETH_ALEN];
-    u16 cmd_seq;
+    u16 cmd_seq; /**< 命令在可靠传输里的序号：对端重传时据此重放响应 */
+    u16 req_id;  /**< 主机分配的请求号：原样带回给主机，供它精确配对 */
     u16 len;
     u8 channel; /**< 主机侧 USB 传输通道（DAP_CHANNEL_*）：决定回给主机的 Packet Size */
     u8 data[MAX_DAP_PAYLOAD_SIZE];
@@ -86,7 +87,7 @@ inline constexpr u8 MAX_LOSS_PERMILLE = 255;
  * 状态全在对象内。与 usb.cc 的 dap_task（USB 侧执行接线）对称：无线传输层把
  * 收到的 DapCommand 交给公共执行器（dap_executor_run）执行，结果以 DapResponse
  * 业务包回发给来源；发送端（USB 侧）经 submit_dap_command 提交命令，响应由接收
- * 回调入队后按可靠传输序号配回。
+ * 回调入队后按命令的请求号配回。
  *
  * 可靠性归 arq_link 管：本层只负责"这是什么业务包"，每条发送通路在调用
  * m_arq.submit 时显式给出自己的可靠性等级——本层不按包类型猜。
@@ -110,15 +111,17 @@ class WirelessLink
     /**
      * 打包一条 DAP 命令/响应（原样字节流）为对应业务包并通过可靠传输发送给对端。
      * 命令包额外带上主机侧通道标记（channel，见 DAP_CHANNEL_*）：对端据此回答
-     * DAP_Info 的单包尺寸；响应包不需要它。
+     * DAP_Info 的单包尺寸；响应包不需要它。req_id 原样带到对端，响应里带回来。
      */
-    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 *seq_out = nullptr);
+    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 req_id,
+                               u16 *seq_out = nullptr);
 
     /**
-     * 回发一条 DAP 响应。@param cmd_seq 它回应的是哪条命令：对端重传那条命令时
-     * 据此重放这条响应，而不是把命令再执行一遍。
+     * 回发一条 DAP 响应。@param req_id 它回应的是哪条命令（主机分配的请求号）；
+     * @param cmd_seq 命令在可靠传输里的序号：对端重传那条命令时据此重放这条响应，
+     * 而不是把命令再执行一遍。
      */
-    esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 cmd_seq);
+    esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 req_id, u16 cmd_seq);
 
     /**
      * 串口出向准入：令牌桶限速 + DAP 让路。
@@ -243,10 +246,11 @@ class WirelessLink
      *
      * @param channel 该命令来自哪条主机侧 USB 通道（DAP_CHANNEL_*）：随命令送到对端，
      *                供它回答 DAP_Info 的单包尺寸
-     * @param seq_out 输出：本条命令的可靠传输序号
+     * @param req_id  本条命令的请求号：随命令送到对端并由响应带回，用于精确配对
+     * @param seq_out 输出：本条命令的可靠传输序号（失败销账用）
      * @return ESP_OK=已发出；否则失败（未配对 / 会话未对齐 / 发送或提交失败）
      */
-    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 *seq_out);
+    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 req_id, u16 *seq_out);
 
     /**
      * 取出一条已被可靠传输判定失败的命令序号（重传耗尽）。
@@ -286,12 +290,13 @@ class WirelessLink
      * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
      * @param cmd_seq 该命令在可靠传输里的序号；回响应时按它记账，
      *                对端重传同一条命令时据此重放响应而不是重新执行
+     * @param req_id  主机为该命令分配的请求号：响应原样带回，供主机精确配对
      * @param data    DAP 命令原样字节流
      * @param len     命令长度（> MAX_DAP_PAYLOAD_SIZE 时拒绝）
      * @param channel 该命令来自的主机侧 USB 通道（DAP_CHANNEL_*）：执行器据此回答
      *                DAP_Info 的单包尺寸
      */
-    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len, u8 channel);
+    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, u16 req_id, const u8 *data, size_t len, u8 channel);
 
   private:
     /** ESP-NOW 接收/发送回调（esp_now 要求 C 函数指针，无 arg；经 Application 访问） */
@@ -464,8 +469,10 @@ class WirelessLink
     TaskHandle_t m_dap_task = nullptr;
     /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
     u8 m_dap_src_mac[ESP_NOW_ETH_ALEN];
-    /** 最近一条命令的可靠传输序号；仅执行任务线程读写（回响应时按它记账） */
+    /** 最近一条命令的可靠传输序号；仅执行任务线程读写（响应重放按它记账） */
     u16 m_dap_cmd_seq = 0;
+    /** 最近一条命令的请求号；仅执行任务线程读写（响应里带回给主机） */
+    u16 m_dap_req_id = 0;
     /** 从命令队列取出的待执行命令（不占 dap-wireless 任务栈；仅执行任务线程读写） */
     DapExecuteRequest m_dap_pending;
     /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */

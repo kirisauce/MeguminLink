@@ -266,8 +266,8 @@ FrameInfo parse_frame(const u8 *request, size_t avail, bool allow_batch)
     switch (request[0])
     {
     case ID_DAP_Info:
-        // 响应 [ID][Length] + DAP_Info 数据（最长 4B）
-        return enough(avail, 2) ? frame(2, 6) : need_more();
+        // 响应 [ID][Length] + DAP_Info 数据（最长 12B vendor 字符串）
+        return enough(avail, 2) ? frame(2, 14) : need_more();
     case ID_DAP_HostStatus:
         return enough(avail, 3) ? frame(3, 2) : need_more();
     case ID_DAP_Connect:

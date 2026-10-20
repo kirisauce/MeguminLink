@@ -31,14 +31,15 @@
 static constexpr char TAG[] = "mlink::usb";
 
 /**
- * vendor IN 已发出的累计字节数（由 tud_vendor_tx_cb 累加）。
- *
- * 响应写回靠它确认"这一整条真的被主机读走了"：vendor FIFO 是字节流、没有消息边界，
- * 两条响应同时排在里面会被主机的一次读合并成一条，而按"一次读一条响应"解析的主机
- * （pyocd 的延迟传输正是如此）只能解出第一条、其余全丢。注意一条响应可能跨多次 IN
- * 传输（端点 64B），所以判据是"累计字节数够了"，而不是"回调来过一次"。
+ * vendor IN 已发出的累计字节数（由 tud_vendor_tx_cb 累加），与 s_vendor_tx_queued
+ * 一起判定主机是否把响应整条取走：vendor FIFO 是字节流、没有消息边界，两条响应同时
+ * 排在 FIFO 里会被主机的一次读合并成一条，而按"一次读一条响应"解析的主机只能解出
+ * 第一条。一条响应可能跨多次 IN 传输（端点 64B），判据因此是累计字节数追平。
  */
 static volatile u32 s_vendor_tx_bytes = 0;
+
+/** 已写入 vendor FIFO 的累计字节数（dap_task 串行写，无需原子） */
+static u32 s_vendor_tx_queued = 0;
 
 /** 重新枚举前的断开时长：给主机足够时间感知拔出（软断开本身在 ms 级生效） */
 static constexpr u32 RECONNECT_DELAY_MS = 100;
@@ -201,22 +202,26 @@ void dap_send_vendor_response(const u8 *data, u16 len)
     // 不会自动发起 IN 传输，短响应必须显式 flush 才能送达主机
     tud_vendor_n_write_flush(USB_DAP_INTERFACE);
 
-    // 等这条响应整条被主机读走再返回（见 s_vendor_tx_bytes 的说明）：端点只有 64B，
-    // 大响应要跨多次 IN 传输，只等第一段就放行会把这条响应截断、下一条接上去。
-    // 等待要够长：主机在连发命令时不会同时读响应。500ms 仍等不到就交给超时销账兜底。
-    const u32 sent_before = s_vendor_tx_bytes;
+    // 等这条响应（连同此前遗留的）整条被主机读走再返回：端点只有 64B，大响应要跨
+    // 多次 IN 传输，只等第一段就放行会让下一条响应接上来、主机端整体错开一条。
+    s_vendor_tx_queued += len;
     for (int w = 0; w < 500; w++)
     {
         if (!tud_vendor_n_mounted(USB_DAP_INTERFACE))
         {
             return;
         }
-        if ((s_vendor_tx_bytes - sent_before) >= len)
+        if (s_vendor_tx_bytes == s_vendor_tx_queued)
         {
-            break;
+            return;
         }
         vTaskDelay(1);
     }
+
+    // 主机 500ms 没取走：调试器已退出或重启。把发送计数对齐到实际已发字节，避免下一条
+    // 响应的等待被这些陈旧字节提前满足；数据留在端点，由主机下次读时取走。
+    s_vendor_tx_queued = s_vendor_tx_bytes;
+    ESP_LOGW(TAG, "vendor response unread for 500 ms, host likely gone");
 }
 
 #if CONFIG_MEGUMINLINK_USB_HID_DAP_ENABLE
@@ -284,10 +289,13 @@ bool dap_source_ready(DapSource source)
     return tud_vendor_n_mounted(USB_DAP_INTERFACE);
 }
 
-/** 一条已提交、还没拿到响应的无线 DAP 命令（响应按可靠传输序号配回来） */
+/** 一条已提交、还没拿到响应的无线 DAP 命令（响应按请求号配回来） */
 struct PendingWirelessCommand
 {
     bool used = false;
+    /** 提交时分配的请求号：随命令送到对端、随响应带回来，响应按它配对 */
+    u16 req_id = 0;
+    /** 可靠传输序号：重传耗尽时 ARQ 层按它上抛失败，销账用 */
     u16 seq = 0;
     /** 命令号（请求首字节）：销账日志用它指明失败的是哪条命令 */
     u8 cmd_id = 0;
@@ -305,43 +313,30 @@ struct DapTaskContext
     mlink::CmsisDapUsb *usb;
     DapSource source = DapSource::VendorBulk;
     u16 request_len = 0;
+    /** 下一条命令的请求号（回绕后与在途条目碰撞的概率极低，且槽位本身只有 8 个） */
+    u16 next_req_id = 1;
     PendingWirelessCommand pending[CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH];
 };
 
-/**
- * 取最老的一条挂起条目（响应按先进先出配回）。
- *
- * 不能用响应携带的 seq 去匹配命令：两端各有独立的发送序号空间，响应上的 seq 是
- * 对端发那条响应时用的序号，与本地命令的序号没有对应关系。窗口为 1 时两侧恰好
- * 同步递增，看着能对上；一旦并发、或任一端重置过会话，就会整体错位——响应全部
- * 配不上而被当成迟到丢掉，主机侧表现为收不到响应直至超时。
- *
- * 可靠传输保证响应按命令顺序交付（乱序已在接收侧重排），所以顺序配对是成立的。
- */
-PendingWirelessCommand *oldest_pending(DapTaskContext &ctx)
-{
-    PendingWirelessCommand *found = nullptr;
-    for (PendingWirelessCommand &pending : ctx.pending)
-    {
-        if (!pending.used)
-        {
-            continue;
-        }
-        // tick 回绕周期远长于挂起条目的存活时间（< 2s），直接比大小即可
-        if (found == nullptr || pending.sent_tick < found->sent_tick)
-        {
-            found = &pending;
-        }
-    }
-    return found;
-}
-
-/** 按命令自己的序号找挂起条目（失败销账用：take_failed 给的是本地命令序号） */
+/** 按可靠传输序号找挂起条目（重传耗尽时 ARQ 层上报的就是它） */
 PendingWirelessCommand *find_pending(DapTaskContext &ctx, u16 seq)
 {
     for (PendingWirelessCommand &pending : ctx.pending)
     {
         if (pending.used && pending.seq == seq)
+        {
+            return &pending;
+        }
+    }
+    return nullptr;
+}
+
+/** 按请求号找挂起条目（响应配对的唯一依据：对端把命令的请求号原样带回来） */
+PendingWirelessCommand *find_pending_by_req(DapTaskContext &ctx, u16 req_id)
+{
+    for (PendingWirelessCommand &pending : ctx.pending)
+    {
+        if (pending.used && pending.req_id == req_id)
         {
             return &pending;
         }
@@ -373,9 +368,10 @@ void submit_wireless_command(DapTaskContext &ctx, const u8 *cmd, u16 len)
 
     u16 seq = 0;
     // 通道标记随命令送到对端：对端据此回答 DAP_Info 的单包尺寸，HID 与 bulk 的
-    // 可承载命令大小不同（见 DAP_CHANNEL_*）
+    // 可承载命令大小不同（见 DAP_CHANNEL_*）。请求号由本端分配，与 ARQ 序号无关。
     const u8 channel = (ctx.source == DapSource::Hid) ? DAP_CHANNEL_HID : DAP_CHANNEL_VENDOR_BULK;
-    const esp_err_t ret = app.wireless_link().submit_dap_command(cmd, len, channel, &seq);
+    const u16 req_id = ctx.next_req_id++;
+    const esp_err_t ret = app.wireless_link().submit_dap_command(cmd, len, channel, req_id, &seq);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "cannot submit DAP cmd 0x%02X (%s) len=%u: %s", cmd_id, dap_command_name(cmd_id),
@@ -384,6 +380,7 @@ void submit_wireless_command(DapTaskContext &ctx, const u8 *cmd, u16 len)
     }
 
     slot->used = true;
+    slot->req_id = req_id;
     slot->seq = seq;
     slot->cmd_id = cmd_id;
     slot->source = ctx.source;
@@ -403,21 +400,23 @@ void drain_wireless_responses(DapTaskContext &ctx)
 {
     auto &app = mlink::Application::get_instance();
 
-    // 1) 已到达的响应：按序号配回，并按命令当初的来源通道写回
+    // 1) 已到达的响应：按它回应的命令请求号精确配回，并按命令当初的来源通道写回
     for (;;)
     {
-        u16 seq = 0;
+        u16 req_id = 0;
         u16 len = 0;
-        if (!app.wait_wireless_response(&seq, dap_response, &len, 0))
+        if (!app.wait_wireless_response(&req_id, dap_response, &len, 0))
         {
             break;
         }
 
-        PendingWirelessCommand *pending = oldest_pending(ctx);
+        PendingWirelessCommand *pending = find_pending_by_req(ctx, req_id);
         if (pending == nullptr)
         {
-            // 没有任何在途命令：已销账的命令迟到的响应，回写会让主机响应流错位
-            ESP_LOGW(TAG, "late wireless DAP response seq=%u (%u bytes) dropped", seq, static_cast<unsigned>(len));
+            // 命令已销账（重传耗尽/超时）或已配过：迟到的与重传重放的响应都归这一类，
+            // 回写会让主机后续的响应整体错开一条
+            ESP_LOGW(TAG, "stale wireless DAP response req_id=%u (%u bytes) dropped", req_id,
+                     static_cast<unsigned>(len));
             continue;
         }
 

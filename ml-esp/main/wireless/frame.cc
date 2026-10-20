@@ -34,12 +34,13 @@ size_t Packet::serialized_size() const
         break;
     }
     case PacketType::DapCommand: {
-        // 命令帧体比响应多一个通道标记字节（见 DAP_CHANNEL_FIELD_SIZE）
-        body = DAP_FRAME_HEADER_SIZE + DAP_CHANNEL_FIELD_SIZE + payload.dap_command.len;
+        // 帧体 = len 2B + channel 1B + req_id 2B + 命令字节
+        body = DAP_FRAME_HEADER_SIZE + DAP_CHANNEL_FIELD_SIZE + DAP_REQUEST_FIELD_SIZE + payload.dap_command.len;
         break;
     }
     case PacketType::DapResponse: {
-        body = DAP_FRAME_HEADER_SIZE + payload.dap_response.len;
+        // 帧体 = len 2B + req_id 2B + 响应字节
+        body = DAP_FRAME_HEADER_SIZE + DAP_REQUEST_FIELD_SIZE + payload.dap_response.len;
         break;
     }
     case PacketType::UartFromHost:
@@ -99,15 +100,17 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
     case PacketType::DapCommand: {
         // 数据段拷入调用方存储，data 指向该存储（见 ReceivedPacket::storage）
         auto &content = payload.dap_command;
-        MLINK_CHECK_SIZE(p, 3);
+        MLINK_CHECK_SIZE(p, 5);
         const u16 n = p.read_u16();
         const u8 channel = p.read_u8();
+        const u16 req_id = p.read_u16();
         if (n > storage_cap)
         {
             return ESP_ERR_INVALID_SIZE;
         }
         MLINK_CHECK_SIZE(p, n);
         p.read_bytes(storage, n);
+        content.req_id = req_id;
         content.len = n;
         content.channel = channel;
         content.data = storage;
@@ -115,14 +118,16 @@ esp_err_t Packet::deserialize(const u8 *data, size_t len, u8 *storage, size_t st
     }
     case PacketType::DapResponse: {
         auto &content = payload.dap_response;
-        MLINK_CHECK_SIZE(p, 2);
+        MLINK_CHECK_SIZE(p, 4);
         const u16 n = p.read_u16();
+        const u16 req_id = p.read_u16();
         if (n > storage_cap)
         {
             return ESP_ERR_INVALID_SIZE;
         }
         MLINK_CHECK_SIZE(p, n);
         p.read_bytes(storage, n);
+        content.req_id = req_id;
         content.len = n;
         content.data = storage;
         break;
@@ -229,9 +234,10 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        MLINK_CHECK_SIZE(s, 3);
+        MLINK_CHECK_SIZE(s, 5);
         s.write_u16(content.len);
         s.write_u8(content.channel);
+        s.write_u16(content.req_id);
         MLINK_CHECK_SIZE(s, content.len);
         s.write_bytes(content.data, content.len);
         break;
@@ -242,8 +248,9 @@ esp_err_t Packet::serialize(u8 *buffer, size_t len) const
         {
             return ESP_ERR_INVALID_SIZE;
         }
-        MLINK_CHECK_SIZE(s, 2);
+        MLINK_CHECK_SIZE(s, 4);
         s.write_u16(content.len);
+        s.write_u16(content.req_id);
         MLINK_CHECK_SIZE(s, content.len);
         s.write_bytes(content.data, content.len);
         break;

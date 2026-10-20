@@ -86,30 +86,30 @@ class Application
     /** 由主任务调用：取走全部积压帧（返回后本队列为空） */
     std::vector<ReceivedPacket> take_received_packets();
 
-    /** 一条无线 DAP 响应：带上可靠传输序号，供发送端配回挂起的命令 */
+    /** 一条无线 DAP 响应：带上它所回应的命令请求号，供发送端精确配回挂起的命令 */
     struct WirelessResponse
     {
-        u16 seq;                       /**< 可靠传输序号；未启用可靠传输时为 0 */
+        u16 req_id;                    /**< 回应的是哪条命令（主机分配的请求号） */
         u16 len;                       /**< 载荷长度 */
         u8 data[MAX_DAP_PAYLOAD_SIZE]; /**< 载荷 */
     };
 
     /**
-     * 主循环/接收回调调用：把收到的无线 DAP 响应连同它的可靠传输序号入队。
+     * 主循环/接收回调调用：把收到的无线 DAP 响应连同它回应的命令请求号入队。
      * 队列而不是单缓冲——窗口大于 1 时一次乱序补齐会连续交付多条响应，单缓冲会把
      * 前一条覆盖掉，主机的响应流随之整体错位。
      */
-    void push_wireless_response(u16 seq, const u8 *data, u16 len);
+    void push_wireless_response(u16 req_id, const u8 *data, u16 len);
 
     /**
      * 由 dap_task 调用：取一条已到达的无线 DAP 响应。
-     * @param seq        输出：响应的可靠传输序号（未启用可靠传输时为 0）
+     * @param req_id     输出：响应对应的命令请求号
      * @param buf        响应缓冲区（容量需 ≥ MAX_DAP_PAYLOAD_SIZE）
      * @param len        输出：实际响应字节数
      * @param timeout_ms 等待超时；0 = 只取已到达的，不等待
      * @return true=取到；false=超时或队列为空
      */
-    bool wait_wireless_response(u16 *seq, u8 *buf, u16 *len, u32 timeout_ms);
+    bool wait_wireless_response(u16 *req_id, u8 *buf, u16 *len, u32 timeout_ms);
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     CmsisDapUsb &usb();

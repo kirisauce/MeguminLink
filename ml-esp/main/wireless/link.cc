@@ -150,7 +150,7 @@ esp_err_t WirelessLink::init()
         // ARQ 层：自带任务与收发环，必须在注册 ESP-NOW 回调之前就绪（回调一注册
         // 就可能进帧）。载荷上限取业务包上限（最大的业务包是 DAP 命令），
         // frame.hpp 的 static_assert 保证它装得下。
-        const size_t arq_payload_cap = DAP_FRAME_HEADER_SIZE + DAP_CHANNEL_FIELD_SIZE + MAX_DAP_PAYLOAD_SIZE;
+        const size_t arq_payload_cap = DAP_FRAME_HEADER_SIZE + DAP_FRAME_FIELDS_MAX + MAX_DAP_PAYLOAD_SIZE;
         const esp_err_t arq_ret = m_arq.init(arq_settings_load(), arq_payload_cap);
         ESP_RETURN_ON_ERROR(arq_ret, TAG, "m_arq.init() failed");
 
@@ -650,7 +650,8 @@ void WirelessLink::clear_espnow_backoff(u32 now)
     portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
-esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 *seq_out)
+esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 req_id,
+                                         u16 *seq_out)
 {
     if (len > MAX_DAP_PAYLOAD_SIZE)
     {
@@ -663,13 +664,14 @@ esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, siz
     Packet packet;
     packet.packet_type = PacketType::DapCommand;
     auto &content = packet.payload.dap_command;
+    content.req_id = req_id;
     content.len = static_cast<u16>(len);
     content.channel = channel;
     content.data = data;
     return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, seq_out);
 }
 
-esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 cmd_seq)
+esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 req_id, u16 cmd_seq)
 {
     if (len > MAX_DAP_PAYLOAD_SIZE)
     {
@@ -682,9 +684,11 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
     Packet packet;
     packet.packet_type = PacketType::DapResponse;
     auto &content = packet.payload.dap_response;
+    content.req_id = req_id;
     content.len = static_cast<u16>(len);
     content.data = data;
 
+    // ARQ 层的记账用命令的可靠传输序号（重传重放），业务层的配对用 req_id
     const ResponseContext response = {true, cmd_seq};
     return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, nullptr, response);
 }
@@ -786,7 +790,7 @@ esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const paylo
     return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, false);
 }
 
-esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 *seq_out)
+esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 req_id, u16 *seq_out)
 {
     const u8 *peer_mac = peer_mac_key().cached();
     if (peer_mac == nullptr)
@@ -813,7 +817,7 @@ esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel
     }
 
     u16 seq = 0;
-    const esp_err_t ret = send_dap_command(peer_mac, cmd, len, channel, &seq);
+    const esp_err_t ret = send_dap_command(peer_mac, cmd, len, channel, req_id, &seq);
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Wireless: cannot submit %u-byte DAP request: %s", static_cast<unsigned>(len),
@@ -869,6 +873,7 @@ bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     *len = req.len;
     std::memcpy(link->m_dap_src_mac, req.src_mac, ESP_NOW_ETH_ALEN);
     link->m_dap_cmd_seq = req.cmd_seq;
+    link->m_dap_req_id = req.req_id;
 
     // DAP_Info 上报的单包尺寸按命令来源通道给：HID 是定长 64B 报告，只有 vendor
     // bulk 才用得上 1274B 这个安全上限（见 DAP_REPORTED_PACKET_SIZE_MAX）。混用会
@@ -886,7 +891,8 @@ void WirelessLink::dap_resp_sink(const u8 *data, u16 len, void *arg)
     // 响应走可靠传输，序号与确认由 ARQ 层给，并记下它回的是哪条命令——对端重传
     // 那条命令时据此重放这条响应，而不是把命令再执行一遍。窗口满不会丢响应：
     // 它在 ARQ 层的待发环里等窗口空位。
-    const esp_err_t ret = link->send_dap_response(link->m_dap_src_mac, data, len, link->m_dap_cmd_seq);
+    const esp_err_t ret =
+        link->send_dap_response(link->m_dap_src_mac, data, len, link->m_dap_req_id, link->m_dap_cmd_seq);
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to send DAP response: %s", esp_err_to_name(ret));
@@ -902,7 +908,8 @@ void WirelessLink::dap_task_fn(void *arg)
                      sizeof(link->m_dap_request), link->m_dap_response, sizeof(link->m_dap_response));
 }
 
-esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *data, size_t len, u8 channel)
+esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, u16 req_id, const u8 *data, size_t len,
+                                    u8 channel)
 {
     if (m_dap_queue == nullptr)
     {
@@ -918,6 +925,7 @@ esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, const u8 *da
     DapExecuteRequest req = {};
     std::memcpy(req.src_mac, src_mac, ESP_NOW_ETH_ALEN);
     req.cmd_seq = cmd_seq;
+    req.req_id = req_id;
     req.len = static_cast<u16>(len);
     req.channel = channel;
     std::memcpy(req.data, data, len);
@@ -1006,7 +1014,7 @@ void WirelessLink::arq_deliver(void *ctx, const u8 *src_mac, u16 seq, const u8 *
         // 接收端（C3，单核）原来每帧要经主循环中转，而 esp_wifi 任务收帧后持续
         // 占用 CPU，主循环迟迟得不到调度，每命令多 ~9ms。
         const auto &cmd = packet.payload.dap_command;
-        const esp_err_t ret = self->dap_execute(src_mac, seq, cmd.data, cmd.len, cmd.channel);
+        const esp_err_t ret = self->dap_execute(src_mac, seq, cmd.req_id, cmd.data, cmd.len, cmd.channel);
         if (ret != ESP_OK)
         {
             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(src_mac),
@@ -1015,9 +1023,10 @@ void WirelessLink::arq_deliver(void *ctx, const u8 *src_mac, u16 seq, const u8 *
         return;
     }
     case PacketType::DapResponse: {
-        // 响应交给 USB 转发路径：序号带上，USB 侧按它配回挂起的命令
+        // 响应带上它所回应的命令序号：USB 侧按它精确配对，重传触发的响应重放
+        // 因此会被识别为重复而丢弃，不会让主机端的响应流多出一条
         const auto &resp = packet.payload.dap_response;
-        app.push_wireless_response(seq, resp.data, resp.len);
+        app.push_wireless_response(resp.req_id, resp.data, resp.len);
         return;
     }
     case PacketType::UartFromHost: {

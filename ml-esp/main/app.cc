@@ -166,7 +166,7 @@ std::vector<ReceivedPacket> Application::take_received_packets()
     return packets;
 }
 
-void Application::push_wireless_response(u16 seq, const u8 *data, u16 len)
+void Application::push_wireless_response(u16 req_id, const u8 *data, u16 len)
 {
     if (m_wireless_response_queue == nullptr)
     {
@@ -179,18 +179,18 @@ void Application::push_wireless_response(u16 seq, const u8 *data, u16 len)
         // 无线帧承载上限的防御性截断（正常不会触发）
         len = static_cast<u16>(sizeof(response.data));
     }
-    response.seq = seq;
+    response.req_id = req_id;
     response.len = len;
     std::memcpy(response.data, data, len);
 
     // 队列满说明消费侧没跟上：丢弃并告警，等这条响应的命令最终由超时销账
     if (xQueueSend(m_wireless_response_queue, &response, 0) != pdTRUE)
     {
-        ESP_LOGW(TAG, "wireless response queue full, dropped seq=%u (%u bytes)", seq, len);
+        ESP_LOGW(TAG, "wireless response queue full, dropped req_id=%u (%u bytes)", req_id, len);
     }
 }
 
-bool Application::wait_wireless_response(u16 *seq, u8 *buf, u16 *len, u32 timeout_ms)
+bool Application::wait_wireless_response(u16 *req_id, u8 *buf, u16 *len, u32 timeout_ms)
 {
     if (m_wireless_response_queue == nullptr)
     {
@@ -203,9 +203,9 @@ bool Application::wait_wireless_response(u16 *seq, u8 *buf, u16 *len, u32 timeou
         return false; // 超时或队列为空：调用方按自己的节奏再来取
     }
 
-    if (seq != nullptr)
+    if (req_id != nullptr)
     {
-        *seq = response.seq;
+        *req_id = response.req_id;
     }
     std::memcpy(buf, response.data, response.len);
     *len = response.len;
@@ -642,7 +642,7 @@ void Application::run()
                         // 重放），不会走到这条经主循环的老路径；序号填 0 只为兼容。
                         // 通道标记照常透传：执行器靠它回答 DAP_Info 的单包尺寸
                         const esp_err_t ret =
-                            m_wireless_link.dap_execute(rp.src_mac, 0, cmd.data, cmd.len, cmd.channel);
+                            m_wireless_link.dap_execute(rp.src_mac, 0, cmd.req_id, cmd.data, cmd.len, cmd.channel);
                         if (ret != ESP_OK)
                         {
                             ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(rp.src_mac),
@@ -652,8 +652,7 @@ void Application::run()
                     }
                     case PacketType::DapResponse: {
                         const auto &resp = rp.packet.payload.dap_response;
-                        // 未经可靠传输的响应没有序号：填 0，配对退化为先进先出
-                        push_wireless_response(0, resp.data, resp.len);
+                        push_wireless_response(resp.req_id, resp.data, resp.len);
                         break;
                     }
                     case PacketType::Ping: {
