@@ -177,6 +177,12 @@ class ArqLink
          * 给出（本回调在任务里被调用，回头调本层的 peer 查询没有必要）。
          */
         void (*deliver)(void *ctx, const u8 *src_mac, u16 seq, const u8 *payload, u16 len) = nullptr;
+
+        /**
+         * 每轮的空闲钩子：链路层在这里排空自己的尽力而为出向数据（串口字节流）。
+         * 本层不参与限速与重试，发不出去的由链路层留到下一轮。
+         */
+        void (*poll)(void *ctx) = nullptr;
     };
 
     /**
@@ -235,6 +241,9 @@ class ArqLink
 
     /** ESP-NOW 接收回调：只把原始帧投进接收环（环满则丢帧并计数） */
     void on_frame(const u8 *src_mac, const u8 *data, size_t len);
+
+    /** 立刻唤醒任务：有新的尽力而为数据要排空时由链路层调用 */
+    void wake();
 
     /** 设定会话对端；对端变化会重置会话（两端序号基准重新对齐） */
     void set_peer(const u8 *peer_mac);

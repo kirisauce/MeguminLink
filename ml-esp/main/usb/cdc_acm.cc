@@ -21,6 +21,16 @@ u8 s_rx_buffer[256];
 // peer（尽力而为，未配对丢弃）。
 void cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
 {
+    auto &app = Application::get_instance();
+
+    if (app.mode() == Mode::Wireless)
+    {
+        // 读取与发送都在 ARQ 任务里：这里只唤醒它，FIFO 由它按缓冲空间取走
+        app.wireless_link().notify_host_uart();
+        return;
+    }
+
+    // Local：CDC 与本地 UART 直通（写入量统计与失败告警都在桥里）
     size_t rx_size = 0;
     const esp_err_t ret =
         tinyusb_cdcacm_read(static_cast<tinyusb_cdcacm_itf_t>(interface), s_rx_buffer, sizeof(s_rx_buffer), &rx_size);
@@ -29,16 +39,6 @@ void cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
         ESP_LOGW(TAG, "CDC read failed: %s", esp_err_to_name(ret));
         return;
     }
-
-    auto &app = Application::get_instance();
-    if (app.mode() == Mode::Wireless)
-    {
-        app.forward_uart_data_from_port(s_rx_buffer, rx_size, UartSource::Host);
-        app.config_channel().add_uart_wireless_tx(static_cast<u16>(rx_size));
-        return;
-    }
-
-    // Local：CDC 与本地 UART 直通（写入量统计与失败告警都在桥里）
     app.uart_bridge().send_uart_data(s_rx_buffer, rx_size);
 }
 
@@ -79,6 +79,16 @@ esp_err_t CdcAcm::init()
     cfg.callback_rx = cdcacm_rx_callback;
     cfg.callback_line_coding_changed = cdcacm_line_coding_callback;
     return tinyusb_cdcacm_init(&cfg);
+}
+
+size_t CdcAcm::read(u8 *buf, size_t max)
+{
+    size_t rx_size = 0;
+    if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, max, &rx_size) != ESP_OK)
+    {
+        return 0;
+    }
+    return rx_size;
 }
 
 size_t CdcAcm::send_uart_data(const u8 *data, size_t len)

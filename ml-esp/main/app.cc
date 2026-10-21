@@ -82,6 +82,10 @@ Application::Application()
 #endif
     // 本机串口桥：驱动、两个队列与两条任务都由它自己建立，两端同一实现
     ESP_ERROR_CHECK(m_uart_bridge.init());
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    // 无线出向的数据来处：链路层的空闲钩子回头从 CDC 取字节，链路层不直接依赖 USB
+    m_wireless_link.set_host_uart_fill(&Application::fill_host_uart, this);
+#endif
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -104,6 +108,12 @@ void Application::set_mode(Mode new_mode)
     }
 
     m_mode = new_mode; // 先更新状态：apply_mode 按新模式应用系统行为
+
+    // 离开 Wireless 时清空 CDC 出向缓冲：残留字节不能跨模式发出去
+    if (new_mode != Mode::Wireless)
+    {
+        m_wireless_link.flush_host_uart();
+    }
 
     // 配对是 Wireless 子流程：离开 Wireless 即终止配对（切回时未配对会重新自动进入）
     if (new_mode != Mode::Wireless && m_pairing_active)
@@ -233,6 +243,33 @@ ConfigChannel &Application::config_channel()
 {
     return m_config_channel;
 }
+
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+void Application::fill_host_uart(void *ctx)
+{
+    auto *self = static_cast<Application *>(ctx);
+    if (self->m_mode != Mode::Wireless)
+    {
+        return;
+    }
+
+    auto &link = self->m_wireless_link;
+    auto &cdc = self->m_usb.cdc();
+    u8 buffer[256];
+
+    // 放不下一整块就不取：CDC FIFO 会被填满，端点 NAK 把压力传回主机
+    while (link.host_uart_space() >= sizeof(buffer))
+    {
+        const size_t n = cdc.read(buffer, sizeof(buffer));
+        if (n == 0)
+        {
+            break;
+        }
+        link.push_host_uart(buffer, n);
+        self->m_config_channel.add_uart_wireless_tx(static_cast<u16>(n));
+    }
+}
+#endif
 
 void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSource source)
 {

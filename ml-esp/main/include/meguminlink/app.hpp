@@ -182,6 +182,14 @@ class Application
     /** 按当前模式应用系统行为（USB 启用/禁用）；构造与 set_mode 复用 */
     void apply_mode();
 
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    /**
+     * 无线出向的数据来处（注册给 WirelessLink 的空闲钩子）：把 CDC 收到的字节
+     * 搬进出向缓冲。缓冲放不下一整块就停手，端点 NAK 反压主机。
+     */
+    static void fill_host_uart(void *ctx);
+#endif
+
     /** 当前模式与配对状态对应的设备场景（主循环交给 LED 门面下发） */
     LedRequest led_request() const;
 

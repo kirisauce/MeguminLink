@@ -154,7 +154,8 @@ esp_err_t WirelessLink::init()
         const esp_err_t arq_ret = m_arq.init(arq_settings_load(), arq_payload_cap);
         ESP_RETURN_ON_ERROR(arq_ret, TAG, "m_arq.init() failed");
 
-        const ArqLink::Callbacks arq_callbacks = {this, &WirelessLink::arq_send_raw, &WirelessLink::arq_deliver};
+        const ArqLink::Callbacks arq_callbacks = {this, &WirelessLink::arq_send_raw, &WirelessLink::arq_deliver,
+                                                  &WirelessLink::arq_poll};
         m_arq.set_callbacks(arq_callbacks);
     }
 
@@ -568,7 +569,7 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
     return send_ret;
 }
 
-bool WirelessLink::uart_tx_admit(size_t len)
+bool WirelessLink::uart_tx_admit(size_t len, UartSource source)
 {
     // 链路正忙就压低串口额度，把空口让给 DAP。判据用"最近发过可靠帧"的时间戳
     // 而不是 ARQ 的 in_flight：准入跑在每一帧串口数据上，不能在那里取锁。
@@ -579,26 +580,24 @@ bool WirelessLink::uart_tx_admit(size_t len)
         bytes_per_s = bytes_per_s * CONFIG_MEGUMINLINK_UART_TX_MIN_PERCENT / 100;
     }
 
+    UartBucket &bucket = (source == UartSource::Host) ? m_uart_bucket_host : m_uart_bucket_target;
     bool admit = false;
-    portENTER_CRITICAL(&m_uart_bucket_lock);
-    const u32 elapsed = now - m_uart_bucket_refill_ms;
+    portENTER_CRITICAL(&bucket.lock);
+    const u32 elapsed = now - bucket.refill_ms;
     if (elapsed > 0)
     {
         const u32 add = static_cast<u32>((static_cast<u64>(bytes_per_s) * elapsed) / 1000);
-        const u32 filled = m_uart_bucket_tokens + add;
-        m_uart_bucket_tokens = (filled < UART_BUCKET_CAP_BYTES) ? filled : UART_BUCKET_CAP_BYTES;
-        m_uart_bucket_refill_ms = now;
+        const u32 filled = bucket.tokens + add;
+        bucket.tokens = (filled < UART_BUCKET_CAP_BYTES) ? filled : UART_BUCKET_CAP_BYTES;
+        bucket.refill_ms = now;
     }
-    if (m_uart_bucket_tokens >= len)
+    if (bucket.tokens >= len)
     {
-        m_uart_bucket_tokens -= static_cast<u32>(len);
+        bucket.tokens -= static_cast<u32>(len);
         admit = true;
     }
-    portEXIT_CRITICAL(&m_uart_bucket_lock);
+    portEXIT_CRITICAL(&bucket.lock);
 
-    if (!admit)
-    {
-    }
     return admit;
 }
 
@@ -693,7 +692,7 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
     return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, nullptr, response);
 }
 
-esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
+esp_err_t WirelessLink::send_uart_frame(const u8 *data, size_t len, UartSource source)
 {
     const u8 *peer_mac = peer_mac_key().cached();
     if (peer_mac == nullptr)
@@ -703,28 +702,35 @@ esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource so
         return ESP_ERR_NOT_FOUND;
     }
 
-    // 帧上限是链路自己的约束：调用方按各自的读块粒度交数据（CDC 回调一次可给到
-    // 256B），这里切成 MAX_UART_PAYLOAD_SIZE 的帧逐块发。中途失败即停：已经发出
-    // 去的块收不回来，剩下的丢弃。
+    if (len > MAX_UART_PAYLOAD_SIZE)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Packet 为指针视图：data 指向调用方串口缓冲，零拷贝
+    Packet packet;
+    packet.packet_type = (source == UartSource::Host) ? PacketType::UartFromHost : PacketType::UartFromTarget;
+    auto &content = packet.payload.uart_data;
+    content.len = static_cast<u16>(len);
+    content.data = data;
+
+    return submit_packet(peer_mac, packet, ArqLink::Reliability::Unreliable, true);
+}
+
+esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
+{
     while (len > 0)
     {
         const size_t chunk = (len < MAX_UART_PAYLOAD_SIZE) ? len : MAX_UART_PAYLOAD_SIZE;
 
         // 先过令牌桶再碰驱动：串口没有窗口与重传保护，放它无限灌入会把 ESP-NOW
         // 的发送队列打满，连 DAP 的可靠帧都发不出去。被拒即丢（计数在准入里）。
-        if (!uart_tx_admit(chunk))
+        if (!uart_tx_admit(chunk, source))
         {
             return ESP_ERR_TIMEOUT;
         }
 
-        // Packet 为指针视图：data 指向调用方串口缓冲，零拷贝
-        Packet packet;
-        packet.packet_type = (source == UartSource::Host) ? PacketType::UartFromHost : PacketType::UartFromTarget;
-        auto &content = packet.payload.uart_data;
-        content.len = static_cast<u16>(chunk);
-        content.data = data;
-
-        const esp_err_t ret = submit_packet(peer_mac, packet, ArqLink::Reliability::Unreliable, true);
+        const esp_err_t ret = send_uart_frame(data, chunk, source);
         if (ret != ESP_OK)
         {
             return ret;
@@ -735,6 +741,75 @@ esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource so
     }
 
     return ESP_OK;
+}
+
+size_t WirelessLink::host_uart_space()
+{
+    return m_host_uart.space();
+}
+
+size_t WirelessLink::push_host_uart(const u8 *data, size_t len)
+{
+    return m_host_uart.push(data, len);
+}
+
+void WirelessLink::flush_host_uart()
+{
+    m_host_uart.flush();
+}
+
+void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
+{
+    m_host_uart_fill = fill;
+    m_host_uart_fill_ctx = ctx;
+}
+
+void WirelessLink::notify_host_uart()
+{
+    m_arq.wake();
+}
+
+void WirelessLink::arq_poll(void *ctx)
+{
+    static_cast<WirelessLink *>(ctx)->poll_host_uart_egress();
+}
+
+void WirelessLink::poll_host_uart_egress()
+{
+    // 先补读：缓冲腾出空间后把 CDC 端点重新打开
+    if (m_host_uart_fill != nullptr)
+    {
+        m_host_uart_fill(m_host_uart_fill_ctx);
+    }
+
+    // 没有配对就没有落点：丢掉这批，重新配对后从新字节开始
+    if (peer_mac_key().cached() == nullptr)
+    {
+        m_host_uart.flush();
+        return;
+    }
+
+    u8 frame[MAX_UART_PAYLOAD_SIZE];
+    while (true)
+    {
+        const size_t n = m_host_uart.peek(frame, sizeof(frame));
+        if (n == 0)
+        {
+            break;
+        }
+
+        // 额度不足或驱动暂时发不出去：这一帧留在缓冲里，下一轮接着来
+        if (!uart_tx_admit(n, UartSource::Host))
+        {
+            break;
+        }
+        if (send_uart_frame(frame, n, UartSource::Host) != ESP_OK)
+        {
+            break;
+        }
+
+        m_host_uart.consume(n);
+    }
 }
 
 esp_err_t WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)

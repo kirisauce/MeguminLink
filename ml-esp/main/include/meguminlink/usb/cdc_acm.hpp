@@ -33,6 +33,14 @@ class CdcAcm
     size_t send_uart_data(const u8 *data, size_t len);
 
     /**
+     * 取走 CDC 收到的数据（最多 max 字节，不等待）。谁取、什么时候取由调用方
+     * 按模式决定，本对象不判断。
+     *
+     * @return 实际读到的字节数
+     */
+    size_t read(u8 *buf, size_t max);
+
+    /**
      * 主机是否已打开 CDC ACM 串口（TinyUSB 的 DTR，且总线就绪）。
      * 实时查询不缓存：拔插与重新枚举后不会留下过期的"已打开"。
      */

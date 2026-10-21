@@ -367,6 +367,11 @@ bool ArqLink::established() const
     return value;
 }
 
+void ArqLink::wake()
+{
+    xSemaphoreGive(m_wake);
+}
+
 bool ArqLink::can_submit() const
 {
     xSemaphoreTake(m_state_mutex, portMAX_DELAY);
@@ -532,6 +537,13 @@ void ArqLink::run_loop()
 
         drain_rx(now);
         poll_core(now);
+
+        // 尽力而为的出向挂在同一拍上：链路层自己决定发多少、发不动就留到下一轮
+        if (m_callbacks.poll != nullptr)
+        {
+            m_callbacks.poll(m_callbacks.ctx);
+        }
+
         publish_state();
 
         // 睡到下一个待办时刻；没有待办就兜底醒来刷新对外缓存（调用方的背压判断

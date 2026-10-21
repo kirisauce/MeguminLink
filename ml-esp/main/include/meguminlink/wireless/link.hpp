@@ -8,6 +8,7 @@
 #include "meguminlink/common.hpp"       // IWYU pragma: keep
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/uart_egress.hpp"
 #include "sdkconfig.h"
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
@@ -126,28 +127,53 @@ class WirelessLink
     /**
      * 串口出向准入：令牌桶限速 + DAP 让路。
      *
-     * 串口包没有窗口与重传保护，进入空口的速率必须由本端自己管住：超过对端
-     * UART 消费能力的部分直接丢弃，否则 ESP-NOW 的发送队列会被灌满，连 DAP
-     * 的可靠帧与确认帧都发不出去。DAP 有在途消息时按配置比例压低额度，把
-     * 链路让给可靠流量。
+     * 两个方向各有一个桶：主机下载把自己的额度吃满时，屏幕的回包不会被饿死。
+     * 超速的部分直接丢弃，否则 ESP-NOW 的发送队列会被灌满，连 DAP 的可靠帧与
+     * 确认帧都发不出去。DAP 有在途消息时按配置比例压低额度。
      *
      * @param len 待发帧的载荷长度（字节）
-     * @return true = 放行；false = 拒绝（已计入 GetStats 的 uart_tx_admit_dropped）
+     * @param source 走哪个方向的桶
+     * @return true = 放行；false = 额度不足，调用方应保留数据稍后重试
      */
-    bool uart_tx_admit(size_t len);
+    bool uart_tx_admit(size_t len, UartSource source);
 
     /**
-     * 无线路径：把一段串口数据发给已配对 peer（尽力而为，不重传）。配对地址查询
-     * 与出向准入都在这里完成——串口没有窗口与重传保护，超过对端消费能力的部分
-     * 直接丢弃，否则 ESP-NOW 的发送队列会被灌满。
+     * 无线路径：把不超过单帧上限的串口数据作为一帧发出（不切块、不过准入）。
+     * 准入与重试由调用方的队列负责，发送失败时帧仍留在调用方手里。
+     */
+    esp_err_t send_uart_frame(const u8 *data, size_t len, UartSource source);
+
+    /**
+     * 无线路径：把一段串口数据发给已配对 peer（尽力而为，不重传）。配对地址与
+     * 出向准入都在这里完成，超过单帧上限的部分切成多帧。
      *
      * @param source 数据来自本机哪个端口：UartSource::Host 封成 UartFromHost 包
      *               （对端写它的 UART TX），UartSource::Target 封成 UartFromTarget
      *               包（对端写它的 CDC）
-     * @param len 任意长度：超过单帧载荷上限（MAX_UART_PAYLOAD_SIZE）的部分在这里
-     *            切成多帧发出，调用方不必自己分块
      */
     esp_err_t send_uart_data(const u8 *data, size_t len, UartSource source);
+
+    /**
+     * 主机串口数据的出向缓冲（CDC → 空口）。
+     *
+     * 主机一次写进来的字节先落进环形缓冲，再由 ARQ 任务的空闲钩子按令牌速率
+     * 逐帧发出；缓冲满了就不取新数据，端点 NAK 把压力反传给主机。
+     */
+    size_t host_uart_space();
+    size_t push_host_uart(const u8 *data, size_t len);
+
+    /** 丢弃缓冲内全部待发字节（离开 Wireless 模式时用） */
+    void flush_host_uart();
+
+    /**
+     * 数据的来处：由 Application 接到 USB 层，本层不直接依赖它。
+     * 回调在 ARQ 任务里被调用，实现方负责"有多少空间取多少字节并 push"。
+     */
+    using HostUartFill = void (*)(void *ctx);
+    void set_host_uart_fill(HostUartFill fill, void *ctx);
+
+    /** 有新数据可发：唤醒 ARQ 任务立即排空，不用等兜底节拍 */
+    void notify_host_uart();
 
     /**
      * 无线路径：打包线编码参数为 UartLineCoding 包发给已配对 peer（可靠传输：
@@ -420,12 +446,21 @@ class WirelessLink
 
     /**
      * 串口出向令牌桶。只有串口数据帧过这道闸（DAP 的可靠帧不受限）：桶满两帧、
-     * 按对端线速补充，链路正忙时按配置比例压低。调用方是 CDC 回调（tinyusb
-     * 任务）与 UART 桥任务，自旋锁保护。
+     * 按对端线速补充，链路正忙时按配置比例压低。调用方是无线发送任务与 UART
+     * 桥任务，各自加锁。
+     *
+     * 两个方向分开记账：主机下载把 Host 桶吃满时，屏幕回包的 Target 桶仍然有
+     * 额度，否则回包会被自己的下载流量饿死。
      */
-    portMUX_TYPE m_uart_bucket_lock = portMUX_INITIALIZER_UNLOCKED;
-    u32 m_uart_bucket_tokens = UART_BUCKET_CAP_BYTES;
-    u32 m_uart_bucket_refill_ms = 0;
+    struct UartBucket
+    {
+        portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
+        u32 tokens = UART_BUCKET_CAP_BYTES;
+        u32 refill_ms = 0;
+    };
+
+    UartBucket m_uart_bucket_host;
+    UartBucket m_uart_bucket_target;
 
     /**
      * ESP-NOW 发送退避。撞上 NO_MEM、或发送完成回调连续报失败达到阈值时抬高；
@@ -452,6 +487,17 @@ class WirelessLink
      * 查 ARQ 快照要取锁，而准入跑在收数据的每一帧上。
      */
     volatile u32 m_last_reliable_tx_ms = 0;
+
+    /** 主机串口出向缓冲：字节流，状态都在对象里 */
+    UartEgress m_host_uart;
+
+    /** 数据来处（Application 接上 USB CDC 的读取原语） */
+    HostUartFill m_host_uart_fill = nullptr;
+    void *m_host_uart_fill_ctx = nullptr;
+
+    /** ARQ 任务的空闲钩子：补读 CDC，再按令牌额度发出去 */
+    void poll_host_uart_egress();
+    static void arq_poll(void *ctx);
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     /**
