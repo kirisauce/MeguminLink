@@ -140,30 +140,35 @@ class WirelessLink
     /**
      * 无线路径：把不超过单帧上限的串口数据作为一帧发出（不切块、不过准入）。
      * 准入与重试由调用方的队列负责，发送失败时帧仍留在调用方手里。
+     *
+     * @param reliability 本帧是否按可靠传输发（占序号、进窗口、丢帧重传）
      */
-    esp_err_t send_uart_frame(const u8 *data, size_t len, UartSource source);
+    esp_err_t send_uart_frame(const u8 *data, size_t len, UartSource source, ArqLink::Reliability reliability);
 
     /**
-     * 无线路径：把一段串口数据发给已配对 peer（尽力而为，不重传）。配对地址与
-     * 出向准入都在这里完成，超过单帧上限的部分切成多帧。
+     * 无线路径：把一段串口数据交给对应的出向缓冲。
+     *
+     * 数据落进缓冲后由 ARQ 任务的空闲钩子逐帧发出：主机一侧有 CDC 反压，缓冲满
+     * 了就不再取端点；目标一侧没有流控，缓冲满时有限等待，仍然放不下才丢弃。
      *
      * @param source 数据来自本机哪个端口：UartSource::Host 封成 UartFromHost 包
      *               （对端写它的 UART TX），UartSource::Target 封成 UartFromTarget
      *               包（对端写它的 CDC）
+     * @return 实际入队的字节数（< len 表示缓冲已满，超出部分丢弃）
      */
-    esp_err_t send_uart_data(const u8 *data, size_t len, UartSource source);
+    size_t send_uart_data(const u8 *data, size_t len, UartSource source);
 
     /**
-     * 主机串口数据的出向缓冲（CDC → 空口）。
+     * 串口出向缓冲的剩余空间（两个方向各一条，按 source 选）。
      *
      * 主机一次写进来的字节先落进环形缓冲，再由 ARQ 任务的空闲钩子按令牌速率
      * 逐帧发出；缓冲满了就不取新数据，端点 NAK 把压力反传给主机。
      */
-    size_t host_uart_space();
-    size_t push_host_uart(const u8 *data, size_t len);
+    size_t uart_egress_space(UartSource source);
+    size_t push_uart_egress(const u8 *data, size_t len, UartSource source);
 
-    /** 丢弃缓冲内全部待发字节（离开 Wireless 模式时用） */
-    void flush_host_uart();
+    /** 丢弃两条缓冲内的全部待发字节（离开 Wireless 模式时用） */
+    void flush_uart_egress();
 
     /**
      * 数据的来处：由 Application 接到 USB 层，本层不直接依赖它。
@@ -173,7 +178,18 @@ class WirelessLink
     void set_host_uart_fill(HostUartFill fill, void *ctx);
 
     /** 有新数据可发：唤醒 ARQ 任务立即排空，不用等兜底节拍 */
-    void notify_host_uart();
+    void notify_uart_egress();
+
+    /** 串口出向是否走可靠传输（主机经配置通道 0x1D 下发，出厂默认开） */
+    bool uart_reliable() const;
+
+    /**
+     * 设置串口出向的可靠性（主循环调用，立即生效并落盘）。
+     *
+     * 可靠模式下每帧占一个可靠传输窗口：窗口没有余量时分给 DAP，本轮不提交，
+     * 数据留在缓冲里等下一轮；缓冲满时仍旧反压主机或丢弃。
+     */
+    void set_uart_reliable(bool reliable);
 
     /**
      * 无线路径：打包线编码参数为 UartLineCoding 包发给已配对 peer（可靠传输：
@@ -427,8 +443,11 @@ class WirelessLink
 
     /** 串口出向令牌桶容量：两帧。桶小才能把突发摊平到毫秒级 */
     static constexpr u32 UART_BUCKET_CAP_BYTES = 2 * MAX_UART_PAYLOAD_SIZE;
-    /** 判"链路正忙"的窗口：这段时间内发过可靠帧就让串口让路 */
+    /** 判"链路正忙"的窗口：这段时间内提交过 DAP 业务包就让串口让路 */
     static constexpr u32 DAP_BUSY_WINDOW_MS = 50;
+    /** 目标侧没有流控：出向缓冲满时按这个上限等待空口追上，等不到才丢 */
+    static constexpr u32 UART_PUSH_WAIT_MS = 100;
+    static constexpr u32 UART_PUSH_WAIT_STEP_MS = 2;
     /** ESP-NOW 退避：首档 20ms，逐级翻倍，200ms 封顶 */
     static constexpr u16 ESPNOW_BACKOFF_BASE_MS = 20;
     static constexpr u16 ESPNOW_BACKOFF_MAX_MS = 200;
@@ -483,21 +502,46 @@ class WirelessLink
     volatile u32 m_send_fail_log_ms = 0;
 
     /**
-     * 最近一次可靠帧（DAP 命令/响应）发出的时刻。串口准入据此判断链路是否正忙：
-     * 查 ARQ 快照要取锁，而准入跑在收数据的每一帧上。
+     * 最近一次 DAP 业务包（命令/响应/转发的控制请求）提交的时刻。串口准入据此
+     * 判断链路是否正忙：查 ARQ 快照要取锁，而准入跑在收数据的每一帧上。
+     *
+     * 只看"DAP 业务有没有在占空口"，与这一帧本身是否可靠无关：串口帧走可靠
+     * 传输时同样经过可靠通道，若按可靠性记账，串口流量会把自己判成"DAP 忙"
+     * 而按低额度自我限速。
      */
-    volatile u32 m_last_reliable_tx_ms = 0;
+    volatile u32 m_last_dap_tx_ms = 0;
 
-    /** 主机串口出向缓冲：字节流，状态都在对象里 */
+    /** 两条串口出向缓冲：主机端口与目标端口各一条，字节流状态都在对象里 */
     UartEgress m_host_uart;
+    UartEgress m_target_uart;
+
+    /** 串口出向是否走可靠传输（主循环写，ARQ 任务读） */
+    volatile bool m_uart_reliable = true;
 
     /** 数据来处（Application 接上 USB CDC 的读取原语） */
     HostUartFill m_host_uart_fill = nullptr;
     void *m_host_uart_fill_ctx = nullptr;
 
-    /** ARQ 任务的空闲钩子：补读 CDC，再按令牌额度发出去 */
-    void poll_host_uart_egress();
+    /** ARQ 任务的空闲钩子：补读 CDC，再把两条出向缓冲按额度排空 */
+    void poll_uart_egress();
     static void arq_poll(void *ctx);
+
+    /** 一帧串口数据的传输判定 */
+    enum class UartVerdict : u8
+    {
+        Reliable,   /**< 走可靠传输 */
+        Unreliable, /**< 走尽力而为（开关关闭，或可靠窗口没有余量可分） */
+        Wait,       /**< 本轮不提交：窗口与待发位置让给 DAP */
+    };
+
+    /** 当前一帧串口数据该怎么发 */
+    UartVerdict uart_frame_verdict() const;
+
+    /** 排空一条出向缓冲：按额度与可靠性逐帧提交，发不出去的留在缓冲里 */
+    void drain_uart_egress(UartEgress &egress, UartSource source);
+
+    /** 按数据来处取出向缓冲 */
+    UartEgress &uart_egress(UartSource source);
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     /**

@@ -23,6 +23,7 @@ import {
 	CMD_RESET,
 	CMD_SET_MODE,
 	CMD_SET_LOSS,
+	CMD_SET_UART_RELIABLE,
 	CMD_SET_WIFI_RATE,
 	MODE_WIRELESS,
 	type LinkConfigPatch,
@@ -670,6 +671,22 @@ export class MlinkSession {
 		if (generation !== this.#generation) return;
 		if (this.commandError === null && this.config !== null) {
 			this.config = { ...this.config, lossPermille: permille };
+		}
+	}
+
+	/**
+	 * 设置串口出向是否走可靠传输。
+	 *
+	 * 设备端把同一条控制请求转发给对端：两端必须一致，只改一端会变成"下载走可靠、
+	 * 回包走尽力而为"的半可靠链路。回显值就地更新——命令返回 ok 即表示已被接受，
+	 * 实际应用在设备主循环，下一次轮询读到的是生效值。
+	 */
+	async setUartReliable(reliable: boolean): Promise<void> {
+		const generation = this.#generation;
+		await this.#sendCommand(CMD_SET_UART_RELIABLE, reliable ? 1 : 0);
+		if (generation !== this.#generation) return;
+		if (this.commandError === null && this.stats !== null) {
+			this.stats = { ...this.stats, uartReliable: reliable ? 1 : 0 };
 		}
 	}
 

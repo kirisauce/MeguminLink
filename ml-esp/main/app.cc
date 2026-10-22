@@ -32,6 +32,9 @@ namespace
  */
 constexpr u32 RESTART_DELAY_MS = 100;
 
+/** 串口出向缓冲满的日志间隔：缓冲满时每一块数据都会触发一次告警 */
+constexpr u32 UART_DROP_LOG_INTERVAL_MS = 1000;
+
 const char *mode_to_string(Mode mode)
 {
     switch (mode)
@@ -46,7 +49,8 @@ const char *mode_to_string(Mode mode)
 } // namespace
 
 Application::Application()
-    : m_mode_key(NVS_KEY_MODE, static_cast<u8>(Mode::Local)), m_mode(Mode::Local),
+    : m_mode_key(NVS_KEY_MODE, static_cast<u8>(Mode::Local)),
+      m_uart_reliable_key(NVS_KEY_UART_RELIABLE, UART_RELIABLE_DEFAULT), m_mode(Mode::Local),
       m_main_task_wake(xSemaphoreCreateBinary()), m_rx_mutex(xSemaphoreCreateMutex()),
       m_wireless_response_queue(xQueueCreate(CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH, sizeof(WirelessResponse)))
 {
@@ -86,6 +90,8 @@ Application::Application()
     // 无线出向的数据来处：链路层的空闲钩子回头从 CDC 取字节，链路层不直接依赖 USB
     m_wireless_link.set_host_uart_fill(&Application::fill_host_uart, this);
 #endif
+    // 串口出向可靠性：与模式无关的链路行为，随上电恢复（出厂默认开）
+    m_wireless_link.set_uart_reliable(m_uart_reliable_key.get() != 0);
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -109,10 +115,10 @@ void Application::set_mode(Mode new_mode)
 
     m_mode = new_mode; // 先更新状态：apply_mode 按新模式应用系统行为
 
-    // 离开 Wireless 时清空 CDC 出向缓冲：残留字节不能跨模式发出去
+    // 离开 Wireless 时清空两条出向缓冲：残留字节不能跨模式发出去
     if (new_mode != Mode::Wireless)
     {
-        m_wireless_link.flush_host_uart();
+        m_wireless_link.flush_uart_egress();
     }
 
     // 配对是 Wireless 子流程：离开 Wireless 即终止配对（切回时未配对会重新自动进入）
@@ -258,14 +264,14 @@ void Application::fill_host_uart(void *ctx)
     u8 buffer[256];
 
     // 放不下一整块就不取：CDC FIFO 会被填满，端点 NAK 把压力传回主机
-    while (link.host_uart_space() >= sizeof(buffer))
+    while (link.uart_egress_space(UartSource::Host) >= sizeof(buffer))
     {
         const size_t n = cdc.read(buffer, sizeof(buffer));
         if (n == 0)
         {
             break;
         }
-        link.push_host_uart(buffer, n);
+        link.push_uart_egress(buffer, n, UartSource::Host);
         self->m_config_channel.add_uart_wireless_tx(static_cast<u16>(n));
     }
 }
@@ -277,10 +283,17 @@ void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSo
     // 无线在 WirelessLink、本机 UART 在 UartBridge、CDC 在 CmsisDapUsb。
     if (m_mode == Mode::Wireless)
     {
-        const esp_err_t ret = m_wireless_link.send_uart_data(data, len, source);
-        if (ret != ESP_OK)
+        // 入队即算交给链路：真正的发出与重传由 ARQ 任务负责，这里只应对缓冲满
+        const size_t queued = m_wireless_link.send_uart_data(data, len, source);
+        if (queued < len)
         {
-            ESP_LOGW(TAG, "Wireless UART: failed to send %u bytes: %s", static_cast<unsigned>(len), esp_err_to_name(ret));
+            const u32 now = now_ms();
+            if (static_cast<i32>(now - m_uart_drop_log_ms) >= 0)
+            {
+                m_uart_drop_log_ms = now + UART_DROP_LOG_INTERVAL_MS;
+                ESP_LOGW(TAG, "Wireless UART: egress buffer full, %u of %u bytes dropped",
+                         static_cast<unsigned>(len - queued), static_cast<unsigned>(len));
+            }
         }
         return;
     }
@@ -458,13 +471,16 @@ void Application::consume_pending_action()
         break;
     case ConfigChannel::Action::Reset: {
         // 删除失败不回滚：重启后的构造逻辑会按残留记录自愈
-        ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and WiFi rate, rebooting");
+        ESP_LOGI(TAG, "Factory reset: erasing pairing, mode and link preferences, rebooting");
         const esp_err_t erase_ret = peer_mac_key().erase();
         if (erase_ret != ESP_OK)
         {
             ESP_LOGE(TAG, "Failed to erase peer MAC: %s", esp_err_to_name(erase_ret));
         }
         (void)m_mode_key.erase();
+        (void)m_uart_reliable_key.erase();
+        // 串口可靠性是有出厂默认值的偏好项：擦掉记录后运行态也要回到默认
+        m_wireless_link.set_uart_reliable(UART_RELIABLE_DEFAULT != 0);
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
         (void)usb_capability_erase();
 #endif
@@ -529,6 +545,17 @@ void Application::consume_pending_action()
         // 做——命令的接受方既可能是本机 EP0，也可能是转发的对端请求。
         (void)m_wireless_link.set_wifi_rate(arg);
         break;
+    case ConfigChannel::Action::SetUartReliable: {
+        // 串口出向是否走可靠传输：立即生效并落盘，缓冲里的字节按新选择继续发
+        const bool reliable = (arg != 0);
+        m_wireless_link.set_uart_reliable(reliable);
+        const esp_err_t ret = m_uart_reliable_key.set(static_cast<u8>(reliable ? 1 : 0));
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to persist UART reliability: %s", esp_err_to_name(ret));
+        }
+        break;
+    }
     case ConfigChannel::Action::SetLinkConfig: {
         // 参数落盘 + 立即应用。应用会换新 epoch 重置会话，对端据此重新对齐序号并
         // 采纳这份参数——参数因此不必再走那条尽力而为的中继通道。

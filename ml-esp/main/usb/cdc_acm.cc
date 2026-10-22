@@ -26,7 +26,7 @@ void cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
     if (app.mode() == Mode::Wireless)
     {
         // 读取与发送都在 ARQ 任务里：这里只唤醒它，FIFO 由它按缓冲空间取走
-        app.wireless_link().notify_host_uart();
+        app.wireless_link().notify_uart_egress();
         return;
     }
 

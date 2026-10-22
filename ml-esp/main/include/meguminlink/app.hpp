@@ -62,6 +62,12 @@ enum class Mode
 /** 模式在 NVS 中的 key（持久化 Local/Wireless 维度） */
 inline constexpr char NVS_KEY_MODE[] = "mode";
 
+/** 串口出向可靠性在 NVS 中的 key（出厂默认开） */
+inline constexpr char NVS_KEY_UART_RELIABLE[] = "uart_rel";
+
+/** 串口出向可靠性的出厂默认值：下载突发不再被令牌桶整帧丢弃 */
+inline constexpr u8 UART_RELIABLE_DEFAULT = 1;
+
 class Application
 {
   public:
@@ -126,7 +132,7 @@ class Application
 
     /**
      * 本机某个端口收到数据 → 按当前模式选路。Local：CDC 与本机 UART 直通；
-     * Wireless：交给无线链路发给配对 peer（查配对与出向准入在链路侧完成）。
+     * Wireless：交给出向缓冲（配对、准入与逐帧发送都在链路侧完成）。
      * 调用方：S3 侧 CDC RX 回调与 UART 桥任务、C3 侧 UART 桥任务。
      *
      * @param source 数据来自哪个端口，决定帧类型：UartSource::Host 来自本机 CDC、
@@ -160,8 +166,9 @@ class Application
     static Application &get_instance();
 
   private:
-    NvsKeyU8 m_mode_key; /**< 模式 NVS 键（自动加载带缓存） */
-    Mode m_mode;         /**< 当前运行模式 */
+    NvsKeyU8 m_mode_key;         /**< 模式 NVS 键（自动加载带缓存） */
+    NvsKeyU8 m_uart_reliable_key; /**< 串口出向可靠性 NVS 键（0=尽力而为 1=可靠） */
+    Mode m_mode;                 /**< 当前运行模式 */
     SemaphoreHandle_t m_main_task_wake;
 
     /**
@@ -229,6 +236,9 @@ class Application
 
     /** 本机串口桥（UART ↔ 对侧：无线，或 Local 模式下的主机 CDC）；两端同一实现 */
     UartBridge m_uart_bridge;
+
+    /** 串口出向缓冲满的日志限速时刻（下载突发会连续满，逐块报会把日志刷满） */
+    u32 m_uart_drop_log_ms = 0;
 
     /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless/link.hpp） */
     WirelessLink m_wireless_link;

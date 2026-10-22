@@ -70,6 +70,12 @@ bool phymode_for_rate(u8 rate, wifi_phy_mode_t *mode)
     }
     return false; // 超出 11b/11g/HT20：本链路不做支持
 }
+
+/** 该业务包是不是 DAP 方向的流量（串口出向准入据此给 DAP 让路） */
+bool is_dap_traffic(PacketType type)
+{
+    return type == PacketType::DapCommand || type == PacketType::DapResponse || type == PacketType::RelayedUsbControl;
+}
 } // namespace
 
 bool mlink::wifi_rate_supported(u8 rate)
@@ -496,6 +502,13 @@ esp_err_t WirelessLink::submit_packet(const u8 *dest_mac, const Packet &packet, 
 
     xSemaphoreGive(m_pack_mutex);
 
+    // DAP 业务一旦提交就认定链路进入"DAP 忙"窗口：串口准入据此压低额度，把空口
+    // 留给命令与响应。只按业务类型记账，串口帧自己走可靠通道不算在内。
+    if (submitted == ArqLink::Submit::Ok && is_dap_traffic(packet.packet_type))
+    {
+        m_last_dap_tx_ms = now_ms();
+    }
+
     switch (submitted)
     {
     case ArqLink::Submit::Ok:
@@ -513,13 +526,8 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
                                  bool loss_injectable)
 {
     // reliable 表示"本帧属于可靠传输机制"（数据帧、纯确认与会话重置）：它们是
-    // 空口的主要用户，串口准入据此让路，撞上发送锁时也值得等。
+    // 空口的主要用户，撞上发送锁时也值得等。
     const u32 now = now_ms();
-
-    if (reliable)
-    {
-        m_last_reliable_tx_ms = now;
-    }
 
     // 退避窗口内不再触碰驱动。持续满速冲击会把 ESP-NOW 的发送队列带进不可恢复
     // 的状态（NO_MEM，或对端持续不应答），只有重启设备才能解开——宁可丢尽力而为的帧。
@@ -571,11 +579,11 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
 
 bool WirelessLink::uart_tx_admit(size_t len, UartSource source)
 {
-    // 链路正忙就压低串口额度，把空口让给 DAP。判据用"最近发过可靠帧"的时间戳
-    // 而不是 ARQ 的 in_flight：准入跑在每一帧串口数据上，不能在那里取锁。
+    // 链路正忙就压低串口额度，把空口让给 DAP。判据用"最近提交过 DAP 业务包"的
+    // 时间戳而不是 ARQ 的 in_flight：准入跑在每一帧串口数据上，不能在那里取锁。
     const u32 now = now_ms();
     u32 bytes_per_s = CONFIG_MEGUMINLINK_UART_TX_MAX_BPS / 10;
-    if ((now - m_last_reliable_tx_ms) < DAP_BUSY_WINDOW_MS)
+    if ((now - m_last_dap_tx_ms) < DAP_BUSY_WINDOW_MS)
     {
         bytes_per_s = bytes_per_s * CONFIG_MEGUMINLINK_UART_TX_MIN_PERCENT / 100;
     }
@@ -692,7 +700,8 @@ esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, si
     return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, nullptr, response);
 }
 
-esp_err_t WirelessLink::send_uart_frame(const u8 *data, size_t len, UartSource source)
+esp_err_t WirelessLink::send_uart_frame(const u8 *data, size_t len, UartSource source,
+                                         ArqLink::Reliability reliability)
 {
     const u8 *peer_mac = peer_mac_key().cached();
     if (peer_mac == nullptr)
@@ -714,48 +723,54 @@ esp_err_t WirelessLink::send_uart_frame(const u8 *data, size_t len, UartSource s
     content.len = static_cast<u16>(len);
     content.data = data;
 
-    return submit_packet(peer_mac, packet, ArqLink::Reliability::Unreliable, true);
+    return submit_packet(peer_mac, packet, reliability, true);
 }
 
-esp_err_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
+size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
 {
-    while (len > 0)
+    // 调用方必须是能睡的端口任务（UART 桥），不能是 ARQ 任务：缓冲只有 ARQ 任务
+    // 在排空，在它自己的上下文里等空间会把排空一起等死。
+    UartEgress &egress = uart_egress(source);
+    size_t done = 0;
+
+    // 目标一侧没有流控（CDC 那侧靠端点 NAK 反压）：缓冲满了就等一等，让空口追上，
+    // 等不到的才丢——屏幕回包里的确认丢一条就会让主机侧白等到超时。
+    for (u32 waited_ms = 0; done < len && waited_ms <= UART_PUSH_WAIT_MS; waited_ms += UART_PUSH_WAIT_STEP_MS)
     {
-        const size_t chunk = (len < MAX_UART_PAYLOAD_SIZE) ? len : MAX_UART_PAYLOAD_SIZE;
-
-        // 先过令牌桶再碰驱动：串口没有窗口与重传保护，放它无限灌入会把 ESP-NOW
-        // 的发送队列打满，连 DAP 的可靠帧都发不出去。被拒即丢（计数在准入里）。
-        if (!uart_tx_admit(chunk, source))
+        done += egress.push(data + done, len - done);
+        if (done == len)
         {
-            return ESP_ERR_TIMEOUT;
+            break;
         }
-
-        const esp_err_t ret = send_uart_frame(data, chunk, source);
-        if (ret != ESP_OK)
-        {
-            return ret;
-        }
-
-        data += chunk;
-        len -= chunk;
+        vTaskDelay(pdMS_TO_TICKS(UART_PUSH_WAIT_STEP_MS));
     }
 
-    return ESP_OK;
+    if (done > 0)
+    {
+        m_arq.wake();
+    }
+    return done;
 }
 
-size_t WirelessLink::host_uart_space()
+size_t WirelessLink::uart_egress_space(UartSource source)
 {
-    return m_host_uart.space();
+    return uart_egress(source).space();
 }
 
-size_t WirelessLink::push_host_uart(const u8 *data, size_t len)
+size_t WirelessLink::push_uart_egress(const u8 *data, size_t len, UartSource source)
 {
-    return m_host_uart.push(data, len);
+    const size_t written = uart_egress(source).push(data, len);
+    if (written > 0)
+    {
+        m_arq.wake();
+    }
+    return written;
 }
 
-void WirelessLink::flush_host_uart()
+void WirelessLink::flush_uart_egress()
 {
     m_host_uart.flush();
+    m_target_uart.flush();
 }
 
 void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
@@ -764,17 +779,33 @@ void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
     m_host_uart_fill_ctx = ctx;
 }
 
-void WirelessLink::notify_host_uart()
+void WirelessLink::notify_uart_egress()
 {
     m_arq.wake();
 }
 
-void WirelessLink::arq_poll(void *ctx)
+bool WirelessLink::uart_reliable() const
 {
-    static_cast<WirelessLink *>(ctx)->poll_host_uart_egress();
+    return m_uart_reliable;
 }
 
-void WirelessLink::poll_host_uart_egress()
+void WirelessLink::set_uart_reliable(bool reliable)
+{
+    m_uart_reliable = reliable;
+    ESP_LOGI(TAG, "UART egress reliability %s", reliable ? "on" : "off");
+}
+
+UartEgress &WirelessLink::uart_egress(UartSource source)
+{
+    return (source == UartSource::Host) ? m_host_uart : m_target_uart;
+}
+
+void WirelessLink::arq_poll(void *ctx)
+{
+    static_cast<WirelessLink *>(ctx)->poll_uart_egress();
+}
+
+void WirelessLink::poll_uart_egress()
 {
     // 先补读：缓冲腾出空间后把 CDC 端点重新打开
     if (m_host_uart_fill != nullptr)
@@ -782,33 +813,87 @@ void WirelessLink::poll_host_uart_egress()
         m_host_uart_fill(m_host_uart_fill_ctx);
     }
 
-    // 没有配对就没有落点：丢掉这批，重新配对后从新字节开始
+    // 没有配对就没有落点：丢掉两条缓冲，重新配对后从新字节开始
     if (peer_mac_key().cached() == nullptr)
     {
-        m_host_uart.flush();
+        flush_uart_egress();
         return;
     }
 
+    // 目标方向先排：它是对端串口回给主机的确认与数据，卡住它等于把主机侧拖成超时，
+    // 而主机方向的下载突发本来就有缓冲兜着
+    drain_uart_egress(m_target_uart, UartSource::Target);
+    drain_uart_egress(m_host_uart, UartSource::Host);
+}
+
+WirelessLink::UartVerdict WirelessLink::uart_frame_verdict() const
+{
+    if (!m_uart_reliable)
+    {
+        return UartVerdict::Unreliable;
+    }
+
+    // 窗口只有一格时可靠通道自己都不够用：串口退回尽力而为，至少还发得出去
+    const ArqSettings settings = m_arq.settings();
+    if (settings.window <= 1)
+    {
+        return UartVerdict::Unreliable;
+    }
+
+    // DAP 的可靠消息还在待发环里排队：先让它走，窗口不会因为串口帧而晚推进
+    if (m_arq.reliable_pending() > 0)
+    {
+        return UartVerdict::Wait;
+    }
+
+    // 留一整个窗口槽给 DAP：串口最多占 window - 1 条，DAP 的命令与响应随时插得进来
+    const ArqLink::Snapshot arq = m_arq.snapshot();
+    if (static_cast<size_t>(arq.in_flight) + 1 >= settings.window)
+    {
+        return UartVerdict::Wait;
+    }
+    return UartVerdict::Reliable;
+}
+
+void WirelessLink::drain_uart_egress(UartEgress &egress, UartSource source)
+{
     u8 frame[MAX_UART_PAYLOAD_SIZE];
+
     while (true)
     {
-        const size_t n = m_host_uart.peek(frame, sizeof(frame));
+        const size_t n = egress.peek(frame, sizeof(frame));
         if (n == 0)
         {
             break;
         }
 
+        const UartVerdict verdict = uart_frame_verdict();
+        if (verdict == UartVerdict::Wait)
+        {
+            // 让路只是暂缓：这一帧留在缓冲里，下一轮再看，满了照样反压主机
+            break;
+        }
+        const ArqLink::Reliability reliability =
+            (verdict == UartVerdict::Reliable) ? ArqLink::Reliability::Reliable : ArqLink::Reliability::Unreliable;
+
         // 额度不足或驱动暂时发不出去：这一帧留在缓冲里，下一轮接着来
-        if (!uart_tx_admit(n, UartSource::Host))
+        if (!uart_tx_admit(n, source))
         {
             break;
         }
-        if (send_uart_frame(frame, n, UartSource::Host) != ESP_OK)
+        if (send_uart_frame(frame, n, source, reliability) != ESP_OK)
         {
             break;
         }
 
-        m_host_uart.consume(n);
+        egress.consume(n);
+
+        // 可靠帧进的是待发环，真正发出在下一轮 drain_tx：立刻唤醒把窗口推进一格，
+        // 否则只能等兜底节拍，一拍的节流就够把下载拖成超时
+        if (reliability == ArqLink::Reliability::Reliable)
+        {
+            m_arq.wake();
+        }
     }
 }
 

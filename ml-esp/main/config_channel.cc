@@ -242,6 +242,8 @@ ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
 //   0x1C EnterUpdate   软复位进入更新模式：重启后 USB 只暴露一个 CDC 串口并
 //                        显示渐变灯效，硬复位退出；仅 USB 目标支持（无 USB 侧回
 //                        unsupported）。进入请求跨软复位传递，见 update_mode.cc
+//   0x1D SetUartReliable 参数 0=关 1=开（串口出向是否走可靠传输，两端同时应用），
+//                        其他值回 malformed
 // 动作命令的响应 TLV 区为空：status == ok 表示动作已投递（执行在主循环，
 // 完成与否看串口日志与设备行为），busy 表示槽内已有未取走的动作。
 //
@@ -281,6 +283,7 @@ enum class Cmd : u8
     SetWifiRate = 0x19,
     SetLinkConfig = 0x1B,
     EnterUpdate = 0x1C,
+    SetUartReliable = 0x1D,
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     SetLoss = 0x1A,
 #endif
@@ -382,6 +385,10 @@ u16 ConfigChannel::dispatch_control(u8 cmd, u8 arg, u8 seq)
         return mlink::wifi_rate_supported(arg)
                    ? post_action_response(cmd, seq, Action::SetWifiRate, arg)
                    : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
+    case Cmd::SetUartReliable:
+        // 只有开/关两个取值，其余按 malformed 拒绝且不占动作槽
+        return arg <= 1 ? post_action_response(cmd, seq, Action::SetUartReliable, arg)
+                        : build_empty_response(cmd, seq, static_cast<u8>(Status::Malformed));
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     case Cmd::SetLoss:
         // 丢包率上限由无线链路定义；越界不占动作槽。未编译该功能时本命令码
@@ -484,6 +491,7 @@ enum : u8
     TAG_UART_DATA_BITS = 0x36,   // u8：数据位 5-8
     TAG_UART_STOP_BITS = 0x37,   // u8：停止位 0=1 1=1.5 2=2
     TAG_UART_PARITY = 0x38,      // u8：校验 0=无 1=奇 2=偶 3=Mark 4=Space
+    TAG_UART_RELIABLE = 0x39,    // u8：串口出向是否走可靠传输 0=尽力而为 1=可靠
     // 可靠传输统计：无线段（0x20-0x2F）已排满，单开 0x70-0x7F 一段
     TAG_ARQ_STATE = 0x70,         // u8：bit0-3 生效窗口、bit7 熔断中
     TAG_ARQ_TX = 0x71,            // u32：首次发出的可靠消息数
@@ -804,6 +812,8 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_UART_DATA_BITS, stats.uart_data_bits);
     p += tlv_u8(m_response + p, TAG_UART_STOP_BITS, stats.uart_stop_bits);
     p += tlv_u8(m_response + p, TAG_UART_PARITY, stats.uart_parity);
+    p += tlv_u8(m_response + p, TAG_UART_RELIABLE,
+                Application::get_instance().wireless_link().uart_reliable() ? 1 : 0);
     p += tlv_u32(m_response + p, TAG_UPTIME, static_cast<u32>(esp_timer_get_time() / 1000));
 
     return finish_response(cmd, seq, p);
@@ -1189,6 +1199,12 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
         relay_to_peer(cmd, arg);
     }
 #endif
+    // 串口出向的可靠性是两端各自的选择，但两端必须一致：只改一端就会出现"下载走
+    // 可靠、回包走尽力而为"的半可靠链路，吞吐与丢帧现象无法归因
+    else if (cmd == static_cast<u8>(Cmd::SetUartReliable) && arg <= 1)
+    {
+        relay_to_peer(cmd, arg);
+    }
 
     u16 len = dispatch_control(cmd, arg, seq);
     if (len > request->wLength)

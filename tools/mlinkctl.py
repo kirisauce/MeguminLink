@@ -10,6 +10,7 @@
     mlinkctl set-mode <mode>     切换运行模式：local | wireless（cmd 0x10）
     mlinkctl set-rate <rate>     设置 ESP-NOW 发送速率档位，两端同时应用（cmd 0x19）
     mlinkctl set-loss <percent>  设置注入丢包率，两端同时应用（cmd 0x1A，需固件编译该功能）
+    mlinkctl set-uart-reliable on|off  串口出向是否走可靠传输，两端同时应用（cmd 0x1D）
     mlinkctl pair                进入配对流程（cmd 0x11）
     mlinkctl exit-pair           退出配对流程（cmd 0x15）
     mlinkctl ping [-c N]         探测已配对对端：ESP-NOW 往返时延（cmd 0x18）
@@ -77,6 +78,7 @@ CMD_PING = 0x18
 CMD_SET_WIFI_RATE = 0x19
 CMD_SET_LOSS = 0x1A
 CMD_ENTER_UPDATE = 0x1C
+CMD_SET_UART_RELIABLE = 0x1D
 
 # 更新模式的固件升级协议（见 ml-esp/main/usb/firmware_updater.cc 顶部；与固件一一对应）：
 # 8B 帧头 + 载荷，CDC 串口上一问一答，整数一律大端。设备侧用 CDC 而不是 vendor
@@ -196,6 +198,7 @@ TAG_UART_BAUD = 0x35
 TAG_UART_DATA_BITS = 0x36
 TAG_UART_STOP_BITS = 0x37
 TAG_UART_PARITY = 0x38
+TAG_UART_RELIABLE = 0x39
 
 # 对端存活探测（GetStats 的 0x22-0x25，与固件 config_channel.cc 一致）：
 # online 0=从未探测 1=在线 2=离线；rtt 是最近一次成功往返的微秒数；ok/fail 是
@@ -407,11 +410,15 @@ def render_uart_state(values):
     data_bits = number(TAG_UART_DATA_BITS, 8)
     stop_bits = UART_STOP_BITS.get(number(TAG_UART_STOP_BITS), "?")
     parity = UART_PARITY.get(number(TAG_UART_PARITY), "?")
-    return [
+    parts = [
         f"uart_open={'yes' if number(TAG_UART_HOST_OPEN) else 'no'}",
         f"uart_baud={number(TAG_UART_BAUD)}",
         f"uart_format={data_bits}{parity}{stop_bits}",
     ]
+    # 可靠出向是较新的 tag：老固件不上报时整项省略，别把缺失读成 off
+    if TAG_UART_RELIABLE in values:
+        parts.append(f"uart_reliable={'on' if number(TAG_UART_RELIABLE) else 'off'}")
+    return parts
 
 
 def render_peer_state(values):
@@ -806,6 +813,18 @@ def cmd_set_loss(args):
     print("mlinkctl: 已下发本机并转发对端；两端固件都需编译该功能（见 Kconfig 的 Wireless 菜单）", file=sys.stderr)
 
 
+def cmd_set_uart_reliable(args):
+    value = 1 if args.state == "on" else 0
+
+    # 设备端按 0/1 存放，并把同一条控制请求转发给对端：两端必须一致，只改一端会
+    # 变成"下载走可靠、回包走尽力而为"的半可靠链路，现象没法归因。转发是尽力而
+    # 为的，对端没跟上时重发一次即可。
+    decode(fetch(find_device(args.serial), CMD_SET_UART_RELIABLE, value))
+    print(f"status=ok uart_reliable={args.state}")
+    if value == 0:
+        print("mlinkctl: 已关闭：串口出向回到尽力而为，超速的帧会被令牌桶整帧丢弃", file=sys.stderr)
+
+
 def cmd_action(args):
     decode(fetch(find_device(args.serial), args.cmd_code))
     print("status=ok")
@@ -1096,6 +1115,14 @@ def build_parser():
         help=f"丢包率百分比，0-{LOSS_PERCENT_MAX}（0.1 步进），0 = 关闭",
     )
     set_loss.set_defaults(handler=cmd_set_loss)
+
+    set_uart = subparsers.add_parser("set-uart-reliable", help="串口出向是否走可靠传输，两端同时应用")
+    set_uart.add_argument(
+        "state",
+        choices=("on", "off"),
+        help="on = 可靠传输（丢帧重传，占一个 ARQ 窗口）；off = 尽力而为（超速即丢）",
+    )
+    set_uart.set_defaults(handler=cmd_set_uart_reliable)
 
     ping = subparsers.add_parser("ping", help="探测已配对对端（ESP-NOW 往返时延）")
     ping.add_argument("-c", "--count", type=int, default=1, metavar="N", help="探测次数（默认 1）")

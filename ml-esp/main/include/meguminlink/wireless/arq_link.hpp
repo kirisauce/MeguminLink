@@ -264,6 +264,9 @@ class ArqLink
      */
     bool can_submit() const;
 
+    /** 待发环里尚未取走的可靠消息条数（链路层据此给 DAP 让路） */
+    size_t reliable_pending() const;
+
     /**
      * 取出一条"重传耗尽、已判定失败"的消息序号。
      *

@@ -385,6 +385,11 @@ bool ArqLink::can_submit() const
     return state.in_flight < state.window;
 }
 
+size_t ArqLink::reliable_pending() const
+{
+    return (m_tx_reliable == nullptr) ? 0 : static_cast<size_t>(uxQueueMessagesWaiting(m_tx_reliable));
+}
+
 bool ArqLink::take_failed(u16 *seq_out)
 {
     xSemaphoreTake(m_state_mutex, portMAX_DELAY);

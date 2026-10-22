@@ -40,6 +40,7 @@ export const CMD_SET_LINK_CONFIG = 0x1b;
  * 升级协议跑在那个口上（见 update.ts）。硬复位即退回正常模式。
  */
 export const CMD_ENTER_UPDATE = 0x1c;
+export const CMD_SET_UART_RELIABLE = 0x1d;
 /** 固件的静态响应缓冲是 256B，实测整帧 77B；这里给足余量。 */
 export const MAX_RESPONSE = 512;
 
@@ -78,6 +79,7 @@ const TAG_UART_BAUD = 0x35;
 const TAG_UART_DATA_BITS = 0x36;
 const TAG_UART_STOP_BITS = 0x37;
 const TAG_UART_PARITY = 0x38;
+const TAG_UART_RELIABLE = 0x39;
 
 /** 对端存活探测的 tag（0x20-0x2F 无线段，紧跟空口字节计数器续编）。 */
 const TAG_PEER_ONLINE = 0x22;
@@ -205,6 +207,8 @@ export type Stats = {
 	uartDataBits: number | null;
 	uartStopBits: number | null;
 	uartParity: number | null;
+	/** 串口出向是否走可靠传输：1 = 可靠，0 = 尽力而为；老固件不上报时为 null */
+	uartReliable: number | null;
 	peerOnline: number | null;
 	pingRttUs: number | null;
 	pingOk: number | null;
@@ -467,7 +471,13 @@ function parseTlv(frame: DataView, start: number, end: number): Map<number, Data
  * CDC ACM 串口状态字段：它们是状态而不是计数器，既不进 STAT_FIELDS，
  * 也不参与 rate.ts 的速率差分（CounterKey 显式把它们排除在外）。
  */
-export type UartStateKey = 'uartHostOpen' | 'uartBaud' | 'uartDataBits' | 'uartStopBits' | 'uartParity';
+export type UartStateKey =
+	| 'uartHostOpen'
+	| 'uartBaud'
+	| 'uartDataBits'
+	| 'uartStopBits'
+	| 'uartParity'
+	| 'uartReliable';
 
 /** 对端存活探测字段：与串口状态同待遇，既不进 STAT_FIELDS 也不参与速率差分。 */
 export type PeerStateKey = 'peerOnline' | 'pingRttUs' | 'pingOk' | 'pingFail';
@@ -541,6 +551,7 @@ export function decodeStats(frame: DataView): Stats {
 	stats.uartDataBits = readOptional(tags.get(TAG_UART_DATA_BITS));
 	stats.uartStopBits = readOptional(tags.get(TAG_UART_STOP_BITS));
 	stats.uartParity = readOptional(tags.get(TAG_UART_PARITY));
+	stats.uartReliable = readOptional(tags.get(TAG_UART_RELIABLE));
 	stats.peerOnline = readOptional(tags.get(TAG_PEER_ONLINE));
 	stats.pingRttUs = readOptional(tags.get(TAG_PING_RTT));
 	stats.pingOk = readOptional(tags.get(TAG_PING_OK));

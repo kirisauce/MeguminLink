@@ -157,6 +157,7 @@ class ConfigChannel
         ApplyUsbConfig, // 落盘 USB 能力草稿并应用（重建描述符 + 重新枚举 USB）
         Ping,           // 立即探测已配对对端（存活与往返时延）
         SetWifiRate,    // arg: wifi_phy_rate_t 原值（ESP-NOW 发送速率档位）
+        SetUartReliable, // arg: 0=串口出向走尽力而为 1=走可靠传输（落盘）
         SetLinkConfig,  // 落盘并应用可靠传输参数（草稿槽已由 SetLinkConfig 命令填好）
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
         SetLoss,        // arg: 千分比（DAP/UART 出向帧的注入丢包率，见 wireless/link.hpp）
