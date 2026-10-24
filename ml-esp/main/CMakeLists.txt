@@ -45,5 +45,8 @@ list(APPEND __src
     ${CMAKE_CURRENT_LIST_DIR}/led/gpio_led_driver.cc
     ${CMAKE_CURRENT_LIST_DIR}/led/ws2812_led_driver.cc)
 
+file(GLOB __meaproto_src ${CMAKE_CURRENT_LIST_DIR}/meaproto/*.cc)
+list(APPEND __src ${__meaproto_src})
+
 idf_component_register(SRCS ${__src}
                     INCLUDE_DIRS "./include" "./cmsis_dap/Include" "./cmsis_dap/Config")
