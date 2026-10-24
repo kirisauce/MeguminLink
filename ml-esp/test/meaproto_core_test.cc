@@ -21,6 +21,14 @@ using test::check_eq;
 constexpr u16 MTU = 1470;
 constexpr u32 START_MS = 1000;
 constexpr u32 FIRST_EPOCH = 0x01020304;
+constexpr u32 PEER_EPOCH = 0x0A0B;
+constexpr u16 PEER_MTU = 1400;
+constexpr Config DEFAULT_CONFIG = {};
+
+u16 empty_hash()
+{
+    return config_hash(std::span<const ChannelSpec>{});
+}
 
 struct FakeSink final : Sink
 {
@@ -72,7 +80,7 @@ struct FakeLink
 struct Rig
 {
     Rig()
-        : core(std::span<const ChannelSpec>{}, Config{}, MTU, sink,
+        : core(std::span<const ChannelSpec>{}, DEFAULT_CONFIG, MTU, sink,
                CoreHooks{&link, &FakeLink::send, &FakeLink::random})
     {
     }
@@ -91,6 +99,65 @@ ControlFrame decoded(const std::vector<u8> &bytes)
     return frame;
 }
 
+/** 把控制帧编成字节；version 用于构造版本不符的帧 */
+std::vector<u8> encode_control(const ControlFrame &frame, u8 version = VERSION)
+{
+    u8 buffer[CONTROL_FRAME_SIZE] = {};
+    usize written = 0;
+    check_eq(encode(frame, std::span<u8>{buffer, sizeof(buffer)}, written), WireError::Ok);
+    buffer[0] = static_cast<u8>((version << VERSION_SHIFT) | FLAG_CONTROL);
+    return std::vector<u8>{buffer, buffer + written};
+}
+
+void deliver(Rig &rig, const ControlFrame &frame, u8 version = VERSION)
+{
+    const std::vector<u8> bytes = encode_control(frame, version);
+    rig.core.receive(rig.now, std::span<const u8>{bytes.data(), bytes.size()});
+}
+
+ControlFrame last_sent(const Rig &rig)
+{
+    return decoded(rig.link.frames.back());
+}
+
+ControlFrame connect_request(u32 own_epoch, u16 mtu, u16 hash)
+{
+    ControlFrame frame;
+    frame.type = ControlType::ConnectRequest;
+    frame.own_epoch = own_epoch;
+    frame.mtu = mtu;
+    frame.config_hash = hash;
+    return frame;
+}
+
+ControlFrame connect_accept(u32 own_epoch, u32 peer_epoch, u16 mtu)
+{
+    ControlFrame frame;
+    frame.type = ControlType::ConnectAccept;
+    frame.own_epoch = own_epoch;
+    frame.peer_epoch = peer_epoch;
+    frame.mtu = mtu;
+    frame.config_hash = empty_hash();
+    return frame;
+}
+
+ControlFrame disconnect(u32 own_epoch)
+{
+    ControlFrame frame;
+    frame.type = ControlType::Disconnect;
+    frame.own_epoch = own_epoch;
+    frame.config_hash = empty_hash();
+    return frame;
+}
+
+/** 走完 open() + ConnectAccept，进入 Connected */
+void handshake(Rig &rig)
+{
+    rig.core.open(rig.now);
+    const u32 own_epoch = last_sent(rig).own_epoch;
+    deliver(rig, connect_accept(PEER_EPOCH, own_epoch, PEER_MTU));
+}
+
 void idle_initial()
 {
     Rig rig;
@@ -99,6 +166,7 @@ void idle_initial()
     check(!rig.core.connecting());
     check(rig.link.frames.empty());
     check_eq(rig.core.step(rig.now), rig.now + 1000);
+    check_eq(rig.core.mtu(), MTU);
 }
 
 void open_sends_connect_request()
@@ -118,7 +186,7 @@ void open_sends_connect_request()
     check_eq(frame.peer_epoch, 0);
     check_eq(frame.own_epoch, FIRST_EPOCH);
     check_eq(frame.mtu, MTU);
-    check_eq(frame.config_hash, config_hash(std::span<const ChannelSpec>{}));
+    check_eq(frame.config_hash, empty_hash());
     check_eq(frame.token, 0);
 }
 
@@ -140,7 +208,7 @@ void close_sends_disconnect()
 
     check(rig.core.state() == Core::State::Idle);
     check_eq(rig.link.frames.size(), 2);
-    const ControlFrame frame = decoded(rig.link.frames.back());
+    const ControlFrame frame = last_sent(rig);
     check_eq(frame.type, ControlType::Disconnect);
     check_eq(frame.peer_epoch, 0);
     check_eq(rig.sink.disconnected_count, 1);
@@ -168,14 +236,202 @@ void send_failure_keeps_connecting()
 void snapshot_reflects_state()
 {
     Rig rig;
-    Stats idle = rig.core.snapshot();
+    const Stats idle = rig.core.snapshot();
     check(!idle.connected);
     check_eq(idle.peer_epoch, 0);
 
     rig.core.open(rig.now);
-    Stats connecting = rig.core.snapshot();
+    const Stats connecting = rig.core.snapshot();
     check(!connecting.connected);
     check_eq(connecting.peer_epoch, 0);
+}
+
+void accept_connect_request()
+{
+    Rig rig;
+    deliver(rig, connect_request(PEER_EPOCH, PEER_MTU, empty_hash()));
+
+    check(rig.core.connected());
+    check_eq(rig.sink.connected_count, 1);
+    check_eq(rig.core.mtu(), PEER_MTU);
+    check_eq(rig.link.frames.size(), 1);
+
+    const ControlFrame reply = last_sent(rig);
+    check_eq(reply.type, ControlType::ConnectAccept);
+    check_eq(reply.status, ControlStatus::Ok);
+    check_eq(reply.peer_epoch, PEER_EPOCH);
+    check(reply.own_epoch != 0);
+}
+
+void reject_config_mismatch()
+{
+    Rig rig;
+    deliver(rig, connect_request(PEER_EPOCH, PEER_MTU, static_cast<u16>(empty_hash() ^ 0x1234u)));
+
+    check(rig.core.state() == Core::State::Idle);
+    check_eq(rig.sink.connected_count, 0);
+    const ControlFrame reply = last_sent(rig);
+    check_eq(reply.type, ControlType::ConnectReject);
+    check_eq(reply.status, ControlStatus::ConfigMismatch);
+}
+
+void reject_bad_version()
+{
+    Rig rig;
+    deliver(rig, connect_request(PEER_EPOCH, PEER_MTU, empty_hash()), 2);
+
+    check(rig.core.state() == Core::State::Idle);
+    const ControlFrame reply = last_sent(rig);
+    check_eq(reply.type, ControlType::ConnectReject);
+    check_eq(reply.status, ControlStatus::VersionMismatch);
+}
+
+void ignore_bad_version_non_request()
+{
+    Rig rig;
+    ControlFrame keepalive;
+    keepalive.type = ControlType::KeepAlive;
+    deliver(rig, keepalive, 2);
+    check(rig.link.frames.empty());
+}
+
+void complete_handshake_with_accept()
+{
+    Rig rig;
+    handshake(rig);
+
+    check(rig.core.connected());
+    check_eq(rig.sink.connected_count, 1);
+    check_eq(rig.core.mtu(), PEER_MTU);
+    check_eq(rig.core.snapshot().peer_epoch, PEER_EPOCH);
+}
+
+void stale_accept_ignored()
+{
+    Rig rig;
+    rig.core.open(rig.now);
+    const u32 own_epoch = last_sent(rig).own_epoch;
+    deliver(rig, connect_accept(PEER_EPOCH, own_epoch + 1, PEER_MTU));
+
+    check(rig.core.connecting());
+    check_eq(rig.sink.connected_count, 0);
+}
+
+void peer_reject_returns_to_idle()
+{
+    Rig rig;
+    rig.core.open(rig.now);
+    const u32 own_epoch = last_sent(rig).own_epoch;
+
+    ControlFrame reject;
+    reject.type = ControlType::ConnectReject;
+    reject.status = ControlStatus::ConfigMismatch;
+    reject.peer_epoch = own_epoch;
+    deliver(rig, reject);
+
+    check(rig.core.state() == Core::State::Idle);
+    check_eq(rig.sink.disconnected_count, 1);
+    check(rig.sink.last_reason == DisconnectReason::Rejected);
+}
+
+void retry_resends_request()
+{
+    Rig rig;
+    rig.core.open(rig.now);
+    check_eq(rig.link.frames.size(), 1);
+
+    rig.now += DEFAULT_CONFIG.connect_retry_ms;
+    rig.core.step(rig.now);
+
+    check(rig.core.connecting());
+    check_eq(rig.link.frames.size(), 2);
+    check_eq(last_sent(rig).type, ControlType::ConnectRequest);
+}
+
+void retries_exhausted()
+{
+    Rig rig;
+    rig.core.open(rig.now);
+    for (int i = 0; i < 2 * DEFAULT_CONFIG.connect_max_retries && rig.core.connecting(); ++i)
+    {
+        rig.now += DEFAULT_CONFIG.connect_retry_ms;
+        rig.core.step(rig.now);
+    }
+
+    check(rig.core.state() == Core::State::Idle);
+    check_eq(rig.sink.disconnected_count, 1);
+    check(rig.sink.last_reason == DisconnectReason::Rejected);
+    check_eq(rig.link.frames.size(), 1 + DEFAULT_CONFIG.connect_max_retries);
+}
+
+void open_throttled_after_failure()
+{
+    Rig rig;
+    rig.core.open(rig.now);
+    for (int i = 0; i < 2 * DEFAULT_CONFIG.connect_max_retries && rig.core.connecting(); ++i)
+    {
+        rig.now += DEFAULT_CONFIG.connect_retry_ms;
+        rig.core.step(rig.now);
+    }
+
+    const std::size_t frames = rig.link.frames.size();
+    rig.core.open(rig.now);
+    check(rig.core.state() == Core::State::Idle);
+    check_eq(rig.link.frames.size(), frames);
+
+    rig.now += DEFAULT_CONFIG.connect_retry_ms;
+    rig.core.open(rig.now);
+    check(rig.core.connecting());
+    check_eq(rig.link.frames.size(), frames + 1);
+}
+
+void peer_disconnect_returns_to_idle()
+{
+    Rig rig;
+    handshake(rig);
+    deliver(rig, disconnect(PEER_EPOCH));
+
+    check(rig.core.state() == Core::State::Idle);
+    check_eq(rig.sink.disconnected_count, 1);
+    check(rig.sink.last_reason == DisconnectReason::Requested);
+}
+
+void stale_disconnect_ignored()
+{
+    Rig rig;
+    handshake(rig);
+    deliver(rig, disconnect(PEER_EPOCH + 1));
+
+    check(rig.core.connected());
+    check_eq(rig.sink.disconnected_count, 0);
+}
+
+void duplicate_request_repeats_accept()
+{
+    Rig rig;
+    handshake(rig);
+    const std::size_t frames = rig.link.frames.size();
+    deliver(rig, connect_request(PEER_EPOCH, PEER_MTU, empty_hash()));
+
+    check(rig.core.connected());
+    check_eq(rig.sink.connected_count, 1);
+    check_eq(rig.link.frames.size(), frames + 1);
+    check_eq(last_sent(rig).type, ControlType::ConnectAccept);
+}
+
+void restart_with_new_epoch()
+{
+    Rig rig;
+    handshake(rig);
+    const std::size_t frames = rig.link.frames.size();
+    deliver(rig, connect_request(PEER_EPOCH + 7, PEER_MTU, empty_hash()));
+
+    check(rig.core.connected());
+    check_eq(rig.sink.connected_count, 1);
+    check_eq(rig.core.snapshot().peer_epoch, PEER_EPOCH + 7);
+    check_eq(rig.link.frames.size(), frames + 1);
+    check_eq(last_sent(rig).type, ControlType::ConnectAccept);
+    check_eq(last_sent(rig).peer_epoch, PEER_EPOCH + 7);
 }
 
 const test::Case TESTS[] = {
@@ -186,6 +442,20 @@ const test::Case TESTS[] = {
     {"close on idle is a no-op", close_when_idle_is_noop},
     {"send failure keeps connecting", send_failure_keeps_connecting},
     {"snapshot reflects state", snapshot_reflects_state},
+    {"accept connect request", accept_connect_request},
+    {"reject config mismatch", reject_config_mismatch},
+    {"reject bad version", reject_bad_version},
+    {"ignore bad version non-request", ignore_bad_version_non_request},
+    {"complete handshake with accept", complete_handshake_with_accept},
+    {"stale accept ignored", stale_accept_ignored},
+    {"peer reject returns to idle", peer_reject_returns_to_idle},
+    {"retry resends request", retry_resends_request},
+    {"retries exhausted", retries_exhausted},
+    {"open throttled after failure", open_throttled_after_failure},
+    {"peer disconnect returns to idle", peer_disconnect_returns_to_idle},
+    {"stale disconnect ignored", stale_disconnect_ignored},
+    {"duplicate request repeats accept", duplicate_request_repeats_accept},
+    {"restart with new epoch", restart_with_new_epoch},
 };
 } // namespace
 
