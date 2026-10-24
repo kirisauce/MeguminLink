@@ -4,17 +4,21 @@
 
 #include "meaproto/types.hpp"
 
-#include <concepts>
 #include <span>
 
 namespace meaproto
 {
 /** 应用侧接收接口：回调运行在 meaproto 任务上下文，只允许入队或拷贝 */
-template <typename T>
-concept Sink = requires(T sink, ChannelId channel, std::span<const u8> data, DisconnectReason reason) {
-    { sink.on_message(channel, data) } -> std::same_as<void>;
-    { sink.on_connected() } -> std::same_as<void>;
-    { sink.on_disconnected(reason) } -> std::same_as<void>;
+class Sink
+{
+  public:
+    virtual ~Sink() = default;
+
+    /** 对应发送端一次 send()：分片已重组、可靠消息已按序 */
+    virtual void on_message(ChannelId channel, std::span<const u8> data) = 0;
+
+    virtual void on_connected() = 0;
+    virtual void on_disconnected(DisconnectReason reason) = 0;
 };
 } // namespace meaproto
 
