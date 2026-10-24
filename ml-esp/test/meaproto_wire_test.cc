@@ -3,44 +3,19 @@
 
 #include "meaproto/hash.hpp"
 #include "meaproto/wire.hpp"
+#include "test_common.hpp"
 
 #include <array>
 #include <cstddef>
-#include <print>
-#include <source_location>
+#include <iterator>
 #include <span>
 
 using namespace meaproto;
 
 namespace
 {
-int g_pass = 0;
-int g_fail = 0;
-
-void check(bool condition, std::source_location where = std::source_location::current())
-{
-    if (condition)
-    {
-        ++g_pass;
-        return;
-    }
-    ++g_fail;
-    std::print("    [FAIL] {}:{}\n", where.file_name(), where.line());
-}
-
-template <typename Actual, typename Expected>
-void check_eq(Actual actual, Expected expected, std::source_location where = std::source_location::current())
-{
-    const long long lhs = static_cast<long long>(actual);
-    const long long rhs = static_cast<long long>(expected);
-    if (lhs == rhs)
-    {
-        ++g_pass;
-        return;
-    }
-    ++g_fail;
-    std::print("    [FAIL] {}:{}  got {}, want {}\n", where.file_name(), where.line(), lhs, rhs);
-}
+using test::check;
+using test::check_eq;
 
 static_assert(Encodable<DatagramHeader>);
 static_assert(Decodable<DatagramHeader>);
@@ -407,42 +382,27 @@ void config_hash_sensitive()
     check(hash != config_hash(std::span<const ChannelSpec>{}));
 }
 
-struct TestCase
-{
-    const char *name;
-    void (*run)();
-};
-
-const TestCase TESTS[] = {
-    {"datagram 往返", datagram_roundtrip},
-    {"datagram 边界值", datagram_roundtrip_edges},
-    {"datagram 截断", datagram_truncated},
-    {"datagram 版本非法", datagram_bad_version},
-    {"datagram flags 矛盾", datagram_bad_flags},
-    {"datagram channel 保留位忽略", datagram_channel_reserved_ignored},
-    {"message 不可靠往返", message_unreliable_roundtrip},
-    {"message 可靠往返", message_reliable_roundtrip},
-    {"message 分片往返", message_fragment_roundtrip},
-    {"message flags 非法", message_bad_flags},
-    {"message 分片字段非法", message_bad_split},
-    {"message 截断", message_truncated},
-    {"control 往返", control_roundtrip},
-    {"control 非法字段", control_bad},
-    {"encode 缓冲不足", encode_buffer_too_small},
-    {"config_hash 敏感度", config_hash_sensitive},
+const test::Case TESTS[] = {
+    {"datagram roundtrip", datagram_roundtrip},
+    {"datagram edge values", datagram_roundtrip_edges},
+    {"datagram truncated", datagram_truncated},
+    {"datagram bad version", datagram_bad_version},
+    {"datagram conflicting flags", datagram_bad_flags},
+    {"datagram channel reserved bits ignored", datagram_channel_reserved_ignored},
+    {"message unreliable roundtrip", message_unreliable_roundtrip},
+    {"message reliable roundtrip", message_reliable_roundtrip},
+    {"message fragment roundtrip", message_fragment_roundtrip},
+    {"message bad flags", message_bad_flags},
+    {"message bad split fields", message_bad_split},
+    {"message truncated", message_truncated},
+    {"control roundtrip", control_roundtrip},
+    {"control bad fields", control_bad},
+    {"encode buffer too small", encode_buffer_too_small},
+    {"config_hash sensitivity", config_hash_sensitive},
 };
 } // namespace
 
 int main()
 {
-    for (const TestCase &test : TESTS)
-    {
-        const int before = g_fail;
-        std::print("== {}\n", test.name);
-        test.run();
-        std::print("   {}\n", (g_fail == before) ? "通过" : "失败");
-    }
-
-    std::print("\n断言：{} 通过 / {} 失败\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    return test::run(TESTS, std::size(TESTS));
 }

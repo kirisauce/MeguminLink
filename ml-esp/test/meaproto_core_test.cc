@@ -4,10 +4,10 @@
 #include "meaproto/core.hpp"
 #include "meaproto/hash.hpp"
 #include "meaproto/wire.hpp"
+#include "test_common.hpp"
 
 #include <cstddef>
-#include <print>
-#include <source_location>
+#include <iterator>
 #include <span>
 #include <vector>
 
@@ -15,33 +15,8 @@ using namespace meaproto;
 
 namespace
 {
-int g_pass = 0;
-int g_fail = 0;
-
-void check(bool condition, std::source_location where = std::source_location::current())
-{
-    if (condition)
-    {
-        ++g_pass;
-        return;
-    }
-    ++g_fail;
-    std::print("    [FAIL] {}:{}\n", where.file_name(), where.line());
-}
-
-template <typename Actual, typename Expected>
-void check_eq(Actual actual, Expected expected, std::source_location where = std::source_location::current())
-{
-    const long long lhs = static_cast<long long>(actual);
-    const long long rhs = static_cast<long long>(expected);
-    if (lhs == rhs)
-    {
-        ++g_pass;
-        return;
-    }
-    ++g_fail;
-    std::print("    [FAIL] {}:{}  got {}, want {}\n", where.file_name(), where.line(), lhs, rhs);
-}
+using test::check;
+using test::check_eq;
 
 constexpr u16 MTU = 1470;
 constexpr u32 START_MS = 1000;
@@ -203,33 +178,18 @@ void snapshot_reflects_state()
     check_eq(connecting.peer_epoch, 0);
 }
 
-struct TestCase
-{
-    const char *name;
-    void (*run)();
-};
-
-const TestCase TESTS[] = {
-    {"初始状态", idle_initial},
-    {"发起握手", open_sends_connect_request},
-    {"重复 open 幂等", open_idempotent},
-    {"close 发 Disconnect", close_sends_disconnect},
-    {"Idle 时 close 无操作", close_when_idle_is_noop},
-    {"发送失败仍进 Connecting", send_failure_keeps_connecting},
-    {"快照反映状态", snapshot_reflects_state},
+const test::Case TESTS[] = {
+    {"initial state", idle_initial},
+    {"open sends connect request", open_sends_connect_request},
+    {"open is idempotent", open_idempotent},
+    {"close sends disconnect", close_sends_disconnect},
+    {"close on idle is a no-op", close_when_idle_is_noop},
+    {"send failure keeps connecting", send_failure_keeps_connecting},
+    {"snapshot reflects state", snapshot_reflects_state},
 };
 } // namespace
 
 int main()
 {
-    for (const TestCase &test : TESTS)
-    {
-        const int before = g_fail;
-        std::print("== {}\n", test.name);
-        test.run();
-        std::print("   {}\n", (g_fail == before) ? "通过" : "失败");
-    }
-
-    std::print("\n断言：{} 通过 / {} 失败\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    return test::run(TESTS, std::size(TESTS));
 }
