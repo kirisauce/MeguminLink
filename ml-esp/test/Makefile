@@ -1,47 +1,50 @@
-#   make            编译全部
-#   make run        编译并运行全部
-#   make arq        只跑 arq
-#   make meaproto   只跑 meaproto
-#   make clean      清理
+#   make              编译全部
+#   make run          编译并运行全部
+#   make meaproto     meaproto 的全部子测试
+#   make arq / meaproto-wire   只跑其中一个
+#   make clean        清理
 #
-# 产物在 build/ 下（已被 .gitignore 的 **/build 忽略）。
+# 二进制在 build/bin/，目标文件与依赖在 build/obj/（均被 .gitignore 的 **/build 忽略）。
 
 CXX ?= g++
 CXXFLAGS ?= -std=c++23 -Wall -Wextra -Werror -O1
 CPPFLAGS ?= -I ../main/include
 
-ARQ_TEST = build/arq_host_test
-ARQ_SRC = arq_host_test.cc ../main/wireless/arq.cc
-ARQ_HDR = ../main/include/meguminlink/wireless/arq.hpp ../main/include/meguminlink/common.hpp
+# 源文件搜索：测试源在本目录，固件源在 ../main/<模块>/
+vpath %.cc ../main ../main/wireless ../main/meaproto
 
-MEAPROTO_TEST = build/meaproto_test
-MEAPROTO_SRC = meaproto_test.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
-MEAPROTO_HDR = ../main/include/meaproto/wire.hpp ../main/include/meaproto/hash.hpp \
-               ../main/include/meaproto/types.hpp ../main/include/meguminlink/binfmt.hpp \
-               ../main/include/meguminlink/common.hpp
+# 每个测试一行：名字 = 源文件（固件源以 ../main/ 开头）
+arq           = arq_host_test.cc ../main/wireless/arq.cc
+meaproto-wire = meaproto_wire_test.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
 
-TESTS = $(ARQ_TEST) $(MEAPROTO_TEST)
+TESTS = arq meaproto-wire
 
-all: $(TESTS)
+# 源文件 → 目标文件：../main/a/b.cc → build/obj/a/b.o，其余 → build/obj/<name>.o
+obj = $(addprefix build/obj/,$(patsubst %.cc,%.o,$(patsubst ../main/%,%,$(1))))
 
-$(ARQ_TEST): $(ARQ_SRC) $(ARQ_HDR)
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(ARQ_SRC) -o $@
+build/bin/arq: $(call obj,$(arq))
+build/bin/meaproto-wire: $(call obj,$(meaproto-wire))
 
-$(MEAPROTO_TEST): $(MEAPROTO_SRC) $(MEAPROTO_HDR)
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(MEAPROTO_SRC) -o $@
+build/bin/%:
+	@mkdir -p $(@D)
+	$(CXX) $^ -o $@
 
-run: $(TESTS)
-	@for test in $(TESTS); do echo "== $$test"; ./$$test || exit 1; done
+build/obj/%.o: %.cc
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -MMD -MP -c $< -o $@
 
-arq: $(ARQ_TEST)
-	./$(ARQ_TEST)
+all: $(addprefix build/bin/,$(TESTS))
 
-meaproto: $(MEAPROTO_TEST)
-	./$(MEAPROTO_TEST)
+run: arq meaproto
+
+meaproto: meaproto-wire
+
+arq meaproto-wire: %: build/bin/%
+	./$<
 
 clean:
 	rm -rf build
 
-.PHONY: all run arq meaproto clean
+-include $(shell find build -name '*.d' 2>/dev/null)
+
+.PHONY: all run arq meaproto meaproto-wire clean

@@ -1,5 +1,5 @@
 // MeaProto 报文编解码（meaproto/wire.hpp）的宿主单元测试：往返、字段边界、
-// 截断与非法字段的拒绝路径。用法见同目录 Makefile：cd ml-esp/test && make meaproto
+// 截断与非法字段的拒绝路径。用法见同目录 Makefile：cd ml-esp/test && make meaproto-wire
 
 #include "meaproto/hash.hpp"
 #include "meaproto/wire.hpp"
