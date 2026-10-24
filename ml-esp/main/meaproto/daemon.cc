@@ -1,0 +1,284 @@
+#include "meaproto/daemon.hpp"
+
+#include <cstring>
+
+#include <esp_log.h>
+#include <esp_random.h>
+
+namespace meaproto
+{
+namespace
+{
+constexpr char TAG[] = "meaproto";
+
+/** 统计日志间隔 */
+constexpr u32 STATS_LOG_INTERVAL_MS = 10000;
+
+/** stop() 等待任务退出的上限 */
+constexpr u32 STOP_TIMEOUT_MS = 1000;
+
+u32 now_ms() noexcept
+{
+    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+/** u32 计时回绕安全：now 是否已到 deadline */
+bool time_after(u32 now, u32 deadline) noexcept
+{
+    return static_cast<i32>(now - deadline) >= 0;
+}
+
+const char *state_name(Core::State state) noexcept
+{
+    switch (state)
+    {
+    case Core::State::Idle:
+        return "idle";
+    case Core::State::Connecting:
+        return "connecting";
+    case Core::State::Connected:
+        return "connected";
+    }
+    return "unknown";
+}
+} // namespace
+
+u32 random_epoch(void *) noexcept
+{
+    return esp_random();
+}
+
+DaemonImpl::DaemonImpl(Sink &sink, std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
+                       const CoreHooks &hooks) noexcept
+    : m_core(channels, config, mtu, sink, hooks), m_rx_depth(config.rx_queue_depth == 0 ? 1 : config.rx_queue_depth),
+      m_rx_item(static_cast<u16>(sizeof(u16) + mtu))
+{
+    m_rx_queue = xQueueCreate(m_rx_depth, m_rx_item);
+    m_stopped = xSemaphoreCreateBinary();
+    if (m_rx_queue == nullptr || m_stopped == nullptr)
+    {
+        ESP_LOGE(TAG, "failed to create rx queue or stop semaphore");
+    }
+}
+
+DaemonImpl::~DaemonImpl()
+{
+    stop();
+
+    if (m_rx_queue != nullptr)
+    {
+        vQueueDelete(m_rx_queue);
+        m_rx_queue = nullptr;
+    }
+    if (m_stopped != nullptr)
+    {
+        vSemaphoreDelete(m_stopped);
+        m_stopped = nullptr;
+    }
+}
+
+void DaemonImpl::start(UBaseType_t priority, usize stack)
+{
+    if (m_rx_queue == nullptr || m_stopped == nullptr || m_task.load(std::memory_order_relaxed) != nullptr)
+    {
+        return;
+    }
+
+    TaskHandle_t task = nullptr;
+    if (xTaskCreate(&DaemonImpl::task_entry, "meaproto", static_cast<configSTACK_DEPTH_TYPE>(stack), this, priority,
+                    &task) != pdPASS)
+    {
+        ESP_LOGE(TAG, "failed to create task");
+        return;
+    }
+    m_task.store(task, std::memory_order_relaxed);
+}
+
+void DaemonImpl::stop()
+{
+    // 先摘句柄：之后的 open()/close()/收帧只会看到空句柄，不会再通知这条要退出的任务
+    const TaskHandle_t task = m_task.exchange(nullptr, std::memory_order_acq_rel);
+    if (task == nullptr)
+    {
+        return;
+    }
+
+    m_stopping.store(true, std::memory_order_relaxed);
+    xTaskNotifyGive(task);
+    (void)xSemaphoreTake(m_stopped, pdMS_TO_TICKS(STOP_TIMEOUT_MS));
+    m_stopping.store(false, std::memory_order_relaxed);
+}
+
+void DaemonImpl::open()
+{
+    m_request.store(Request::Open, std::memory_order_relaxed);
+    wake();
+}
+
+void DaemonImpl::close()
+{
+    m_request.store(Request::Close, std::memory_order_relaxed);
+    wake();
+}
+
+bool DaemonImpl::connected() const
+{
+    return m_state.load(std::memory_order_relaxed) == Core::State::Connected;
+}
+
+bool DaemonImpl::connecting() const
+{
+    return m_state.load(std::memory_order_relaxed) == Core::State::Connecting;
+}
+
+Stats DaemonImpl::snapshot() const
+{
+    taskENTER_CRITICAL(&m_snapshot_lock);
+    const Stats value = m_snapshot;
+    taskEXIT_CRITICAL(&m_snapshot_lock);
+    return value;
+}
+
+void DaemonImpl::push_frame(const u8 *data, usize len)
+{
+    // m_rx_staging 只被 Transport 的接收回调写；约定该回调串行
+    if (m_rx_queue == nullptr || len > static_cast<usize>(m_rx_item) - sizeof(u16))
+    {
+        m_rx_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const u16 size = static_cast<u16>(len);
+    std::memcpy(m_rx_staging, &size, sizeof(size));
+    std::memcpy(m_rx_staging + sizeof(size), data, len);
+    if (xQueueSend(m_rx_queue, m_rx_staging, 0) != pdTRUE)
+    {
+        m_rx_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    wake();
+}
+
+void DaemonImpl::publish()
+{
+    const Core::State state = m_core.state();
+    m_state.store(state, std::memory_order_relaxed);
+
+    Stats stats = m_core.snapshot();
+    stats.connected = (state == Core::State::Connected);
+    stats.rx_queue_dropped += m_rx_dropped.load(std::memory_order_relaxed);
+
+    taskENTER_CRITICAL(&m_snapshot_lock);
+    m_snapshot = stats;
+    taskEXIT_CRITICAL(&m_snapshot_lock);
+
+    if (state == m_logged_state)
+    {
+        return;
+    }
+
+    if (state == Core::State::Connected)
+    {
+        ESP_LOGI(TAG, "connected: version=%u mtu=%u config_hash=0x%04X own_epoch=0x%08X peer_epoch=0x%08X",
+                 static_cast<unsigned>(VERSION), static_cast<unsigned>(m_core.mtu()),
+                 static_cast<unsigned>(m_core.config_hash()), static_cast<unsigned>(m_core.own_epoch()),
+                 static_cast<unsigned>(m_core.peer_epoch()));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "state: %s", state_name(state));
+    }
+    m_logged_state = state;
+}
+
+void DaemonImpl::task_entry(void *ctx)
+{
+    static_cast<DaemonImpl *>(ctx)->run();
+}
+
+void DaemonImpl::run()
+{
+    publish();
+    for (;;)
+    {
+        const u32 now = now_ms();
+        apply_requests(now);
+        drain_rx(now);
+        const u32 next = m_core.step(now);
+        publish();
+        log_stats(now);
+
+        if (m_stopping.load(std::memory_order_relaxed))
+        {
+            break;
+        }
+
+        const u32 wait = time_after(next, now) ? (next - now) : 1;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait));
+    }
+
+    xSemaphoreGive(m_stopped);
+    vTaskDelete(nullptr);
+}
+
+void DaemonImpl::apply_requests(u32 now)
+{
+    switch (m_request.exchange(Request::None, std::memory_order_relaxed))
+    {
+    case Request::Open:
+        m_core.open(now);
+        break;
+    case Request::Close:
+        m_core.close(now);
+        break;
+    case Request::None:
+        break;
+    }
+}
+
+void DaemonImpl::drain_rx(u32 now)
+{
+    while (m_rx_queue != nullptr)
+    {
+        if (xQueueReceive(m_rx_queue, m_rx_frame, 0) != pdTRUE)
+        {
+            return;
+        }
+
+        u16 len = 0;
+        std::memcpy(&len, m_rx_frame, sizeof(len));
+        if (len > static_cast<u16>(m_rx_item - sizeof(u16)))
+        {
+            continue;
+        }
+        m_core.receive(now, std::span<const u8>{m_rx_frame + sizeof(u16), len});
+    }
+}
+
+void DaemonImpl::log_stats(u32 now)
+{
+    if (!time_after(now, m_next_stats_ms))
+    {
+        return;
+    }
+    m_next_stats_ms = now + STATS_LOG_INTERVAL_MS;
+
+    const Stats stats = snapshot();
+    ESP_LOGI(TAG, "stats: connected=%d tx=%u retx=%u acked=%u inflight=%u dup=%u oow=%u rx_dropped=%u rtt=%u rto=%u",
+             stats.connected ? 1 : 0, static_cast<unsigned>(stats.datagrams_sent),
+             static_cast<unsigned>(stats.datagrams_retransmitted), static_cast<unsigned>(stats.datagrams_acked),
+             static_cast<unsigned>(stats.datagrams_in_flight), static_cast<unsigned>(stats.duplicate_datagrams),
+             static_cast<unsigned>(stats.out_of_window), static_cast<unsigned>(stats.rx_queue_dropped),
+             static_cast<unsigned>(stats.rtt_ms), static_cast<unsigned>(stats.rto_ms));
+}
+
+void DaemonImpl::wake()
+{
+    const TaskHandle_t task = m_task.load(std::memory_order_relaxed);
+    if (task != nullptr)
+    {
+        xTaskNotifyGive(task);
+    }
+}
+} // namespace meaproto

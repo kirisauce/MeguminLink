@@ -18,7 +18,8 @@ bool time_before(u32 now, u32 deadline) noexcept
 
 Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu, Sink &sink,
            const CoreHooks &hooks) noexcept
-    : m_sink(sink), m_hooks(hooks), m_config(config), m_mtu(mtu), m_config_hash(config_hash(channels)), m_peer_mtu(mtu)
+    : m_sink(sink), m_hooks(hooks), m_config(config), m_mtu(mtu), m_config_hash(meaproto::config_hash(channels)),
+      m_peer_mtu(mtu)
 {
 }
 
@@ -115,6 +116,21 @@ bool Core::connecting() const noexcept
 u16 Core::mtu() const noexcept
 {
     return m_peer_mtu;
+}
+
+u32 Core::own_epoch() const noexcept
+{
+    return m_own_epoch;
+}
+
+u32 Core::peer_epoch() const noexcept
+{
+    return m_peer_epoch;
+}
+
+u16 Core::config_hash() const noexcept
+{
+    return m_config_hash;
 }
 
 Stats Core::snapshot() const noexcept

@@ -67,6 +67,15 @@ class Core
     /** 握手协商后的单帧上限 */
     u16 mtu() const noexcept;
 
+    /** 本端会话标识 */
+    u32 own_epoch() const noexcept;
+
+    /** 对端会话标识 */
+    u32 peer_epoch() const noexcept;
+
+    /** 通道表摘要 */
+    u16 config_hash() const noexcept;
+
     Stats snapshot() const noexcept;
 
   private:
