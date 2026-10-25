@@ -81,7 +81,7 @@ struct Rig
 {
     Rig()
         : core(std::span<const ChannelSpec>{}, DEFAULT_CONFIG, MTU, sink,
-               CoreHooks{&link, &FakeLink::send, &FakeLink::random})
+               CoreHooks{&link, &FakeLink::send, &FakeLink::random}, {})
     {
     }
 
@@ -434,6 +434,91 @@ void restart_with_new_epoch()
     check_eq(last_sent(rig).peer_epoch, PEER_EPOCH + 7);
 }
 
+// ---- 通道发送队列 ----
+
+constexpr ChannelSpec TEST_CHANNELS[] = {
+    {ChannelId{1}, Reliability::ReliableOrdered, 64, 2, 1, 2, 2},
+    {ChannelId{2}, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
+};
+constexpr ChannelId CH_A{1};
+constexpr ChannelId CH_B{2};
+
+/** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
+struct ChannelRig
+{
+    ChannelRig()
+        : storage(Core::storage_bytes(TEST_CHANNELS)),
+          core(TEST_CHANNELS, DEFAULT_CONFIG, MTU, sink, CoreHooks{&link, &FakeLink::send, &FakeLink::random}, storage)
+    {
+    }
+
+    void connect()
+    {
+        core.open(now);
+        const ControlFrame accept = connect_accept(PEER_EPOCH, decoded(link.frames.back()).own_epoch, PEER_MTU);
+        const std::vector<u8> bytes = encode_control(accept);
+        core.receive(now, std::span<const u8>{bytes.data(), bytes.size()});
+    }
+
+    FakeLink link;
+    FakeSink sink;
+    std::vector<u8> storage;
+    Core core;
+    u32 now = START_MS;
+};
+
+void send_not_connected()
+{
+    ChannelRig rig;
+    const u8 payload[4] = {1, 2, 3, 4};
+    check(rig.core.send(CH_A, payload) == SendResult::NotConnected);
+}
+
+void send_invalid_channel()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[1] = {0};
+    check(rig.core.send(ChannelId{9}, payload) == SendResult::InvalidChannel);
+    check(!rig.core.can_send(ChannelId{9}));
+}
+
+void send_too_large()
+{
+    ChannelRig rig;
+    rig.connect();
+    std::vector<u8> too_large(65, 0); // CH_A 上限 64
+    check(rig.core.send(CH_A, too_large) == SendResult::TooLarge);
+
+    std::vector<u8> fits(64, 0);
+    check(rig.core.send(CH_A, fits) == SendResult::Ok);
+}
+
+void send_queue_depth()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[4] = {};
+
+    check(rig.core.can_send(CH_A));
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(!rig.core.can_send(CH_A));
+    check(rig.core.send(CH_A, payload) == SendResult::Busy);
+}
+
+void send_channel_isolation()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[8] = {};
+
+    check(rig.core.send(CH_B, payload) == SendResult::Ok); // CH_B 深度 1，已满
+    check(rig.core.send(CH_B, payload) == SendResult::Busy);
+    check(rig.core.can_send(CH_A)); // 另一条通道照常
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+}
+
 const test::Case TESTS[] = {
     {"initial state", idle_initial},
     {"open sends connect request", open_sends_connect_request},
@@ -456,6 +541,11 @@ const test::Case TESTS[] = {
     {"stale disconnect ignored", stale_disconnect_ignored},
     {"duplicate request repeats accept", duplicate_request_repeats_accept},
     {"restart with new epoch", restart_with_new_epoch},
+    {"send requires connection", send_not_connected},
+    {"send rejects invalid channel", send_invalid_channel},
+    {"send rejects oversized payload", send_too_large},
+    {"send queue depth limits", send_queue_depth},
+    {"send channels are isolated", send_channel_isolation},
 };
 } // namespace
 

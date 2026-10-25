@@ -27,13 +27,13 @@ enum class Reliability : u8
 /** 一条通道的配置：通道表由应用在构造 Daemon 时提供 */
 struct ChannelSpec
 {
-    ChannelId id;            /**< 通道标识，0 保留给协议内部 */
-    Reliability reliability; /**< 该通道的可靠性策略 */
-    u16 max_payload;         /**< 单条消息的载荷上限，不含消息头 */
-    u8 queue_depth;          /**< 发送队列可排队的消息条数 */
-    u8 priority;             /**< 发送优先级，数值小的先发 */
-    u8 reorder_depth;        /**< 接收重排缓冲可暂存的消息条数，0 时取 queue_depth */
-    u8 window;               /**< 未确认帧上限，0 时取 Config::datagram_window */
+    ChannelId id{};                                       /**< 通道标识，0 保留给协议内部 */
+    Reliability reliability = Reliability::ReliableOrdered; /**< 该通道的可靠性策略 */
+    u16 max_payload = 0;                                  /**< 单条消息的载荷上限，不含消息头 */
+    u8 queue_depth = 0;                                   /**< 发送队列可排队的消息条数 */
+    u8 priority = 0;                                      /**< 发送优先级，数值小的先发 */
+    u8 reorder_depth = 0;                                 /**< 接收重排缓冲可暂存的消息条数，0 时取 queue_depth */
+    u8 window = 0;                                        /**< 未确认帧上限，0 时取 Config::datagram_window */
 };
 
 enum class SendResult : u8

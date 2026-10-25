@@ -41,9 +41,9 @@ class Core
         Connected,
     };
 
-    /** 参数顺序：本端协议参数（通道表、配置、MTU）→ 应用接口 → 平台回调 */
-    Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu, Sink &sink,
-         const CoreHooks &hooks) noexcept;
+    /** 参数顺序：本端协议参数（通道表、配置、MTU）→ 应用接口 → 平台回调 → 通道存储 */
+    Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu, Sink &sink, const CoreHooks &hooks,
+         std::span<u8> storage) noexcept;
 
     Core(const Core &) = delete;
     Core &operator=(const Core &) = delete;
@@ -59,6 +59,18 @@ class Core
 
     /** 一次推进：握手重发与超时，返回下次需要唤醒的时刻 */
     u32 step(u32 now) noexcept;
+
+    /**
+     * 通道存储需求（字节）：按通道表的队列深度与载荷上限算出，由调用方分配后交给
+     * 构造函数。协议层因此不关心存储来自内部 RAM 还是 PSRAM。
+     */
+    static usize storage_bytes(std::span<const ChannelSpec> channels) noexcept;
+
+    /** 提交一条消息：NotConnected / InvalidChannel / TooLarge / Busy / Ok */
+    SendResult send(ChannelId channel, std::span<const u8> data) noexcept;
+
+    /** 该通道发送队列是否还有空位（背压用） */
+    bool can_send(ChannelId channel) const noexcept;
 
     State state() const noexcept;
     bool connected() const noexcept;
@@ -79,6 +91,25 @@ class Core
     Stats snapshot() const noexcept;
 
   private:
+    /** 一条通道的发送队列；存储块由构造函数从注入的缓冲里切分 */
+    struct Channel
+    {
+        ChannelSpec spec{};
+        u8 *queue = nullptr; /**< queue_depth × 条目步长 */
+        u16 head = 0;
+        u16 tail = 0;
+        u16 count = 0;
+    };
+
+    /** 条目头：消息长度 */
+    static constexpr usize ENTRY_HEADER = sizeof(u16);
+
+    /** 一条消息在队列里的步长（长度前缀 + 载荷，按 u16 对齐） */
+    static usize entry_stride(const ChannelSpec &spec) noexcept;
+
+    Channel *find_channel(ChannelId channel) noexcept;
+    const Channel *find_channel(ChannelId channel) const noexcept;
+
     /** 编码并发出一个控制帧 */
     bool send_control(u32 now, ControlType type, ControlStatus status, u32 peer_epoch, u16 token) noexcept;
 
@@ -122,6 +153,10 @@ class Core
     u32 m_handshake_deadline_ms = 0; /**< 下一次重发 ConnectRequest 的时刻 */
     u32 m_handshake_gate_ms = 0;     /**< 早于该时刻的 open() 被忽略 */
     u8 m_handshake_retries = 0;      /**< 已重发次数 */
+
+    // ---- 通道 ----
+    Channel m_channels[MAX_CHANNELS];
+    u8 m_channel_count = 0;
 
     // ---- 运行期 ----
     u32 m_last_tx_ms = 0; /**< 最近一次成功发送的时刻，保活用 */

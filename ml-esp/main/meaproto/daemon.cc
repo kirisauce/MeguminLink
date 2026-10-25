@@ -3,6 +3,7 @@
 
 #include <cstring>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_random.h>
 
@@ -17,6 +18,22 @@ constexpr u32 STATS_LOG_INTERVAL_MS = 10000;
 
 /** stop() 等待任务退出的上限 */
 constexpr u32 STOP_TIMEOUT_MS = 1000;
+
+/** 通道存储：内部 RAM，8 位可寻址 */
+u8 *allocate_storage(usize bytes) noexcept
+{
+    if (bytes == 0)
+    {
+        return nullptr;
+    }
+
+    u8 *storage = static_cast<u8 *>(heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (storage == nullptr)
+    {
+        ESP_LOGE(TAG, "failed to allocate %u bytes of channel storage", static_cast<unsigned>(bytes));
+    }
+    return storage;
+}
 
 u32 now_ms() noexcept
 {
@@ -51,8 +68,10 @@ u32 random_epoch(void *) noexcept
 
 template <Transport T>
 Daemon<T>::Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channels, const Config &config) noexcept
-    : m_transport(transport),
-      m_core(channels, config, static_cast<u16>(T::MTU), sink, CoreHooks{this, &Daemon<T>::send_hook, &random_epoch}),
+    : m_transport(transport), m_storage_bytes(Core::storage_bytes(channels)),
+      m_storage(allocate_storage(m_storage_bytes)),
+      m_core(channels, config, static_cast<u16>(T::MTU), sink, CoreHooks{this, &Daemon<T>::send_hook, &random_epoch},
+             std::span<u8>{m_storage, m_storage_bytes}),
       m_rx_depth(config.rx_queue_depth == 0 ? 1 : config.rx_queue_depth),
       m_rx_item(static_cast<u16>(sizeof(u16) + T::MTU))
 {
@@ -68,6 +87,9 @@ Daemon<T>::Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channel
 template <Transport T> Daemon<T>::~Daemon()
 {
     stop();
+
+    heap_caps_free(m_storage);
+    m_storage = nullptr;
 
     if (m_rx_queue != nullptr)
     {

@@ -2,6 +2,8 @@
 
 #include "meaproto/hash.hpp"
 
+#include <cstring>
+
 namespace meaproto
 {
 namespace
@@ -16,11 +18,112 @@ bool time_before(u32 now, u32 deadline) noexcept
 }
 } // namespace
 
-Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu, Sink &sink,
-           const CoreHooks &hooks) noexcept
+Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu, Sink &sink, const CoreHooks &hooks,
+           std::span<u8> storage) noexcept
     : m_sink(sink), m_hooks(hooks), m_config(config), m_mtu(mtu), m_config_hash(meaproto::config_hash(channels)),
       m_peer_mtu(mtu)
 {
+    // 把注入的存储切成一通道一条环形队列；装不下或超出条目上限的通道不登记
+    u8 *cursor = storage.data();
+    usize remaining = storage.size();
+    for (const ChannelSpec &spec : channels)
+    {
+        if (m_channel_count >= MAX_CHANNELS || spec.queue_depth == 0)
+        {
+            break;
+        }
+
+        const usize bytes = entry_stride(spec) * spec.queue_depth;
+        if (remaining < bytes)
+        {
+            break;
+        }
+
+        Channel &channel = m_channels[m_channel_count++];
+        channel.spec = spec;
+        channel.queue = cursor;
+        cursor += bytes;
+        remaining -= bytes;
+    }
+}
+
+usize Core::entry_stride(const ChannelSpec &spec) noexcept
+{
+    const usize raw = ENTRY_HEADER + spec.max_payload;
+    return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
+}
+
+usize Core::storage_bytes(std::span<const ChannelSpec> channels) noexcept
+{
+    usize total = 0;
+    for (const ChannelSpec &spec : channels)
+    {
+        total += entry_stride(spec) * spec.queue_depth;
+    }
+    return total;
+}
+
+Core::Channel *Core::find_channel(ChannelId channel) noexcept
+{
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        if (m_channels[i].spec.id == channel)
+        {
+            return &m_channels[i];
+        }
+    }
+    return nullptr;
+}
+
+const Core::Channel *Core::find_channel(ChannelId channel) const noexcept
+{
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        if (m_channels[i].spec.id == channel)
+        {
+            return &m_channels[i];
+        }
+    }
+    return nullptr;
+}
+
+SendResult Core::send(ChannelId channel, std::span<const u8> data) noexcept
+{
+    if (m_state != State::Connected)
+    {
+        return SendResult::NotConnected;
+    }
+
+    Channel *slot = find_channel(channel);
+    if (slot == nullptr)
+    {
+        return SendResult::InvalidChannel;
+    }
+
+    if (data.size() > slot->spec.max_payload)
+    {
+        return SendResult::TooLarge;
+    }
+
+    if (slot->count >= slot->spec.queue_depth)
+    {
+        return SendResult::Busy;
+    }
+
+    u8 *entry = slot->queue + static_cast<usize>(slot->tail) * entry_stride(slot->spec);
+    const u16 len = static_cast<u16>(data.size());
+    std::memcpy(entry, &len, sizeof(len));
+    std::memcpy(entry + ENTRY_HEADER, data.data(), len);
+
+    slot->tail = static_cast<u16>((slot->tail + 1) % slot->spec.queue_depth);
+    ++slot->count;
+    return SendResult::Ok;
+}
+
+bool Core::can_send(ChannelId channel) const noexcept
+{
+    const Channel *slot = find_channel(channel);
+    return slot != nullptr && slot->count < slot->spec.queue_depth;
 }
 
 void Core::open(u32 now) noexcept

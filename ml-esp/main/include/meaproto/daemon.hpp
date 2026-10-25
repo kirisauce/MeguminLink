@@ -83,6 +83,11 @@ template <Transport T> class Daemon final
 
     // ---- 绑定的对象 ----
     T &m_transport;
+
+    /** 通道存储：按通道表算出需求后一次性分配，构造时交给协议层 */
+    usize m_storage_bytes = 0;
+    u8 *m_storage = nullptr;
+
     Core m_core;
 
     // ---- 接收通路 ----
