@@ -23,7 +23,7 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
     : m_sink(sink), m_hooks(hooks), m_config(config), m_mtu(mtu), m_config_hash(meaproto::config_hash(channels)),
       m_peer_mtu(mtu)
 {
-    // 把注入的存储切成一通道一条环形队列；装不下或超出条目上限的通道不登记
+    // 把注入的存储切成每通道一条环形队列加一段窗口帧槽；装不下的通道不登记
     u8 *cursor = storage.data();
     usize remaining = storage.size();
     for (const ChannelSpec &spec : channels)
@@ -33,8 +33,10 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
             break;
         }
 
-        const usize bytes = entry_stride(spec) * spec.queue_depth;
-        if (remaining < bytes)
+        const u16 window = (spec.window != 0) ? spec.window : m_config.datagram_window;
+        const usize queue_bytes = entry_stride(spec) * spec.queue_depth;
+        const usize window_bytes = frame_stride(mtu) * window;
+        if (window > MAX_WINDOW || remaining < queue_bytes + window_bytes)
         {
             break;
         }
@@ -42,9 +44,16 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
         Channel &channel = m_channels[m_channel_count++];
         channel.spec = spec;
         channel.queue = cursor;
-        cursor += bytes;
-        remaining -= bytes;
+        cursor += queue_bytes;
+        remaining -= queue_bytes;
+        channel.window = cursor;
+        channel.window_count = window;
+        cursor += window_bytes;
+        remaining -= window_bytes;
     }
+
+    m_frame = cursor;
+    m_frame_cap = static_cast<u16>(remaining < mtu ? remaining : mtu);
 }
 
 usize Core::entry_stride(const ChannelSpec &spec) noexcept
@@ -53,12 +62,20 @@ usize Core::entry_stride(const ChannelSpec &spec) noexcept
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
-usize Core::storage_bytes(std::span<const ChannelSpec> channels) noexcept
+usize Core::frame_stride(u16 mtu) noexcept
 {
-    usize total = 0;
+    const usize raw = ENTRY_HEADER + mtu;
+    return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
+}
+
+usize Core::storage_bytes(std::span<const ChannelSpec> channels, const Config &config, u16 mtu) noexcept
+{
+    usize total = frame_stride(mtu); // 组帧暂存
     for (const ChannelSpec &spec : channels)
     {
+        const u16 window = (spec.window != 0) ? spec.window : config.datagram_window;
         total += entry_stride(spec) * spec.queue_depth;
+        total += frame_stride(mtu) * (window > MAX_WINDOW ? MAX_WINDOW : window);
     }
     return total;
 }
@@ -126,6 +143,222 @@ bool Core::can_send(ChannelId channel) const noexcept
     return slot != nullptr && slot->count < slot->spec.queue_depth;
 }
 
+u32 Core::rto_backoff(u8 retx) const noexcept
+{
+    u32 ms = m_config.rto_initial_ms;
+    for (u8 i = 0; i < retx && ms < m_config.rto_max_ms; ++i)
+    {
+        ms *= 2;
+    }
+    return ms < m_config.rto_max_ms ? ms : m_config.rto_max_ms;
+}
+
+bool Core::transmit(Channel &channel, u32 now) noexcept
+{
+    if (channel.count == 0 || m_frame == nullptr)
+    {
+        return false;
+    }
+
+    const bool reliable = (channel.spec.reliability == Reliability::ReliableOrdered);
+    if (reliable && channel.used_slots >= channel.window_count)
+    {
+        return false;
+    }
+
+    const u8 *entry = channel.queue + static_cast<usize>(channel.head) * entry_stride(channel.spec);
+    u16 payload_len = 0;
+    std::memcpy(&payload_len, entry, sizeof(payload_len));
+
+    DatagramHeader header;
+    header.flags = FLAG_HAS_DATA;
+    header.channel = channel.spec.id.value;
+    header.message_count = 1;
+    if (reliable)
+    {
+        header.flags |= FLAG_NEEDS_ACK;
+        header.datagram_seq = channel.tx_seq;
+    }
+
+    usize written = 0;
+    if (encode(header, std::span<u8>{m_frame, m_frame_cap}, written) != WireError::Ok)
+    {
+        return false;
+    }
+
+    MessageHeader message;
+    message.payload_len = payload_len;
+    message.reliability = channel.spec.reliability;
+    if (reliable)
+    {
+        message.ordering = channel.tx_ordering;
+    }
+
+    usize offset = written;
+    if (encode(message, std::span<u8>{m_frame + offset, m_frame_cap - offset}, written) != WireError::Ok)
+    {
+        return false;
+    }
+    offset += written;
+
+    if (offset + payload_len > m_frame_cap)
+    {
+        return false;
+    }
+    std::memcpy(m_frame + offset, entry + ENTRY_HEADER, payload_len);
+    const usize frame_len = offset + payload_len;
+
+    if (!m_hooks.send(m_hooks.ctx, std::span<const u8>{m_frame, frame_len}))
+    {
+        return false;
+    }
+
+    if (reliable)
+    {
+        const usize stride = frame_stride(m_mtu);
+        WindowSlot *slot = nullptr;
+        u16 index = 0;
+        for (u16 i = 0; i < channel.window_count; ++i)
+        {
+            if (!channel.slots[i].used)
+            {
+                slot = &channel.slots[i];
+                index = i;
+                break;
+            }
+        }
+        if (slot == nullptr)
+        {
+            return false;
+        }
+
+        u8 *bytes = channel.window + static_cast<usize>(index) * stride;
+        const u16 stored = static_cast<u16>(frame_len);
+        std::memcpy(bytes, &stored, sizeof(stored));
+        std::memcpy(bytes + ENTRY_HEADER, m_frame, frame_len);
+
+        slot->used = true;
+        slot->seq = header.datagram_seq;
+        slot->len = stored;
+        slot->retx = 0;
+        slot->deadline_ms = now + rto_backoff(0);
+        ++channel.used_slots;
+        channel.tx_seq = static_cast<u16>(channel.tx_seq + 1);
+        channel.tx_ordering = static_cast<u16>(channel.tx_ordering + 1);
+    }
+
+    channel.head = static_cast<u16>((channel.head + 1) % channel.spec.queue_depth);
+    --channel.count;
+    ++m_stats.datagrams_sent;
+    return true;
+}
+
+bool Core::retransmit(u32 now) noexcept
+{
+    bool any = false;
+    const usize stride = frame_stride(m_mtu);
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        Channel &channel = m_channels[i];
+        for (u16 s = 0; s < channel.window_count; ++s)
+        {
+            WindowSlot &slot = channel.slots[s];
+            if (!slot.used || time_before(now, slot.deadline_ms))
+            {
+                continue;
+            }
+
+            const u8 *bytes = channel.window + static_cast<usize>(s) * stride;
+            if (!m_hooks.send(m_hooks.ctx, std::span<const u8>{bytes + ENTRY_HEADER, slot.len}))
+            {
+                return any;
+            }
+
+            slot.retx = (slot.retx < 0xFF) ? static_cast<u8>(slot.retx + 1) : 0xFF;
+            slot.deadline_ms = now + rto_backoff(slot.retx);
+            ++m_stats.datagrams_retransmitted;
+            any = true;
+        }
+    }
+    return any;
+}
+
+void Core::advance_datagrams(u32 now) noexcept
+{
+    (void)retransmit(now);
+
+    for (u8 sent = 0; sent < m_config.send_quota_per_tick; ++sent)
+    {
+        Channel *best = nullptr;
+        for (u8 i = 0; i < m_channel_count; ++i)
+        {
+            Channel &channel = m_channels[i];
+            if (channel.count == 0)
+            {
+                continue;
+            }
+            if (channel.spec.reliability == Reliability::ReliableOrdered && channel.used_slots >= channel.window_count)
+            {
+                continue;
+            }
+            if (best == nullptr || channel.spec.priority < best->spec.priority)
+            {
+                best = &channel;
+            }
+        }
+
+        if (best == nullptr || !transmit(*best, now))
+        {
+            break;
+        }
+    }
+}
+
+void Core::handle_datagram(std::span<const u8> frame) noexcept
+{
+    DatagramHeader header;
+    if (decode(frame, header) != WireError::Ok || header.channel == 0)
+    {
+        return;
+    }
+
+    Channel *channel = find_channel(ChannelId{header.channel});
+    if (channel == nullptr)
+    {
+        return;
+    }
+
+    handle_ack(*channel, header.ack_seq, header.ack_bits);
+}
+
+void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept
+{
+    for (u16 s = 0; s < channel.window_count; ++s)
+    {
+        WindowSlot &slot = channel.slots[s];
+        if (!slot.used)
+        {
+            continue;
+        }
+
+        const u16 back = static_cast<u16>(ack_seq - slot.seq);
+        bool acked = (back != 0 && back < 0x8000);
+        if (!acked)
+        {
+            const u16 ahead = static_cast<u16>(slot.seq - ack_seq);
+            acked = (ahead >= 1 && ahead <= 32 && (ack_bits & (1u << (ahead - 1))) != 0);
+        }
+        if (!acked)
+        {
+            continue;
+        }
+
+        slot.used = false;
+        --channel.used_slots;
+        ++m_stats.datagrams_acked;
+    }
+}
+
 void Core::open(u32 now) noexcept
 {
     if (m_state != State::Idle || time_before(now, m_handshake_gate_ms))
@@ -163,6 +396,10 @@ void Core::receive(u32 now, std::span<const u8> frame) noexcept
 
     if ((frame[0] & FLAG_MASK & FLAG_CONTROL) == 0)
     {
+        if (m_state == State::Connected)
+        {
+            handle_datagram(frame);
+        }
         return;
     }
 
@@ -183,6 +420,11 @@ void Core::receive(u32 now, std::span<const u8> frame) noexcept
 
 u32 Core::step(u32 now) noexcept
 {
+    if (m_state == State::Connected)
+    {
+        advance_datagrams(now);
+    }
+
     if (m_state == State::Connecting && !time_before(now, m_handshake_deadline_ms))
     {
         if (m_handshake_retries >= m_config.connect_max_retries)
@@ -238,9 +480,16 @@ u16 Core::config_hash() const noexcept
 
 Stats Core::snapshot() const noexcept
 {
+    u32 in_flight = 0;
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        in_flight += m_channels[i].used_slots;
+    }
+
     Stats stats = m_stats;
     stats.connected = connected();
     stats.peer_epoch = static_cast<u16>(m_peer_epoch);
+    stats.datagrams_in_flight = in_flight;
     return stats;
 }
 

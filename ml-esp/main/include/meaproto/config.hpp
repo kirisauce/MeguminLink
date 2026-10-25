@@ -9,6 +9,9 @@ namespace meaproto
 /** 通道表条目上限（编译期固定） */
 inline constexpr usize MAX_CHANNELS = 4;
 
+/** 每通道发送窗口槽上限（编译期固定） */
+inline constexpr usize MAX_WINDOW = 16;
+
 /** 协议运行参数；尺寸类字段在构造 Daemon 时生效 */
 struct Config
 {

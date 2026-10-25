@@ -64,7 +64,7 @@ class Core
      * 通道存储需求（字节）：按通道表的队列深度与载荷上限算出，由调用方分配后交给
      * 构造函数。协议层因此不关心存储来自内部 RAM 还是 PSRAM。
      */
-    static usize storage_bytes(std::span<const ChannelSpec> channels) noexcept;
+    static usize storage_bytes(std::span<const ChannelSpec> channels, const Config &config, u16 mtu) noexcept;
 
     /** 提交一条消息：NotConnected / InvalidChannel / TooLarge / Busy / Ok */
     SendResult send(ChannelId channel, std::span<const u8> data) noexcept;
@@ -91,7 +91,17 @@ class Core
     Stats snapshot() const noexcept;
 
   private:
-    /** 一条通道的发送队列；存储块由构造函数从注入的缓冲里切分 */
+    /** 发送窗口槽：保存整帧字节，超时原样重发 */
+    struct WindowSlot
+    {
+        bool used = false;
+        u16 seq = 0;
+        u16 len = 0;
+        u8 retx = 0;
+        u32 deadline_ms = 0;
+    };
+
+    /** 一条通道：队列、窗口与序号；存储块由构造函数从注入的缓冲里切分 */
     struct Channel
     {
         ChannelSpec spec{};
@@ -99,16 +109,43 @@ class Core
         u16 head = 0;
         u16 tail = 0;
         u16 count = 0;
+        u8 *window = nullptr; /**< window_count × 帧槽步长 */
+        u16 window_count = 0;
+        u16 used_slots = 0;
+        u16 tx_seq = 0;
+        u16 tx_ordering = 0;
+        WindowSlot slots[MAX_WINDOW];
     };
 
     /** 条目头：消息长度 */
     static constexpr usize ENTRY_HEADER = sizeof(u16);
 
-    /** 一条消息在队列里的步长（长度前缀 + 载荷，按 u16 对齐） */
+    /** 一条消息的步长（长度前缀 + 载荷，按 u16 对齐） */
     static usize entry_stride(const ChannelSpec &spec) noexcept;
+
+    /** 一个窗口帧槽的步长（长度前缀 + 整帧字节，按 u16 对齐） */
+    static usize frame_stride(u16 mtu) noexcept;
 
     Channel *find_channel(ChannelId channel) noexcept;
     const Channel *find_channel(ChannelId channel) const noexcept;
+
+    /** 队列非空且窗口有空位时组帧发出，成功则出队、占窗 */
+    bool transmit(Channel &channel, u32 now) noexcept;
+
+    /** 重发到期的窗口槽，返回是否有动作 */
+    bool retransmit(u32 now) noexcept;
+
+    /** 每拍的数据报调度：先重传，再按优先级与配额发新帧 */
+    void advance_datagrams(u32 now) noexcept;
+
+    /** 收到的数据报：按帧头 ACK 字段释放对应通道的窗口 */
+    void handle_datagram(std::span<const u8> frame) noexcept;
+
+    /** 按 ack_seq / ack_bits 释放本通道窗口槽 */
+    void handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept;
+
+    /** 重传退避：rto_initial << retx，封顶 rto_max */
+    u32 rto_backoff(u8 retx) const noexcept;
 
     /** 编码并发出一个控制帧 */
     bool send_control(u32 now, ControlType type, ControlStatus status, u32 peer_epoch, u16 token) noexcept;
@@ -157,6 +194,9 @@ class Core
     // ---- 通道 ----
     Channel m_channels[MAX_CHANNELS];
     u8 m_channel_count = 0;
+    /** 组帧暂存，容量为本端 MTU */
+    u8 *m_frame = nullptr;
+    u16 m_frame_cap = 0;
 
     // ---- 运行期 ----
     u32 m_last_tx_ms = 0; /**< 最近一次成功发送的时刻，保活用 */

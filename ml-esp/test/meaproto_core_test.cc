@@ -436,19 +436,25 @@ void restart_with_new_epoch()
 
 // ---- 通道发送队列 ----
 
-constexpr ChannelSpec TEST_CHANNELS[] = {
-    {ChannelId{1}, Reliability::ReliableOrdered, 64, 2, 1, 2, 2},
-    {ChannelId{2}, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
-};
 constexpr ChannelId CH_A{1};
 constexpr ChannelId CH_B{2};
+constexpr ChannelId CH_C{3};
+constexpr ChannelId CH_W{4};
+
+/** 通道表：A 优先级 2、B 优先级 1（队列 1）、C 不可靠、W 窗口 1（队列 2） */
+constexpr ChannelSpec TEST_CHANNELS[] = {
+    {CH_A, Reliability::ReliableOrdered, 64, 2, 2, 2, 2},
+    {CH_B, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
+    {CH_C, Reliability::Unreliable, 32, 2, 3, 2, 0},
+    {CH_W, Reliability::ReliableOrdered, 32, 2, 4, 2, 1},
+};
 
 /** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
 struct ChannelRig
 {
-    ChannelRig()
-        : storage(Core::storage_bytes(TEST_CHANNELS)),
-          core(TEST_CHANNELS, DEFAULT_CONFIG, MTU, sink, CoreHooks{&link, &FakeLink::send, &FakeLink::random}, storage)
+    explicit ChannelRig(const Config &config = DEFAULT_CONFIG)
+        : storage(Core::storage_bytes(TEST_CHANNELS, config, MTU)),
+          core(TEST_CHANNELS, config, MTU, sink, CoreHooks{&link, &FakeLink::send, &FakeLink::random}, storage)
     {
     }
 
@@ -466,6 +472,158 @@ struct ChannelRig
     Core core;
     u32 now = START_MS;
 };
+
+DatagramHeader datagram_header(const std::vector<u8> &bytes)
+{
+    DatagramHeader header;
+    check_eq(decode(std::span<const u8>{bytes.data(), bytes.size()}, header), WireError::Ok);
+    return header;
+}
+
+/** 造一个只带 ACK 字段的数据报，喂给 Core 释放发送窗口 */
+void deliver_ack(Core &core, u32 now, u8 channel, u16 ack_seq, u32 ack_bits)
+{
+    DatagramHeader header;
+    header.flags = FLAG_ACK_ONLY;
+    header.channel = channel;
+    header.ack_seq = ack_seq;
+    header.ack_bits = ack_bits;
+    header.message_count = 0;
+
+    u8 buffer[32] = {};
+    usize written = 0;
+    check_eq(encode(header, std::span<u8>{buffer, sizeof(buffer)}, written), WireError::Ok);
+    core.receive(now, std::span<const u8>{buffer, written});
+}
+
+void datagram_sent_for_queued_message()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[4] = {1, 2, 3, 4};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+
+    const std::size_t before = rig.link.frames.size();
+    rig.core.step(rig.now);
+
+    check_eq(rig.link.frames.size(), before + 2);
+    const DatagramHeader first = datagram_header(rig.link.frames[before]);
+    check_eq(first.channel, CH_A.value);
+    check((first.flags & FLAG_NEEDS_ACK) != 0);
+    check_eq(first.datagram_seq, 0);
+    check_eq(rig.core.snapshot().datagrams_in_flight, 2);
+}
+
+void window_blocks_until_ack()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[4] = {};
+
+    check(rig.core.send(CH_W, payload) == SendResult::Ok);
+    check(rig.core.send(CH_W, payload) == SendResult::Ok);
+
+    const std::size_t before = rig.link.frames.size();
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), before + 1); // 窗口只有 1
+    check_eq(rig.core.snapshot().datagrams_in_flight, 1);
+
+    deliver_ack(rig.core, rig.now, CH_W.value, 1, 0);
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), before + 2);
+    check_eq(rig.core.snapshot().datagrams_in_flight, 1);
+}
+
+void retransmit_after_timeout()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[3] = {9, 8, 7};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    rig.core.step(rig.now);
+
+    const std::vector<u8> sent = rig.link.frames.back();
+    const std::size_t after_first = rig.link.frames.size();
+
+    rig.now += DEFAULT_CONFIG.rto_initial_ms;
+    rig.core.step(rig.now);
+
+    check_eq(rig.link.frames.size(), after_first + 1);
+    check(rig.link.frames.back() == sent);
+    check_eq(rig.core.snapshot().datagrams_retransmitted, 1);
+}
+
+void ack_bits_release_slots()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[2] = {};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    rig.core.step(rig.now);
+    check_eq(rig.core.snapshot().datagrams_in_flight, 2);
+
+    deliver_ack(rig.core, rig.now, CH_A.value, 0, 0x1); // 只确认 seq 1
+    check_eq(rig.core.snapshot().datagrams_in_flight, 1);
+
+    deliver_ack(rig.core, rig.now, CH_A.value, 2, 0); // seq 0 也被覆盖
+    check_eq(rig.core.snapshot().datagrams_in_flight, 0);
+}
+
+void quota_limits_frames_per_tick()
+{
+    ChannelRig rig(Config{.send_quota_per_tick = 1});
+    rig.connect();
+    const u8 payload[2] = {};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+
+    const std::size_t before = rig.link.frames.size();
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), before + 1);
+
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), before + 2);
+}
+
+void priority_orders_channels()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[2] = {};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok); // 优先级 2
+    check(rig.core.send(CH_B, payload) == SendResult::Ok); // 优先级 1
+
+    const std::size_t before = rig.link.frames.size();
+    rig.core.step(rig.now);
+
+    check(rig.link.frames.size() >= before + 1);
+    check_eq(datagram_header(rig.link.frames[before]).channel, CH_B.value);
+}
+
+void unreliable_channel_skips_window()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[2] = {};
+
+    check(rig.core.send(CH_C, payload) == SendResult::Ok);
+    check(rig.core.send(CH_C, payload) == SendResult::Ok);
+
+    const std::size_t before = rig.link.frames.size();
+    rig.core.step(rig.now);
+
+    check_eq(rig.link.frames.size(), before + 2);
+    const DatagramHeader header = datagram_header(rig.link.frames[before]);
+    check_eq(static_cast<u8>(header.flags & FLAG_NEEDS_ACK), 0);
+    check_eq(rig.core.snapshot().datagrams_in_flight, 0);
+}
 
 void send_not_connected()
 {
@@ -546,6 +704,13 @@ const test::Case TESTS[] = {
     {"send rejects oversized payload", send_too_large},
     {"send queue depth limits", send_queue_depth},
     {"send channels are isolated", send_channel_isolation},
+    {"queued message becomes a datagram", datagram_sent_for_queued_message},
+    {"window blocks until ack", window_blocks_until_ack},
+    {"retransmit after timeout", retransmit_after_timeout},
+    {"ack bits release window slots", ack_bits_release_slots},
+    {"send quota limits frames per tick", quota_limits_frames_per_tick},
+    {"priority orders channels", priority_orders_channels},
+    {"unreliable channel skips window", unreliable_channel_skips_window},
 };
 } // namespace
 
