@@ -75,11 +75,12 @@ Daemon<T>::Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channel
       m_rx_depth(config.rx_queue_depth == 0 ? 1 : config.rx_queue_depth),
       m_rx_item(static_cast<u16>(sizeof(u16) + T::MTU))
 {
+    m_core_mutex = xSemaphoreCreateMutex();
     m_rx_queue = xQueueCreate(m_rx_depth, m_rx_item);
     m_stopped = xSemaphoreCreateBinary();
-    if (m_rx_queue == nullptr || m_stopped == nullptr)
+    if (m_core_mutex == nullptr || m_rx_queue == nullptr || m_stopped == nullptr)
     {
-        ESP_LOGE(TAG, "failed to create rx queue or stop semaphore");
+        ESP_LOGE(TAG, "failed to create core mutex, rx queue or stop semaphore");
     }
     m_transport.set_receive_handler(&Daemon<T>::receive_hook, this);
 }
@@ -100,6 +101,11 @@ template <Transport T> Daemon<T>::~Daemon()
     {
         vSemaphoreDelete(m_stopped);
         m_stopped = nullptr;
+    }
+    if (m_core_mutex != nullptr)
+    {
+        vSemaphoreDelete(m_core_mutex);
+        m_core_mutex = nullptr;
     }
 }
 
@@ -163,6 +169,73 @@ template <Transport T> Stats Daemon<T>::snapshot() const
     const Stats value = m_snapshot;
     taskEXIT_CRITICAL(&m_snapshot_lock);
     return value;
+}
+
+template <Transport T> SendResult Daemon<T>::send(ChannelId channel, std::span<const u8> data)
+{
+    if (m_task.load(std::memory_order_relaxed) == nullptr)
+    {
+        return SendResult::InvalidState;
+    }
+
+    lock_core();
+    const SendResult result = m_core.send(channel, data);
+    unlock_core();
+
+    if (result == SendResult::Ok)
+    {
+        wake(); // 入队后立刻唤醒任务，否则要等下一次保活或重传节拍
+    }
+    return result;
+}
+
+template <Transport T> bool Daemon<T>::can_send(ChannelId channel) const
+{
+    if (m_task.load(std::memory_order_relaxed) == nullptr)
+    {
+        return false;
+    }
+
+    lock_core();
+    const bool space = m_core.can_send(channel);
+    unlock_core();
+    return space;
+}
+
+template <Transport T> bool Daemon<T>::set_reliability(ChannelId channel, Reliability reliability)
+{
+    if (m_task.load(std::memory_order_relaxed) == nullptr)
+    {
+        return false;
+    }
+
+    lock_core();
+    const bool changed = m_core.set_reliability(channel, reliability);
+    unlock_core();
+
+    if (changed)
+    {
+        wake();
+    }
+    return changed;
+}
+
+template <Transport T> bool Daemon<T>::ping()
+{
+    if (m_task.load(std::memory_order_relaxed) == nullptr)
+    {
+        return false;
+    }
+
+    lock_core();
+    const bool sent = m_core.ping(now_ms());
+    unlock_core();
+
+    if (sent)
+    {
+        wake();
+    }
+    return sent;
 }
 
 template <Transport T> void Daemon<T>::task_entry(void *ctx)
@@ -235,14 +308,19 @@ template <Transport T> void Daemon<T>::publish()
 
 template <Transport T> void Daemon<T>::run()
 {
+    lock_core();
     publish();
+    unlock_core();
+
     for (;;)
     {
         const u32 now = now_ms();
+        lock_core();
         apply_requests(now);
         drain_rx(now);
         const u32 next = m_core.step(now);
         publish();
+        unlock_core();
         log_stats(now);
 
         if (m_stopping.load(std::memory_order_relaxed))
@@ -307,6 +385,23 @@ template <Transport T> void Daemon<T>::log_stats(u32 now)
              static_cast<unsigned>(stats.datagrams_in_flight), static_cast<unsigned>(stats.duplicate_datagrams),
              static_cast<unsigned>(stats.out_of_window), static_cast<unsigned>(stats.rx_queue_dropped),
              static_cast<unsigned>(stats.rtt_ms), static_cast<unsigned>(stats.rto_ms));
+}
+
+template <Transport T> void Daemon<T>::lock_core() const
+{
+    // 互斥量创建失败时退化为无锁：构造时已报过错，这里不重复
+    if (m_core_mutex != nullptr)
+    {
+        (void)xSemaphoreTake(m_core_mutex, portMAX_DELAY);
+    }
+}
+
+template <Transport T> void Daemon<T>::unlock_core() const
+{
+    if (m_core_mutex != nullptr)
+    {
+        (void)xSemaphoreGive(m_core_mutex);
+    }
 }
 
 template <Transport T> void Daemon<T>::wake()

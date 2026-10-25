@@ -49,6 +49,23 @@ template <Transport T> class Daemon final
     /** 请求断开 */
     void close();
 
+    /**
+     * 提交一条消息。任务未启动时返回 InvalidState，其余结果由协议层判定。
+     *
+     * 与任务循环共用协议锁，因此不能与 step()/receive() 并发；Sink 回调运行在
+     * 持锁的上下文里，那里不得调用本接口。
+     */
+    SendResult send(ChannelId channel, std::span<const u8> data);
+
+    /** 该通道发送队列是否还有空位（背压用） */
+    bool can_send(ChannelId channel) const;
+
+    /** 切换通道可靠性策略；切换会清空该通道的收发状态，两端必须同时切换 */
+    bool set_reliability(ChannelId channel, Reliability reliability);
+
+    /** 发一个 Ping 采样 RTT；未连接时返回 false */
+    bool ping();
+
     bool connected() const;
     bool connecting() const;
     Stats snapshot() const;
@@ -75,6 +92,10 @@ template <Transport T> class Daemon final
     /** 刷新统计快照并打状态迁移日志（任务上下文） */
     void publish();
 
+    /** 协议锁：任务循环与外部接口共用（互斥量创建失败时退化为无锁） */
+    void lock_core() const;
+    void unlock_core() const;
+
     void run();
     void apply_requests(u32 now);
     void drain_rx(u32 now);
@@ -99,6 +120,7 @@ template <Transport T> class Daemon final
     std::atomic<u32> m_rx_dropped{0};   /**< 超长帧与入队失败的丢弃数 */
 
     // ---- 任务与外部请求 ----
+    SemaphoreHandle_t m_core_mutex = nullptr;            /**< 协议状态互斥：任务循环与外部接口共用 */
     SemaphoreHandle_t m_stopped = nullptr;               /**< 任务退出信号量 */
     std::atomic<TaskHandle_t> m_task{nullptr};           /**< 停止后为空，外部只读它来唤醒 */
     std::atomic<bool> m_stopping{false};                 /**< 已请求任务退出 */

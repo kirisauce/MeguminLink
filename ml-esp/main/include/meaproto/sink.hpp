@@ -8,7 +8,12 @@
 
 namespace meaproto
 {
-/** 应用侧接收接口：回调运行在 meaproto 任务上下文，只允许入队或拷贝 */
+/**
+ * 应用侧接收接口：回调运行在 meaproto 任务上下文，只允许入队或拷贝。
+ *
+ * 回调期间协议锁由任务持有，因此回调里不得调用 Daemon::send/can_send/ping/
+ * set_reliability——那会在同一上下文里自锁。
+ */
 class Sink
 {
   public:
