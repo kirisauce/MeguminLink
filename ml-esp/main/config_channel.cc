@@ -7,7 +7,6 @@
 
 #include <esp_app_desc.h>
 #include <esp_log.h>
-#include <esp_mac.h>
 #include <esp_timer.h>
 #include <sdkconfig.h>
 
@@ -99,106 +98,6 @@ ConfigChannel::Stats ConfigChannel::stats_snapshot() const
     portENTER_CRITICAL(&m_stats_lock);
     const Stats snapshot = m_stats;
     portEXIT_CRITICAL(&m_stats_lock);
-    return snapshot;
-}
-
-void ConfigChannel::start_ping()
-{
-    u32 token = 0;
-    portENTER_CRITICAL(&m_ping_lock);
-    if (m_ping_pending)
-    {
-        portEXIT_CRITICAL(&m_ping_lock);
-        return; // 上一轮还没结算：不再叠加请求（迟到回显由 token 校验挡掉）
-    }
-    m_ping_pending = true;
-    token = ++m_ping_token;
-    m_ping_sent_us = esp_timer_get_time();
-    m_ping_deadline_us = m_ping_sent_us + static_cast<i64>(CONFIG_MEGUMINLINK_PING_TIMEOUT_MS) * 1000;
-    portEXIT_CRITICAL(&m_ping_lock);
-
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr)
-    {
-        // 无配对记录：没有可探测的对端，直接判离线，不必等满超时窗口
-        finish_ping(false, 0);
-        return;
-    }
-
-    const esp_err_t ret = Application::get_instance().wireless_link().send_ping(peer_mac, token);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Failed to send ping to " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
-        finish_ping(false, 0);
-    }
-}
-
-void ConfigChannel::finish_ping(bool online, u32 rtt_us)
-{
-    portENTER_CRITICAL(&m_ping_lock);
-    m_ping_pending = false;
-    m_ping_online = online ? 1 : 2;
-    if (online)
-    {
-        m_ping_rtt_us = rtt_us;
-        m_ping_ok = m_ping_ok + 1;
-    }
-    else
-    {
-        m_ping_fail = m_ping_fail + 1;
-    }
-    portEXIT_CRITICAL(&m_ping_lock);
-}
-
-void ConfigChannel::on_pong(const u8 *src_mac, u32 token)
-{
-    // 只认已配对对端的回显：广播地址常驻 peer 表，其他设备的帧同样能到达
-    // 本机，来源与 token 双重校验后才算本轮结果
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr || std::memcmp(peer_mac, src_mac, ESP_NOW_ETH_ALEN) != 0)
-    {
-        return;
-    }
-
-    bool matched = false;
-    u32 rtt_us = 0;
-    portENTER_CRITICAL(&m_ping_lock);
-    if (m_ping_pending && token == m_ping_token)
-    {
-        rtt_us = static_cast<u32>(esp_timer_get_time() - m_ping_sent_us);
-        matched = true;
-    }
-    portEXIT_CRITICAL(&m_ping_lock);
-
-    if (matched)
-    {
-        finish_ping(true, rtt_us);
-    }
-}
-
-void ConfigChannel::poll_ping_timeout()
-{
-    // 唯一职责是结算超时：回显没在窗口内到达即判离线（同一轮只结算一次）。
-    // 探测的发起时机由上位机掌握，设备不自主发帧，没有上位机时链路静默。
-    bool expired = false;
-    portENTER_CRITICAL(&m_ping_lock);
-    expired = m_ping_pending && esp_timer_get_time() >= m_ping_deadline_us;
-    portEXIT_CRITICAL(&m_ping_lock);
-    if (expired)
-    {
-        finish_ping(false, 0);
-    }
-}
-
-ConfigChannel::PingSnapshot ConfigChannel::ping_snapshot() const
-{
-    PingSnapshot snapshot = {};
-    portENTER_CRITICAL(&m_ping_lock);
-    snapshot.online = m_ping_online;
-    snapshot.rtt_us = m_ping_rtt_us;
-    snapshot.ok = m_ping_ok;
-    snapshot.fail = m_ping_fail;
-    portEXIT_CRITICAL(&m_ping_lock);
     return snapshot;
 }
 
@@ -474,10 +373,8 @@ enum : u8
     TAG_DAP_RESPONSE = 0x12,     // u32：DAP 响应字节数
     TAG_WIRELESS_TX = 0x20,      // u32：ESP-NOW 发送帧字节数
     TAG_WIRELESS_RX = 0x21,      // u32：ESP-NOW 接收帧字节数
-    TAG_PEER_ONLINE = 0x22,      // u8：对端存活 0=从未探测 1=在线 2=离线
-    TAG_PING_RTT = 0x23,         // u32：最近一次成功往返（微秒）
-    TAG_PING_OK = 0x24,          // u32：累计探测成功次数
-    TAG_PING_FAIL = 0x25,        // u32：累计探测失败次数
+    TAG_PEER_ONLINE = 0x22,      // u8：协议连接 1=已连接 2=未连接
+    TAG_PING_RTT = 0x23,         // u32：协议层平滑往返时延（微秒）
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     TAG_LOSS_FRAMES = 0x26,  // u32：参与丢包注入判定的出向帧数
     TAG_LOSS_DROPPED = 0x27, // u32：被注入丢弃的帧数
@@ -784,13 +681,11 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
         p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED, 0);
     }
 
-    // 对端存活探测结果：online 是最近一次的结论，ok/fail 是累计计数（上位机
-    // 对两次快照差分即可知道"刚下发的那次探测"是成功还是失败）
-    const PingSnapshot ping = ping_snapshot();
-    p += tlv_u8(m_response + p, TAG_PEER_ONLINE, ping.online);
-    p += tlv_u32(m_response + p, TAG_PING_RTT, ping.rtt_us);
-    p += tlv_u32(m_response + p, TAG_PING_OK, ping.ok);
-    p += tlv_u32(m_response + p, TAG_PING_FAIL, ping.fail);
+    // 对端存活：协议连接状态；往返时延是协议层的平滑估计（微秒）
+    const WirelessLink &link = Application::get_instance().wireless_link();
+    const meaproto::Stats protocol = link.stats();
+    p += tlv_u8(m_response + p, TAG_PEER_ONLINE, link.connected() ? 1 : 2);
+    p += tlv_u32(m_response + p, TAG_PING_RTT, protocol.rtt_ms * 1000);
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     p += tlv_u32(m_response + p, TAG_LOSS_FRAMES, stats.loss_frames);
     p += tlv_u32(m_response + p, TAG_LOSS_DROPPED, stats.loss_dropped);

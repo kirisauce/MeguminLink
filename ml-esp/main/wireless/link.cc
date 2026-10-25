@@ -770,20 +770,14 @@ void WirelessLink::clear_espnow_backoff(u32 now)
     portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
-esp_err_t WirelessLink::send_ping(const u8 *dest_mac, u32 token)
+bool WirelessLink::ping()
 {
-    Packet packet;
-    packet.packet_type = PacketType::Ping;
-    packet.payload.ping.token = token;
-    return send(dest_mac, packet);
+    return m_daemon.ping();
 }
 
-esp_err_t WirelessLink::send_pong(const u8 *dest_mac, u32 token)
+meaproto::Stats WirelessLink::stats() const
 {
-    Packet packet;
-    packet.packet_type = PacketType::Pong;
-    packet.payload.pong.token = token;
-    return send(dest_mac, packet);
+    return m_daemon.snapshot();
 }
 
 bool WirelessLink::arq_established() const

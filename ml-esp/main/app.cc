@@ -440,7 +440,10 @@ void Application::consume_pending_action()
         // 的无线对端，忽略并记日志（与 EnterPairing 同语义）
         if (m_mode == Mode::Wireless)
         {
-            m_config_channel.start_ping();
+            if (!m_wireless_link.ping())
+            {
+                ESP_LOGW(TAG, "Ping dropped: protocol link is not connected");
+            }
         }
         else
         {
@@ -592,9 +595,6 @@ void Application::run()
             }
         }
 
-        // 对端存活探测只做超时结算：发起的时机由上位机掌握（配置通道 0x18）
-        m_config_channel.poll_ping_timeout();
-
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
         m_leds.apply(led_request());
 
@@ -670,37 +670,13 @@ void Application::run()
                     m_wireless_link.peer_add(peer_mac);
                 }
                 // 业务帧（DAP / 串口 / 配置中继）走 meaproto 通道，由 Sink 回调
-                // 直接分派（见 wireless/link.cc）。这里只消费链路层的尽力而为帧：
-                // - Ping：对端在探测本机，原样回显 token 回一帧 Pong；
-                // - Pong：对端回显本机探测，交给配置通道结算往返时延；
-                // 配对控制帧在已配对状态下不应出现，防御性忽略。
+                // 直接分派（见 wireless/link.cc）。已配对后链路层不再有业务包，
+                // 残留的尽力而为帧（对端仍在配对或旧固件）在这里丢弃。
                 auto packets = take_received_packets();
                 for (const auto &rp : packets)
                 {
-                    switch (rp.packet.packet_type)
-                    {
-                    case PacketType::Ping: {
-                        // 回包在主循环任务上下文发出：ESP-NOW 接收回调只投递，
-                        // 不在回调里调用发送（见 config_channel.hpp 的探测说明）
-                        const esp_err_t ret = m_wireless_link.send_pong(rp.src_mac, rp.packet.payload.ping.token);
-                        if (ret != ESP_OK)
-                        {
-                            ESP_LOGW(TAG, "Failed to reply pong to " MACSTR ": %s", MAC2STR(rp.src_mac),
-                                     esp_err_to_name(ret));
-                        }
-                        break;
-                    }
-                    case PacketType::Pong: {
-                        // 任何 Pong 都说明链路双向可用：熔断中的发送侧据此自愈
-                        // （熔断期的探针 Ping 也走这里，token 由配置通道自行判弃）
-                        m_config_channel.on_pong(rp.src_mac, rp.packet.payload.pong.token);
-                        break;
-                    }
-                    default:
-                        ESP_LOGW(TAG, "Unexpected packet type %d in paired state, ignored",
-                                 static_cast<int>(rp.packet.packet_type));
-                        break;
-                    }
+                    ESP_LOGW(TAG, "Unexpected packet type %d in paired state, ignored",
+                             static_cast<int>(rp.packet.packet_type));
                 }
             }
             break;

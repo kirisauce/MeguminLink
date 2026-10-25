@@ -200,12 +200,11 @@ class WirelessLink : private meaproto::Sink
     u32 disconnect_generation() const;
 
     /**
-     * 打包一条存活探测包并发送给已配对 peer（Ping/Pong 同构，token 由探测方
-     * 生成、对端原样回显）。发送在调用方任务上下文完成（主循环），不在 ESP-NOW
-     * 接收回调里回包——回调要短且不可重入驱动。
+     * 发一个协议层 Ping 采样往返时延（主循环执行配置通道的 0x18）。
+     *
+     * 只有已连接才有意义：未连接时返回 false，不生成探测。
      */
-    esp_err_t send_ping(const u8 *dest_mac, u32 token);
-    esp_err_t send_pong(const u8 *dest_mac, u32 token);
+    bool ping();
 
     /** 当前 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值） */
     u8 wifi_rate() const;
@@ -254,6 +253,9 @@ class WirelessLink : private meaproto::Sink
     /** 协议连接状态 */
     bool connected() const;
     bool connecting() const;
+
+    /** 协议层统计快照（配置通道 GetStats 的数据源） */
+    meaproto::Stats stats() const;
 
     /** 会话握手是否已完成（USB 侧据此在转发命令前先等一等） */
     bool arq_established() const;
