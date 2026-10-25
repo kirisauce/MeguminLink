@@ -135,4 +135,6 @@ template <Transport T> class Daemon final
 };
 } // namespace meaproto
 
+#include "meaproto/internal/daemon_impl.hpp"
+
 #endif // __MEAPROTO_DAEMON_HPP__
