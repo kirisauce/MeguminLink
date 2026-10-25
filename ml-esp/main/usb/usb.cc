@@ -412,7 +412,7 @@ void tud_vendor_rx_cb(u8 idx, const u8 *buffer, u16 buffer_size)
     // 读到的字节流按 DAP 命令自描述长度重组：一条命令可能跨多次回调到达，
     // 一次回调也可能带回多条命令；重组后由 dap_task 与 HID 通道的命令
     // 一起顺序执行。
-    u8 tmp[CONFIG_MEGUMINLINK_USB_MAX_PACKET_SIZE];
+    u8 tmp[DAP_PACKET_SIZE];
     u32 n;
     while ((n = tud_vendor_n_read(idx, tmp, sizeof(tmp))) > 0)
     {
