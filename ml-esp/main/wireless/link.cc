@@ -167,6 +167,7 @@ void WirelessLink::handle_uart_message(std::span<const u8> data)
         }
         const u32 baud = (static_cast<u32>(body[0]) << 24) | (static_cast<u32>(body[1]) << 16) |
                          (static_cast<u32>(body[2]) << 8) | static_cast<u32>(body[3]);
+        m_line_baud = baud;
         Application::get_instance().uart_bridge().configure(baud, body[4], body[5], body[6]);
         return;
     }
@@ -259,11 +260,17 @@ WirelessLink::UartVerdict WirelessLink::uart_frame_verdict() const
     return m_daemon.can_send(UART_CHANNEL) ? UartVerdict::Send : UartVerdict::Wait;
 }
 
+u32 WirelessLink::uart_bytes_per_s() const
+{
+    const u32 baud = (m_line_baud != 0) ? m_line_baud : CONFIG_MEGUMINLINK_UART_TX_MAX_BPS;
+    return baud / 10;
+}
+
 bool WirelessLink::uart_tx_admit(usize len, UartSource source)
 {
     // 最近提交过 DAP 业务就把串口额度压下来，把空口让给 DAP
     const u32 now = now_ms();
-    u32 bytes_per_s = CONFIG_MEGUMINLINK_UART_TX_MAX_BPS / 10;
+    u32 bytes_per_s = uart_bytes_per_s();
     if ((now - m_last_dap_tx_ms) < DAP_BUSY_WINDOW_MS)
     {
         bytes_per_s = bytes_per_s * CONFIG_MEGUMINLINK_UART_TX_MIN_PERCENT / 100;
@@ -326,6 +333,11 @@ UartEgress &WirelessLink::uart_egress(UartSource source)
 
 meaproto::SendResult WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
+    if (baud != 0)
+    {
+        m_line_baud = baud;
+    }
+
     u8 frame[1 + UART_LINE_CODING_SIZE] = {};
     frame[0] = UART_SOURCE_LINE_CODING;
     frame[1] = static_cast<u8>(baud >> 24);

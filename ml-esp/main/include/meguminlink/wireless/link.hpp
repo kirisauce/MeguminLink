@@ -287,13 +287,16 @@ class WirelessLink : private meaproto::Sink
 
     UartVerdict uart_frame_verdict() const;
 
-    /** 令牌桶准入（Host/Target 分开记账） */
+    /** 令牌桶准入（Host/Target 分开记账，速率跟随线编码） */
     bool uart_tx_admit(usize len, UartSource source);
 
     /** 排空一条出向缓冲 */
     void drain_uart_egress(UartEgress &egress, UartSource source);
 
     UartEgress &uart_egress(UartSource source);
+
+    /** 当前线速换算成字节/秒（未知时用 Kconfig 兜底） */
+    u32 uart_bytes_per_s() const;
 
     /** 把一段已序列化的缓冲交给 ESP-NOW（退避窗口内直接丢弃） */
     esp_err_t send_frame(const u8 *dest_mac, const u8 *data, size_t len);
@@ -359,6 +362,8 @@ class WirelessLink : private meaproto::Sink
     UartEgress m_target_uart;        /**< 目标方向出向缓冲 */
     UartBucket m_uart_bucket_host;   /**< 主机方向额度 */
     UartBucket m_uart_bucket_target; /**< 目标方向额度 */
+    /** 当前线编码波特率（0 = 未知）：令牌桶按它换算速率 */
+    volatile u32 m_line_baud = 0;
     /** 最近一次提交 DAP 业务包的时刻：串口准入据此给 DAP 让路 */
     volatile u32 m_last_dap_tx_ms = 0;
     /** 主机 CDC 补读原语 */
