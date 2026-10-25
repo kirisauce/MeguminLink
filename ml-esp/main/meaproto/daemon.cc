@@ -68,8 +68,7 @@ u32 random_epoch(void *) noexcept
 
 template <Transport T>
 Daemon<T>::Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channels, const Config &config) noexcept
-    : m_transport(transport),
-      m_storage_bytes(Core::storage_bytes(channels, config, static_cast<u16>(T::MTU))),
+    : m_transport(transport), m_storage_bytes(Core::storage_bytes(channels, config, static_cast<u16>(T::MTU))),
       m_storage(allocate_storage(m_storage_bytes)),
       m_core(channels, config, static_cast<u16>(T::MTU), sink, CoreHooks{this, &Daemon<T>::send_hook, &random_epoch},
              std::span<u8>{m_storage, m_storage_bytes}),
