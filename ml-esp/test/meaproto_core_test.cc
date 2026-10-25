@@ -445,14 +445,16 @@ constexpr ChannelId CH_B{2};
 constexpr ChannelId CH_C{3};
 constexpr ChannelId CH_W{4};
 constexpr ChannelId CH_R{5};
+constexpr ChannelId CH_S{6};
 
-/** 通道表：A 优先级 2、B 优先级 1（队列 1）、C 不可靠、W 窗口 1、R 重排 1（队列 3） */
+/** 通道表：A 优先级 2、B 队列 1、C 不可靠、W 窗口 1、R 重排 1、S 大容量 */
 constexpr ChannelSpec TEST_CHANNELS[] = {
     {CH_A, Reliability::ReliableOrdered, 64, 2, 2, 2, 2},
     {CH_B, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
     {CH_C, Reliability::Unreliable, 32, 2, 3, 2, 0},
     {CH_W, Reliability::ReliableOrdered, 32, 2, 4, 2, 1},
     {CH_R, Reliability::ReliableOrdered, 32, 3, 5, 1, 4},
+    {CH_S, Reliability::ReliableOrdered, 32, 128, 6, 64, 8},
 };
 
 /** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
@@ -799,6 +801,34 @@ void reorder_overflow_keeps_unacked()
     check(duo.b.sink.messages[0] == std::vector<u8>{1});
 }
 
+// ---- 丢包、重复与序号回绕 ----
+
+
+
+
+void duplicate_frames_delivered_once()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 payload[2] = {3, 3};
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+
+    const std::vector<u8> frame = duo.a.link.frames.back();
+    duo.a.link.frames.clear();
+
+    for (int i = 0; i < 3; ++i)
+    {
+        duo.b.core.receive(duo.b.now, std::span<const u8>{frame.data(), frame.size()});
+    }
+
+    check_eq(duo.b.sink.messages.size(), 1);
+    check_eq(duo.b.core.snapshot().duplicate_datagrams, 2);
+}
+
+
+
 // ---- 可靠性切换 ----
 
 void set_reliability_requires_connection()
@@ -976,6 +1006,7 @@ const test::Case TESTS[] = {
     {"set_reliability clears channel state", set_reliability_clears_state},
     {"set_reliability restarts ordering", set_reliability_restarts_ordering},
     {"reconnect resets channels", reconnect_resets_channels},
+    {"duplicate frames delivered once", duplicate_frames_delivered_once},
 };
 } // namespace
 

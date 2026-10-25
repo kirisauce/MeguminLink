@@ -418,7 +418,9 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
 
         if (ahead == 0)
         {
+            // 位图跟着 expected 一起右移：bit i 始终表示 expected + 1 + i
             expected = static_cast<u16>(expected + 1);
+            bits >>= 1;
             while ((bits & 1u) != 0)
             {
                 bits >>= 1;
