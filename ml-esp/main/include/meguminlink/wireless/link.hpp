@@ -18,9 +18,6 @@
 
 namespace mlink
 {
-/** ESP-NOW 广播地址，用于发现阶段的 Probe 广播 */
-inline constexpr u8 ESP_NOW_BROADCAST[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
 /**
  * 一条待执行的 DAP 命令：命令来源（响应回发）+ 可靠传输序号 + 原样命令字节流。
  *
@@ -401,8 +398,6 @@ class WirelessLink
      */
     bool loss_should_drop();
 #endif
-
-    static constexpr u8 CHANNEL = 10; // ESP-NOW 固定信道
 
     bool m_initialized = false;
     /** 发送互斥：ESP-NOW 的发送缓冲与驱动调用串行化 */

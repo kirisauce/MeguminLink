@@ -4,6 +4,7 @@
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（无线侧执行接线）
 #include "meguminlink/dap_frame.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/wireless/espnow_transport.hpp"
 
 #include <cstring>
 
@@ -207,7 +208,7 @@ esp_err_t WirelessLink::init()
         ret = esp_wifi_set_ps(WIFI_PS_NONE);
         ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(ret));
 
-        ret = esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+        ret = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
         ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_channel() failed");
     }
 

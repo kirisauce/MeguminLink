@@ -36,6 +36,12 @@ inline constexpr usize MESSAGE_SPLIT_SIZE = 6;
 inline constexpr usize ACK_BITS_WIDTH = 32;
 inline constexpr u16 MIN_SPLIT_COUNT = 2;
 
+/** 首字节是否属于本协议：高 4 位是版本号 */
+inline constexpr bool is_protocol_frame(u8 first_byte) noexcept
+{
+    return (first_byte >> VERSION_SHIFT) == VERSION;
+}
+
 enum class WireError : u8
 {
     Ok,

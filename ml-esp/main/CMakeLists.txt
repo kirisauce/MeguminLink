@@ -4,6 +4,7 @@ file(GLOB __src ${CMAKE_CURRENT_LIST_DIR}/*.cc ${CMAKE_CURRENT_LIST_DIR}/*.c)
 # 与适配层（arq / arq_link）、配对（pairing）。两端共用，无条件编译。
 list(APPEND __src
     ${CMAKE_CURRENT_LIST_DIR}/wireless/frame.cc
+    ${CMAKE_CURRENT_LIST_DIR}/wireless/espnow_transport.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/link.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq_link.cc
