@@ -51,7 +51,9 @@ class EspNowTransport
     void unbind();
 
     // meaproto::Transport
-    usize mtu() const noexcept;
+    /** ESP-NOW v2 的载荷上限 */
+    static constexpr usize MTU = ESP_NOW_MAX_DATA_LEN_V2;
+
     bool send(std::span<const u8> data) noexcept;
     void set_receive_handler(meaproto::ReceiveFn callback, void *ctx) noexcept;
 

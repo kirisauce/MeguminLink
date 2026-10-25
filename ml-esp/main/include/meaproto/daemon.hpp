@@ -8,37 +8,37 @@
 #include "meaproto/transport.hpp"
 #include "meaproto/types.hpp"
 
+#include <atomic>
+#include <limits>
+#include <span>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
-#include <atomic>
-#include <span>
-
 namespace meaproto
 {
-/** 取会话标识：固件用 esp_random()，宿主测试不走这里 */
+/** 取会话标识 */
 u32 random_epoch(void *ctx) noexcept;
 
 /**
- * Daemon 的非模板部分：任务、接收队列、统计快照与跨任务请求。
+ * 一条连接的运行外壳：把具体 Transport 绑到 Core 上，并跑在一条 FreeRTOS 任务里。
  *
- * 协议状态全在 Core 里，本类只负责把它跑在一条 FreeRTOS 任务上，并把外部调用
- * 转成任务上下文里的动作。
+ * 协议状态全在 Core 里，本类只负责把它跑在任务上，并把外部调用转成任务上下文
+ * 里的动作。
  */
-class DaemonImpl
+template <Transport T> class Daemon final
 {
   public:
     static constexpr UBaseType_t TASK_PRIORITY = 6;
     static constexpr usize TASK_STACK = 6144;
 
-    DaemonImpl(Sink &sink, std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
-               const CoreHooks &hooks) noexcept;
-    ~DaemonImpl();
+    Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channels, const Config &config = {}) noexcept;
+    ~Daemon();
 
-    DaemonImpl(const DaemonImpl &) = delete;
-    DaemonImpl &operator=(const DaemonImpl &) = delete;
+    Daemon(const Daemon &) = delete;
+    Daemon &operator=(const Daemon &) = delete;
 
     void start(UBaseType_t priority = TASK_PRIORITY, usize stack = TASK_STACK);
     void stop();
@@ -53,13 +53,6 @@ class DaemonImpl
     bool connecting() const;
     Stats snapshot() const;
 
-  protected:
-    /** Transport 接收回调的落点：拷进队列并唤醒任务（要求回调串行，见 Transport 约定） */
-    void push_frame(const u8 *data, usize len);
-
-    /** 刷新统计快照并打状态迁移日志（任务上下文） */
-    void publish();
-
   private:
     enum class Request : u8
     {
@@ -68,7 +61,19 @@ class DaemonImpl
         Close,
     };
 
+    static_assert(T::MTU <= static_cast<usize>(std::numeric_limits<u16>::max()),
+                  "transport MTU exceeds the u16 handshake field");
+    /** 队列元素与接收缓冲的尺寸 */
+    static constexpr usize RX_ITEM = sizeof(u16) + T::MTU;
+
     static void task_entry(void *ctx);
+    static bool send_hook(void *ctx, std::span<const u8> data) noexcept;
+    static void receive_hook(void *ctx, const u8 *data, usize len) noexcept;
+
+    /** Transport 接收回调的落点：拷进队列并唤醒任务（要求回调串行，见 Transport 约定） */
+    void push_frame(const u8 *data, usize len);
+    /** 刷新统计快照并打状态迁移日志（任务上下文） */
+    void publish();
 
     void run();
     void apply_requests(u32 now);
@@ -76,66 +81,30 @@ class DaemonImpl
     void log_stats(u32 now);
     void wake();
 
+    // ---- 绑定的对象 ----
+    T &m_transport;
     Core m_core;
 
-    /** 队列与退出信号量在构造时分配、析构时释放：stop() 只停任务，不拆缓冲 */
-    QueueHandle_t m_rx_queue = nullptr;
-    SemaphoreHandle_t m_stopped = nullptr;
+    // ---- 接收通路 ----
+    QueueHandle_t m_rx_queue = nullptr; /**< 构造时分配、析构时释放 */
+    u8 m_rx_depth = 1;                  /**< 队列深度 */
+    u16 m_rx_item = 0;                  /**< 队列元素尺寸 */
+    u8 m_rx_staging[RX_ITEM] = {};      /**< 接收回调独占的拷贝缓冲 */
+    u8 m_rx_frame[RX_ITEM] = {};        /**< 任务上下文读出队列元素用 */
+    std::atomic<u32> m_rx_dropped{0};   /**< 超长帧与入队失败的丢弃数 */
 
-    /** 任务句柄：外部任务只读它来唤醒，stop() 先摘句柄再唤醒 */
-    std::atomic<TaskHandle_t> m_task{nullptr};
-    /** 最近一次外部请求：后写的覆盖先写的，避免 open/close 同拍时顺序歧义 */
-    std::atomic<Request> m_request{Request::None};
-    std::atomic<bool> m_stopping{false};
-    std::atomic<u32> m_rx_dropped{0};
+    // ---- 任务与外部请求 ----
+    SemaphoreHandle_t m_stopped = nullptr;               /**< 任务退出信号量 */
+    std::atomic<TaskHandle_t> m_task{nullptr};           /**< 停止后为空，外部只读它来唤醒 */
+    std::atomic<bool> m_stopping{false};                 /**< 已请求任务退出 */
+    std::atomic<Request> m_request{Request::None};       /**< 后写覆盖先写 */
+    std::atomic<Core::State> m_state{Core::State::Idle}; /**< 只有任务写，外部无锁读 */
 
-    /** 对外可见的连接状态：只有任务写，任何人都能无锁读 */
-    std::atomic<Core::State> m_state{Core::State::Idle};
-
-    /** 统计副本：多个计数器要一起成立，因此用临界区保护 */
-    mutable portMUX_TYPE m_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
+    // ---- 统计与日志 ----
+    mutable portMUX_TYPE m_snapshot_lock = portMUX_INITIALIZER_UNLOCKED; /**< 多个计数器要一起成立 */
     Stats m_snapshot{};
-
-    u8 m_rx_depth = 1;
-    u16 m_rx_item = 0;
-    Core::State m_logged_state = Core::State::Idle;
-    u32 m_next_stats_ms = 0;
-    /** Transport 接收回调上下文独占的拷贝缓冲 */
-    u8 m_rx_staging[sizeof(u16) + MAX_MTU] = {};
-    /** 任务上下文读出队列元素用 */
-    u8 m_rx_frame[sizeof(u16) + MAX_MTU] = {};
-};
-
-/** 一条连接的运行外壳：把具体 Transport 绑到 DaemonImpl 上 */
-template <Transport T> class Daemon final : public DaemonImpl
-{
-  public:
-    Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channels, const Config &config = {})
-        : DaemonImpl(sink, channels, config, transport_mtu(transport),
-                     CoreHooks{this, &Daemon::send_hook, &random_epoch}),
-          m_transport(transport)
-    {
-        m_transport.set_receive_handler(&Daemon::receive_hook, this);
-    }
-
-  private:
-    static u16 transport_mtu(T &transport) noexcept
-    {
-        const usize mtu = transport.mtu();
-        return static_cast<u16>(mtu < MAX_MTU ? mtu : MAX_MTU);
-    }
-
-    static bool send_hook(void *ctx, std::span<const u8> data) noexcept
-    {
-        return static_cast<Daemon *>(ctx)->m_transport.send(data);
-    }
-
-    static void receive_hook(void *ctx, const u8 *data, usize len) noexcept
-    {
-        static_cast<Daemon *>(ctx)->push_frame(data, len);
-    }
-
-    T &m_transport;
+    Core::State m_logged_state = Core::State::Idle; /**< 上次打印的状态 */
+    u32 m_next_stats_ms = 0;                        /**< 下次统计时刻 */
 };
 } // namespace meaproto
 

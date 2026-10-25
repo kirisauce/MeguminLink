@@ -1,4 +1,5 @@
 #include "meaproto/daemon.hpp"
+#include "meguminlink/wireless/espnow_transport.hpp"
 
 #include <cstring>
 
@@ -9,7 +10,7 @@ namespace meaproto
 {
 namespace
 {
-constexpr char TAG[] = "meaproto";
+constexpr char TAG[] = "meaproto::daemon";
 
 /** 统计日志间隔 */
 constexpr u32 STATS_LOG_INTERVAL_MS = 10000;
@@ -48,10 +49,12 @@ u32 random_epoch(void *) noexcept
     return esp_random();
 }
 
-DaemonImpl::DaemonImpl(Sink &sink, std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
-                       const CoreHooks &hooks) noexcept
-    : m_core(channels, config, mtu, sink, hooks), m_rx_depth(config.rx_queue_depth == 0 ? 1 : config.rx_queue_depth),
-      m_rx_item(static_cast<u16>(sizeof(u16) + mtu))
+template <Transport T>
+Daemon<T>::Daemon(T &transport, Sink &sink, std::span<const ChannelSpec> channels, const Config &config) noexcept
+    : m_transport(transport),
+      m_core(channels, config, static_cast<u16>(T::MTU), sink, CoreHooks{this, &Daemon<T>::send_hook, &random_epoch}),
+      m_rx_depth(config.rx_queue_depth == 0 ? 1 : config.rx_queue_depth),
+      m_rx_item(static_cast<u16>(sizeof(u16) + T::MTU))
 {
     m_rx_queue = xQueueCreate(m_rx_depth, m_rx_item);
     m_stopped = xSemaphoreCreateBinary();
@@ -59,9 +62,10 @@ DaemonImpl::DaemonImpl(Sink &sink, std::span<const ChannelSpec> channels, const 
     {
         ESP_LOGE(TAG, "failed to create rx queue or stop semaphore");
     }
+    m_transport.set_receive_handler(&Daemon<T>::receive_hook, this);
 }
 
-DaemonImpl::~DaemonImpl()
+template <Transport T> Daemon<T>::~Daemon()
 {
     stop();
 
@@ -77,7 +81,7 @@ DaemonImpl::~DaemonImpl()
     }
 }
 
-void DaemonImpl::start(UBaseType_t priority, usize stack)
+template <Transport T> void Daemon<T>::start(UBaseType_t priority, usize stack)
 {
     if (m_rx_queue == nullptr || m_stopped == nullptr || m_task.load(std::memory_order_relaxed) != nullptr)
     {
@@ -85,7 +89,7 @@ void DaemonImpl::start(UBaseType_t priority, usize stack)
     }
 
     TaskHandle_t task = nullptr;
-    if (xTaskCreate(&DaemonImpl::task_entry, "meaproto", static_cast<configSTACK_DEPTH_TYPE>(stack), this, priority,
+    if (xTaskCreate(&Daemon<T>::task_entry, "meaproto", static_cast<configSTACK_DEPTH_TYPE>(stack), this, priority,
                     &task) != pdPASS)
     {
         ESP_LOGE(TAG, "failed to create task");
@@ -94,7 +98,7 @@ void DaemonImpl::start(UBaseType_t priority, usize stack)
     m_task.store(task, std::memory_order_relaxed);
 }
 
-void DaemonImpl::stop()
+template <Transport T> void Daemon<T>::stop()
 {
     // 先摘句柄：之后的 open()/close()/收帧只会看到空句柄，不会再通知这条要退出的任务
     const TaskHandle_t task = m_task.exchange(nullptr, std::memory_order_acq_rel);
@@ -109,29 +113,29 @@ void DaemonImpl::stop()
     m_stopping.store(false, std::memory_order_relaxed);
 }
 
-void DaemonImpl::open()
+template <Transport T> void Daemon<T>::open()
 {
     m_request.store(Request::Open, std::memory_order_relaxed);
     wake();
 }
 
-void DaemonImpl::close()
+template <Transport T> void Daemon<T>::close()
 {
     m_request.store(Request::Close, std::memory_order_relaxed);
     wake();
 }
 
-bool DaemonImpl::connected() const
+template <Transport T> bool Daemon<T>::connected() const
 {
     return m_state.load(std::memory_order_relaxed) == Core::State::Connected;
 }
 
-bool DaemonImpl::connecting() const
+template <Transport T> bool Daemon<T>::connecting() const
 {
     return m_state.load(std::memory_order_relaxed) == Core::State::Connecting;
 }
 
-Stats DaemonImpl::snapshot() const
+template <Transport T> Stats Daemon<T>::snapshot() const
 {
     taskENTER_CRITICAL(&m_snapshot_lock);
     const Stats value = m_snapshot;
@@ -139,7 +143,22 @@ Stats DaemonImpl::snapshot() const
     return value;
 }
 
-void DaemonImpl::push_frame(const u8 *data, usize len)
+template <Transport T> void Daemon<T>::task_entry(void *ctx)
+{
+    static_cast<Daemon<T> *>(ctx)->run();
+}
+
+template <Transport T> bool Daemon<T>::send_hook(void *ctx, std::span<const u8> data) noexcept
+{
+    return static_cast<Daemon<T> *>(ctx)->m_transport.send(data);
+}
+
+template <Transport T> void Daemon<T>::receive_hook(void *ctx, const u8 *data, usize len) noexcept
+{
+    static_cast<Daemon<T> *>(ctx)->push_frame(data, len);
+}
+
+template <Transport T> void Daemon<T>::push_frame(const u8 *data, usize len)
 {
     // m_rx_staging 只被 Transport 的接收回调写；约定该回调串行
     if (m_rx_queue == nullptr || len > static_cast<usize>(m_rx_item) - sizeof(u16))
@@ -160,7 +179,7 @@ void DaemonImpl::push_frame(const u8 *data, usize len)
     wake();
 }
 
-void DaemonImpl::publish()
+template <Transport T> void Daemon<T>::publish()
 {
     const Core::State state = m_core.state();
     m_state.store(state, std::memory_order_relaxed);
@@ -192,12 +211,7 @@ void DaemonImpl::publish()
     m_logged_state = state;
 }
 
-void DaemonImpl::task_entry(void *ctx)
-{
-    static_cast<DaemonImpl *>(ctx)->run();
-}
-
-void DaemonImpl::run()
+template <Transport T> void Daemon<T>::run()
 {
     publish();
     for (;;)
@@ -222,7 +236,7 @@ void DaemonImpl::run()
     vTaskDelete(nullptr);
 }
 
-void DaemonImpl::apply_requests(u32 now)
+template <Transport T> void Daemon<T>::apply_requests(u32 now)
 {
     switch (m_request.exchange(Request::None, std::memory_order_relaxed))
     {
@@ -237,7 +251,7 @@ void DaemonImpl::apply_requests(u32 now)
     }
 }
 
-void DaemonImpl::drain_rx(u32 now)
+template <Transport T> void Daemon<T>::drain_rx(u32 now)
 {
     while (m_rx_queue != nullptr)
     {
@@ -256,7 +270,7 @@ void DaemonImpl::drain_rx(u32 now)
     }
 }
 
-void DaemonImpl::log_stats(u32 now)
+template <Transport T> void Daemon<T>::log_stats(u32 now)
 {
     if (!time_after(now, m_next_stats_ms))
     {
@@ -273,7 +287,7 @@ void DaemonImpl::log_stats(u32 now)
              static_cast<unsigned>(stats.rtt_ms), static_cast<unsigned>(stats.rto_ms));
 }
 
-void DaemonImpl::wake()
+template <Transport T> void Daemon<T>::wake()
 {
     const TaskHandle_t task = m_task.load(std::memory_order_relaxed);
     if (task != nullptr)
@@ -281,4 +295,6 @@ void DaemonImpl::wake()
         xTaskNotifyGive(task);
     }
 }
+
+template class Daemon<mlink::EspNowTransport>;
 } // namespace meaproto

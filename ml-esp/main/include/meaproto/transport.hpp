@@ -5,7 +5,6 @@
 #include "meaproto/types.hpp"
 
 #include <concepts>
-#include <cstddef>
 #include <span>
 
 namespace meaproto
@@ -13,13 +12,10 @@ namespace meaproto
 /** 接收回调，实现方只做拷贝入队 */
 using ReceiveFn = void (*)(void *ctx, const u8 *data, usize len);
 
-/** 单帧上限的协议上限（ESP-NOW v2 的容量）：接收队列与缓冲按它开 */
-inline constexpr u16 MAX_MTU = 1470;
-
 /** 一条已绑定的不可靠连接 */
 template <typename T>
 concept Transport = requires(T transport, std::span<const u8> data, ReceiveFn fn, void *ctx) {
-    { transport.mtu() } noexcept -> std::convertible_to<usize>;
+    { T::MTU } -> std::convertible_to<usize>;
     { transport.send(data) } noexcept -> std::same_as<bool>;
     { transport.set_receive_handler(fn, ctx) } noexcept;
 };

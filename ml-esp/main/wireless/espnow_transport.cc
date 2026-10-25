@@ -118,11 +118,6 @@ void EspNowTransport::unbind()
     m_bound = false;
 }
 
-usize EspNowTransport::mtu() const noexcept
-{
-    return ESP_NOW_MAX_DATA_LEN_V2;
-}
-
 bool EspNowTransport::send(std::span<const u8> data) noexcept
 {
     return m_bound && send_raw(m_peer_mac, data);
