@@ -143,6 +143,11 @@ void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> d
         handle_uart_message(data);
         return;
     }
+    if (channel == CONFIG_CHANNEL)
+    {
+        handle_config_message(data);
+        return;
+    }
 
     ESP_LOGD(TAG, "channel %u message (%u bytes) not dispatched", static_cast<unsigned>(channel.value),
              static_cast<unsigned>(data.size()));
@@ -202,6 +207,50 @@ meaproto::SendResult WirelessLink::send_dap_frame(u8 kind, u8 source, u16 req_id
     std::memcpy(frame + DAP_WIRE_HEADER, data, len);
 
     return m_daemon.send(DAP_CHANNEL, std::span<const u8>{frame, DAP_WIRE_HEADER + len});
+}
+
+meaproto::SendResult WirelessLink::send_relayed_usb_control(const payload::RelayedUsbControl &req)
+{
+    Packet packet;
+    packet.packet_type = PacketType::RelayedUsbControl;
+    packet.payload.relayed_usb_control = req;
+    packet.payload.relayed_usb_control.data = nullptr;
+
+    const size_t len = packet.serialized_size();
+    if (len > sizeof(m_pack_frame))
+    {
+        return meaproto::SendResult::TooLarge;
+    }
+    if (m_pack_mutex == nullptr)
+    {
+        return meaproto::SendResult::InvalidState;
+    }
+
+    xSemaphoreTake(m_pack_mutex, portMAX_DELAY);
+    const esp_err_t ret = packet.serialize(m_pack_frame, sizeof(m_pack_frame));
+    meaproto::SendResult result = meaproto::SendResult::TooLarge;
+    if (ret == ESP_OK)
+    {
+        result = m_daemon.send(CONFIG_CHANNEL, std::span<const u8>(m_pack_frame, len));
+    }
+    xSemaphoreGive(m_pack_mutex);
+    return result;
+}
+
+bool WirelessLink::set_uart_reliable(bool reliable)
+{
+    const bool changed = m_daemon.set_reliability(UART_CHANNEL, reliable ? meaproto::Reliability::ReliableOrdered
+                                                                         : meaproto::Reliability::Unreliable);
+    if (changed)
+    {
+        m_uart_reliable = reliable;
+    }
+    return changed;
+}
+
+bool WirelessLink::uart_reliable() const
+{
+    return m_uart_reliable;
 }
 
 meaproto::SendResult WirelessLink::send_dap_command(const u8 *data, usize len, u8 source, u16 req_id)
@@ -291,6 +340,26 @@ void WirelessLink::handle_uart_message(std::span<const u8> data)
     }
     const UartSource port = (source == UART_SOURCE_HOST) ? UartSource::Host : UartSource::Target;
     Application::get_instance().uart_bridge().push_inbound(body.data(), body.size(), port);
+}
+
+void WirelessLink::handle_config_message(std::span<const u8> data)
+{
+    // 反序列化落在协议任务独占的缓冲：CONFIG 载荷是整条 Packet，数据段上限 256B。
+    // 回调跑在协议任务里，只做解释与动作投递，不执行。
+    Packet packet;
+    if (packet.deserialize(data.data(), data.size(), m_config_storage, sizeof(m_config_storage)) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to deserialize %u-byte config message", static_cast<unsigned>(data.size()));
+        return;
+    }
+
+    if (packet.packet_type != PacketType::RelayedUsbControl)
+    {
+        ESP_LOGW(TAG, "Unexpected config packet type %d, ignored", static_cast<int>(packet.packet_type));
+        return;
+    }
+
+    Application::get_instance().config_channel().on_relayed_control(packet.payload.relayed_usb_control);
 }
 
 size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)

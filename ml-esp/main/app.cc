@@ -528,8 +528,10 @@ void Application::consume_pending_action()
         (void)m_wireless_link.set_wifi_rate(arg);
         break;
     case ConfigChannel::Action::SetUartReliable: {
-        // 串口出向是否走可靠传输：立即生效并落盘，缓冲里的字节按新选择继续发
+        // 串口出向是否走可靠传输：立即生效并落盘。未连接时 set_uart_reliable
+        // 不生效，建链后由主循环按落盘值应用
         const bool reliable = (arg != 0);
+        (void)m_wireless_link.set_uart_reliable(reliable);
         const esp_err_t ret = m_uart_reliable_key.set(static_cast<u8>(reliable ? 1 : 0));
         if (ret != ESP_OK)
         {
@@ -583,6 +585,15 @@ void Application::run()
         // 无线侧与对端的档位同步：接收回调只登记待生效值（不可在回调里操作
         // WiFi 驱动），实际应用在这里
         m_wireless_link.poll();
+
+        // 链路刚建立：UART 通道的可靠性按落盘值应用（0x1D 在未连接时不生效，
+        // 切换要等协议层进入 Connected 才有意义）
+        const bool link_connected = m_wireless_link.connected();
+        if (link_connected && !m_link_connected)
+        {
+            (void)m_wireless_link.set_uart_reliable(m_uart_reliable_key.get() != 0);
+        }
+        m_link_connected = link_connected;
 
         // 参数被改动过（主机下发，或按代数/MAC 采纳了对端那份）：落盘。NVS 写入
         // 只在主循环做，不占 tinyusb 任务，也不占 ARQ 任务（交付路径会改参数）。

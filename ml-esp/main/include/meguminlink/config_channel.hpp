@@ -147,13 +147,13 @@ class ConfigChannel
     bool take_link_config_draft(ArqSettings *settings);
 
     /**
-     * 收到对端转发的 USB 控制请求（无线接收回调调用）。
+     * 收到对端转发的 USB 控制请求（CONFIG 通道消息，协议任务调用）。
      *
      * 无 USB 侧的设置只能这样下发：本函数用与本机 USB 侧完全相同的命令表
      * 解释请求，因此两端语义不会漂移。只做解释与投递，不执行——命令可能
-     * 操作 WiFi 驱动，而接收回调不可重入驱动，实际执行留给主循环。
+     * 操作 WiFi 驱动，实际执行留给主循环。
      *
-     * 响应在本目标被丢弃：转发是尽力而为的单向下发，发起端不等回执。
+     * 响应在本目标被丢弃：转发是单向下发，发起端不等回执。
      */
     void on_relayed_control(const payload::RelayedUsbControl &req);
 
@@ -187,6 +187,9 @@ class ConfigChannel
     u16 dispatch_control(u8 cmd, u8 arg, u8 seq);
 
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
+    /** 把需要两端一致的动作命令转发给对端（经 CONFIG 通道） */
+    void relay_to_peer(u8 cmd, u8 arg);
+
     /** TLV 区填到 end 后收尾：写帧头、回整帧长度 */
     u16 finish_response(u8 cmd, u8 seq, usize end);
 

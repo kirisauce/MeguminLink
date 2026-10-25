@@ -178,10 +178,17 @@ class WirelessLink : private meaproto::Sink
     /**
      * 向指定对端（可为广播地址）发送一帧业务包。
      *
-     * 走尽力而为：这条路是探测、配对与配置通道控制帧的通道，它们要么发生在会话
-     * 建立之前，要么本来就不该重传（探活重传会污染 RTT 判定）。
+     * 走尽力而为：这条路只承载配对控制帧，它发生在会话建立之前，没有可用的
+     * 可靠通道。
      */
     esp_err_t send(const u8 *dest_mac, const Packet &packet);
+
+    /**
+     * 把一条 USB 控制请求转发给对端执行（无 USB 侧的设置下发通路）。
+     *
+     * 走 CONFIG 通道可靠发送；未连接时返回 NotConnected，调用方按"仅本机生效"处理。
+     */
+    meaproto::SendResult send_relayed_usb_control(const payload::RelayedUsbControl &req);
 
     /**
      * 提交一条 DAP 命令（发送端，USB 任务上下文）。data 是裸命令字节。
@@ -205,6 +212,17 @@ class WirelessLink : private meaproto::Sink
      * 只有已连接才有意义：未连接时返回 false，不生成探测。
      */
     bool ping();
+
+    /**
+     * 切换 UART 通道的可靠性（配置通道 0x1D）。两端必须同时切换。
+     *
+     * 切换会清空该通道的收发状态；未连接时不生效，由连接建立后按落盘值应用。
+     * @return true=已切换
+     */
+    bool set_uart_reliable(bool reliable);
+
+    /** 当前 UART 通道是否走可靠传输 */
+    bool uart_reliable() const;
 
     /** 当前 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值） */
     u8 wifi_rate() const;
@@ -340,6 +358,9 @@ class WirelessLink : private meaproto::Sink
     /** UART 通道分派：按来源标记写端口或应用线编码 */
     void handle_uart_message(std::span<const u8> data);
 
+    /** CONFIG 通道分派：解析转发过来的 USB 控制请求 */
+    void handle_config_message(std::span<const u8> data);
+
     /** 串口帧的发送判定 */
     enum class UartVerdict : u8
     {
@@ -402,6 +423,8 @@ class WirelessLink : private meaproto::Sink
     u8 m_pack_frame[DAP_FRAME_MAX_SIZE] = {};
     /** 接收业务包的反序列化存储：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉交付任务的栈 */
     u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE] = {};
+    /** CONFIG 消息的反序列化存储（协议任务独占，不与链路层接收共用） */
+    u8 m_config_storage[512] = {};
 
     /** 无线 DAP：执行队列与任务独立，命令执行不拖住协议任务的 ACK 与保活 */
     QueueHandle_t m_dap_queue = nullptr;
@@ -446,6 +469,8 @@ class WirelessLink : private meaproto::Sink
     void *m_host_uart_fill_ctx = nullptr;
     /** 串口组帧缓冲（主循环单线程） */
     u8 m_uart_frame[512] = {};
+    /** UART 通道当前是否走可靠传输（协议层状态；落盘值在 NVS） */
+    volatile bool m_uart_reliable = true;
     /**
      * 当前 ESP-NOW 发送速率档位。只由主循环写（set_wifi_rate / poll），
      * 读取方（配置通道 GetConfig）在 EP0 上下文。

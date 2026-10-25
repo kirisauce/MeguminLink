@@ -159,6 +159,7 @@ class Application
     NvsKeyU8 m_uart_reliable_key; /**< 串口出向可靠性 NVS 键（0=尽力而为 1=可靠） */
     Mode m_mode;                  /**< 当前运行模式 */
     SemaphoreHandle_t m_main_task_wake;
+    bool m_link_connected = false; /**< 上一拍的协议连接状态（建链时应用落盘的可靠开关） */
 
     /**
      * 配对流程统一入口（Wireless 子流程）：
