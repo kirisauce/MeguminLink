@@ -1,12 +1,12 @@
 #include "meguminlink/usb/usb.hpp"
 #include "meguminlink/app.hpp"
-#include "meguminlink/dap_executor.hpp"  // dap_executor_run（Local 执行核心）
-#include "meguminlink/dap_frame.hpp"     // dap_request_size（USB 命令重组）
+#include "meguminlink/dap_executor.hpp"    // dap_executor_run（Local 执行核心）
+#include "meguminlink/dap_frame.hpp"       // dap_request_size（USB 命令重组）
 #include "meguminlink/usb/update_mode.hpp" // UpdateMode::try_instance（更新模式分流）
 #include "meguminlink/usb/usb_capability.hpp"
 #include "meguminlink/usb/usb_descriptors.hpp"
 #include "meguminlink/wireless/frame.hpp"
-#include "meguminlink/wireless/link.hpp" // WirelessLink::submit_dap_command（Wireless 转发）
+#include "meguminlink/wireless/link.hpp" // WirelessLink::send_dap_command（Wireless 转发）
 
 #include <esp_check.h>
 #include <esp_log.h>
@@ -289,13 +289,157 @@ bool dap_source_ready(DapSource source)
     return tud_vendor_n_mounted(USB_DAP_INTERFACE);
 }
 
+/** 一条已提交、还没拿到响应的无线 DAP 命令（响应按请求号配回来） */
+struct PendingWirelessCommand
+{
+    bool used = false;
+    u16 req_id = 0; /**< 发送端分配的请求号：对端原样带回 */
+    u8 cmd_id = 0;  /**< 命令号（请求首字节）：超时与断开日志用它指明是哪条命令 */
+    DapSource source = DapSource::VendorBulk;
+    u16 request_len = 0;
+    TickType_t sent_tick = 0;
+};
+
 // 执行器上下文：命令队列、当前在途命令的来源（响应路由依据）与请求长度（统计用）。
+// 无线模式下还持有"已提交未响应"的挂起表：命令发出后立刻回来取下一条，响应到达
+// 时按请求号配回。cmd_src 与 resp_sink 由同一任务（dap_task）串行调用，挂起表
+// 无需同步。
 struct DapTaskContext
 {
     mlink::CmsisDapUsb *usb;
     DapSource source = DapSource::VendorBulk;
     u16 request_len = 0;
+    u16 next_req_id = 1;
+    u32 link_generation = 0; /**< 上次见到的断开次数：变化时清空挂起表 */
+    PendingWirelessCommand pending[CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH];
 };
+
+/** 按请求号找挂起条目（响应配对的唯一依据） */
+PendingWirelessCommand *find_pending_by_req(DapTaskContext &ctx, u16 req_id)
+{
+    for (PendingWirelessCommand &pending : ctx.pending)
+    {
+        if (pending.used && pending.req_id == req_id)
+        {
+            return &pending;
+        }
+    }
+    return nullptr;
+}
+
+/** 提交一条无线 DAP 命令并登记在途条目；提交失败不占槽（主机侧自行重试） */
+void submit_wireless_command(DapTaskContext &ctx, const u8 *cmd, u16 len)
+{
+    auto &app = mlink::Application::get_instance();
+    const u8 cmd_id = (len > 0) ? cmd[0] : 0;
+
+    PendingWirelessCommand *slot = nullptr;
+    for (PendingWirelessCommand &pending : ctx.pending)
+    {
+        if (!pending.used)
+        {
+            slot = &pending;
+            break;
+        }
+    }
+    if (slot == nullptr)
+    {
+        ESP_LOGW(TAG, "no free in-flight slot, DAP cmd 0x%02X (%s) len=%u dropped", cmd_id, dap_command_name(cmd_id),
+                 static_cast<unsigned>(len));
+        return;
+    }
+
+    // 通道标记随命令送到对端：它据此回答 DAP_Info 的单包尺寸，HID 与 bulk 的
+    // 可承载命令大小不同（见 DAP_CHANNEL_*）
+    const u8 channel = (ctx.source == DapSource::Hid) ? DAP_CHANNEL_HID : DAP_CHANNEL_VENDOR_BULK;
+    const u16 req_id = ctx.next_req_id++;
+    const meaproto::SendResult result = app.wireless_link().send_dap_command(cmd, len, channel, req_id);
+    if (result != meaproto::SendResult::Ok)
+    {
+        ESP_LOGW(TAG, "cannot submit DAP cmd 0x%02X (%s) len=%u: result %u", cmd_id, dap_command_name(cmd_id),
+                 static_cast<unsigned>(len), static_cast<unsigned>(result));
+        return;
+    }
+
+    slot->used = true;
+    slot->req_id = req_id;
+    slot->cmd_id = cmd_id;
+    slot->source = ctx.source;
+    slot->request_len = len;
+    slot->sent_tick = xTaskGetTickCount();
+}
+
+/**
+ * 无线模式的响应回收：响应按请求号配回挂起命令并写回 USB，断开的在途命令与超时
+ * 命令在此销账。
+ *
+ * 销账不回响应（CMSIS-DAP 没有通用失败包），由主机那条命令自己超时重试；迟到的
+ * 响应丢弃，回写会让主机后续的响应整体错位。
+ */
+void drain_wireless_responses(DapTaskContext &ctx)
+{
+    auto &app = mlink::Application::get_instance();
+
+    // 0) 链路断开：在途命令不会再有响应（对端重启后序号基准也变了），整表清掉
+    const u32 generation = app.wireless_link().disconnect_generation();
+    if (generation != ctx.link_generation)
+    {
+        ctx.link_generation = generation;
+        for (PendingWirelessCommand &pending : ctx.pending)
+        {
+            if (!pending.used)
+            {
+                continue;
+            }
+            ESP_LOGW(TAG, "wireless DAP command req_id=%u cmd=0x%02X (%s) dropped: link disconnected", pending.req_id,
+                     pending.cmd_id, dap_command_name(pending.cmd_id));
+            pending.used = false;
+        }
+    }
+
+    // 1) 已到达的响应：按它回应的命令请求号精确配回，并按命令当初的来源通道写回
+    for (;;)
+    {
+        u16 req_id = 0;
+        u16 len = 0;
+        if (!app.wait_wireless_response(&req_id, dap_response, &len, 0))
+        {
+            break;
+        }
+
+        PendingWirelessCommand *pending = find_pending_by_req(ctx, req_id);
+        if (pending == nullptr)
+        {
+            // 命令已销账（断开/超时）或已配过：迟到的响应回写会让主机的响应流错位
+            ESP_LOGW(TAG, "stale wireless DAP response req_id=%u (%u bytes) dropped", req_id,
+                     static_cast<unsigned>(len));
+            continue;
+        }
+
+        dap_send_response(pending->source, dap_response, len);
+        app.config_channel().add_dap_command(pending->request_len, len);
+        pending->used = false;
+    }
+
+    // 2) 硬超时兜底：对端丢弃响应（超过通道上限）时不会有失败上报，只有这一道
+    const TickType_t now = xTaskGetTickCount();
+    for (PendingWirelessCommand &pending : ctx.pending)
+    {
+        if (!pending.used)
+        {
+            continue;
+        }
+        const u32 waited_ms = static_cast<u32>((now - pending.sent_tick) * portTICK_PERIOD_MS);
+        if (waited_ms < CONFIG_MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS)
+        {
+            continue;
+        }
+        ESP_LOGW(TAG, "wireless DAP command req_id=%u cmd=0x%02X (%s) len=%u timed out after %u ms, no response sent",
+                 pending.req_id, pending.cmd_id, dap_command_name(pending.cmd_id),
+                 static_cast<unsigned>(pending.request_len), static_cast<unsigned>(waited_ms));
+        pending.used = false;
+    }
+}
 
 // 执行器命令源（USB 输入，dap_executor_run 的 cmd_src）：
 // 从命令队列取一条命令（两条传输通道共用）；Wireless 模式下无线 DAP 转发不可用，
@@ -307,15 +451,31 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     auto &app = mlink::Application::get_instance();
     const bool wireless = (app.mode() == mlink::Mode::Wireless);
 
+    // 无线模式下 DAP 通道没有空位时先不取命令：让它留在队列里形成背压（队列满 →
+    // 主机 USB 写不进来自然等），取出来再丢会让主机那条命令永远等不到响应。
+    // 排空响应会释放窗口，所以这里醒来一次就够，1ms 的让出避免空转。
+    if (wireless && !app.wireless_link().can_send_dap())
+    {
+        drain_wireless_responses(ctx);
+        vTaskDelay(1);
+        return false;
+    }
+
+    // 无线模式下响应要尽快回写：没有命令可取的间隙也得醒来排空一次。1ms 的取用
+    // 超时让响应最多晚 1ms 回写，而 tick 本身就是 1ms，额外开销可忽略。
     size_t item_size = 0;
     auto item = reinterpret_cast<DapCommand *>(
-        xRingbufferReceive(ctx.usb->m_dap_command_buffer, &item_size, portMAX_DELAY));
+        xRingbufferReceive(ctx.usb->m_dap_command_buffer, &item_size, wireless ? pdMS_TO_TICKS(1) : portMAX_DELAY));
     if (item == nullptr || item_size != sizeof(DapCommand))
     {
         // 队列被写坏（长度不符）：丢弃该项，避免按错误布局解读
         if (item != nullptr)
         {
             vRingbufferReturnItem(ctx.usb->m_dap_command_buffer, item);
+        }
+        if (wireless)
+        {
+            drain_wireless_responses(ctx);
         }
         return false;
     }
@@ -331,20 +491,20 @@ bool usb_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
     // DAP_Info 上报的单包尺寸按传输通道设定：vendor bulk 受 CMSIS-DAP 单字节
     // Transfer Count 的安全上限约束（见 DAP_REPORTED_PACKET_SIZE_MAX），HID 是
     // 定长 64B 报告。主机据此决定一条命令能携带多少数据。
-    DAP_Data.packet_size = (source == DapSource::VendorBulk)
-                               ? static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX)
-                               : DAP_HID_PACKET_SIZE;
+    DAP_Data.packet_size =
+        (source == DapSource::VendorBulk) ? static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX) : DAP_HID_PACKET_SIZE;
 
     if (!dap_source_ready(source))
     {
         return false; // 通道不可用（主机未枚举完成）：丢弃
     }
 
-    // 数据流向判断：Wireless 模式下无线 DAP 转发不可用，命令丢弃；Local 模式交给
-    // 执行器本地执行。
+    // 数据流向判断：Wireless 模式 → 提交给配对 peer；Local 模式 → 交给执行器本地执行。
     if (wireless)
     {
-        return false;
+        drain_wireless_responses(ctx);
+        submit_wireless_command(ctx, buf, *len);
+        return false; // 无线路径已处理（或丢弃），无需执行
     }
 
     return true; // Local 模式：交给执行器执行
@@ -369,6 +529,7 @@ void dap_task(void *arg)
     // dap_executor.cc。
     DapTaskContext ctx = {};
     ctx.usb = reinterpret_cast<mlink::CmsisDapUsb *>(arg);
+    ctx.link_generation = mlink::Application::get_instance().wireless_link().disconnect_generation();
     mlink::dap_executor_run(usb_cmd_src, usb_resp_sink, &ctx, dap_request, sizeof(dap_request), dap_response,
                             sizeof(dap_response));
 }

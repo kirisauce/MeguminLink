@@ -538,7 +538,8 @@ void Application::consume_pending_action()
         // 参数落盘 + 立即应用。应用会换新 epoch 重置会话，对端据此重新对齐序号并
         // 采纳这份参数——参数因此不必再走那条尽力而为的中继通道。
         ArqSettings settings = {};
-        if (m_config_channel.take_link_config_draft(&settings) && m_wireless_link.arq_apply_settings(settings) == ESP_OK)
+        if (m_config_channel.take_link_config_draft(&settings) &&
+            m_wireless_link.arq_apply_settings(settings) == ESP_OK)
         {
             const esp_err_t ret = arq_settings_store(settings);
             if (ret != ESP_OK)
@@ -668,12 +669,8 @@ void Application::run()
                 {
                     m_wireless_link.peer_add(peer_mac);
                 }
-                // USB 收到的 DAP 命令已由 dap_task 转发给 peer（见 usb.cc）。
-                // 这里消费无线链路收到的帧：
-                // - DapCommand：本机是接收端（target 侧），投递给 wireless_dap
-                //   执行器（DAP_ExecuteCommand + 响应回传，见 wireless_dap.cc）；
-                // - DapResponse：本机是发送端，存入响应通道唤醒 dap_task
-                //   （dap_task 转发命令后正等待该响应并写回 USB）；
+                // 业务帧（DAP / 串口 / 配置中继）走 meaproto 通道，由 Sink 回调
+                // 直接分派（见 wireless/link.cc）。这里只消费链路层的尽力而为帧：
                 // - Ping：对端在探测本机，原样回显 token 回一帧 Pong；
                 // - Pong：对端回显本机探测，交给配置通道结算往返时延；
                 // 配对控制帧在已配对状态下不应出现，防御性忽略。
@@ -682,14 +679,6 @@ void Application::run()
                 {
                     switch (rp.packet.packet_type)
                     {
-                    case PacketType::DapCommand:
-                        // DAP 转发窗口关闭：接收路径不投递命令
-                        break;
-                    case PacketType::DapResponse: {
-                        const auto &resp = rp.packet.payload.dap_response;
-                        push_wireless_response(resp.req_id, resp.data, resp.len);
-                        break;
-                    }
                     case PacketType::Ping: {
                         // 回包在主循环任务上下文发出：ESP-NOW 接收回调只投递，
                         // 不在回调里调用发送（见 config_channel.hpp 的探测说明）

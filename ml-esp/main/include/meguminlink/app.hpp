@@ -5,8 +5,8 @@
 #include "meguminlink/config_channel.hpp"
 #include "meguminlink/nvs_flash.hpp"
 #include "meguminlink/wireless/frame.hpp"
-#include "meguminlink/wireless/pairing.hpp"
 #include "meguminlink/wireless/link.hpp"
+#include "meguminlink/wireless/pairing.hpp"
 #include "sdkconfig.h"
 
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
@@ -39,8 +39,7 @@ inline constexpr bool LOCAL_MODE_SUPPORTED = false;
  * Local：本地调试，USB CMSIS-DAP（+ UART 桥）正常工作；仅
  * LOCAL_MODE_SUPPORTED（USB 支持启用）时可达，否则强制 Wireless；
  * Wireless：无线调试，USB 设备保持启用（主机可枚举），USB 收到的
- * DAP 命令由 dap_task 打包为 DapCommand 帧无线转发到配对 peer；
- * 接收端当前仅打日志、不回响应（第一版，无 DAP 执行逻辑）。
+ * DAP 命令由 dap_task 经 DAP 通道转发到配对 peer，对端执行后按原路回响应。
  *
  * 配对（ESP-NOW 建链）是 Wireless 的子流程，统一由配对流程管理
  * （enter_pairing / leave_pairing），两个入口共用一个状态：
@@ -101,9 +100,9 @@ class Application
     };
 
     /**
-     * 主循环/接收回调调用：把收到的无线 DAP 响应连同它回应的命令请求号入队。
-     * 队列而不是单缓冲——窗口大于 1 时一次乱序补齐会连续交付多条响应，单缓冲会把
-     * 前一条覆盖掉，主机的响应流随之整体错位。
+     * 接收回调调用：把收到的无线 DAP 响应连同它回应的命令请求号入队。
+     * 队列而不是单缓冲——一次排空会连续交付多条响应，单缓冲会把前一条覆盖掉，
+     * 主机的响应流随之整体错位。
      */
     void push_wireless_response(u16 req_id, const u8 *data, u16 len);
 
@@ -156,9 +155,9 @@ class Application
     static Application &get_instance();
 
   private:
-    NvsKeyU8 m_mode_key;         /**< 模式 NVS 键（自动加载带缓存） */
+    NvsKeyU8 m_mode_key;          /**< 模式 NVS 键（自动加载带缓存） */
     NvsKeyU8 m_uart_reliable_key; /**< 串口出向可靠性 NVS 键（0=尽力而为 1=可靠） */
-    Mode m_mode;                 /**< 当前运行模式 */
+    Mode m_mode;                  /**< 当前运行模式 */
     SemaphoreHandle_t m_main_task_wake;
 
     /**

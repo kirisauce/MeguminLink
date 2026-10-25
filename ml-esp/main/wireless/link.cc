@@ -13,6 +13,12 @@
 #include <esp_mac.h>
 #include <esp_random.h>
 
+// 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 dap_executor.cc 一致）。
+// clang-format off
+#include "DAP_config.h"
+#include "DAP.h"
+// clang-format on
+
 using namespace mlink;
 
 static constexpr char TAG[] = "mlink::wireless_link";
@@ -66,7 +72,7 @@ void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
     case PacketType::UartFromTarget:
     case PacketType::UartLineCoding:
     case PacketType::RelayedUsbControl:
-        // 业务窗口：无线 DAP / 串口 / 中继转发不可用
+        // 业务类型已改走 meaproto 通道：出现在链路层属异常，忽略
         return;
     default: {
         // 配对控制帧与 Ping/Pong：经主循环驱动状态机
@@ -127,6 +133,11 @@ bool WirelessLink::connecting() const
 
 void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
 {
+    if (channel == DAP_CHANNEL)
+    {
+        handle_dap_message(data);
+        return;
+    }
     if (channel == UART_CHANNEL)
     {
         handle_uart_message(data);
@@ -137,6 +148,107 @@ void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> d
              static_cast<unsigned>(data.size()));
 }
 
+void WirelessLink::handle_dap_message(std::span<const u8> data)
+{
+    if (data.size() < DAP_WIRE_HEADER)
+    {
+        ESP_LOGW(TAG, "DAP message too short (%u bytes)", static_cast<unsigned>(data.size()));
+        return;
+    }
+
+    const u8 kind = data[0];
+    const u8 source = data[1];
+    const u16 req_id = static_cast<u16>((data[2] << 8) | data[3]);
+    const std::span<const u8> body = data.subspan(DAP_WIRE_HEADER);
+
+    if (kind == DAP_KIND_RESPONSE)
+    {
+        // 交付回调只许拷贝入队：响应由 USB 任务取走后写回主机
+        Application::get_instance().push_wireless_response(req_id, body.data(), static_cast<u16>(body.size()));
+        return;
+    }
+
+    if (m_dap_queue == nullptr || body.size() > sizeof(m_dap_post.data))
+    {
+        ESP_LOGW(TAG, "DAP command dropped (%u bytes)", static_cast<unsigned>(body.size()));
+        return;
+    }
+
+    m_dap_post.source = source;
+    m_dap_post.req_id = req_id;
+    m_dap_post.len = static_cast<u16>(body.size());
+    std::memcpy(m_dap_post.data, body.data(), body.size());
+
+    if (xQueueSend(m_dap_queue, &m_dap_post, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "DAP execute queue full, cmd 0x%02X dropped", m_dap_post.data[0]);
+    }
+}
+
+meaproto::SendResult WirelessLink::send_dap_frame(u8 kind, u8 source, u16 req_id, const u8 *data, usize len, u8 *frame)
+{
+    if (len > DAP_CHANNEL_PAYLOAD - DAP_WIRE_HEADER)
+    {
+        m_dap_too_large = m_dap_too_large + 1;
+        ESP_LOGW(TAG, "DAP payload %u exceeds channel limit %u (dropped %u)", static_cast<unsigned>(len),
+                 static_cast<unsigned>(DAP_CHANNEL_PAYLOAD - DAP_WIRE_HEADER), static_cast<unsigned>(m_dap_too_large));
+        return meaproto::SendResult::TooLarge;
+    }
+
+    frame[0] = kind;
+    frame[1] = source;
+    frame[2] = static_cast<u8>(req_id >> 8);
+    frame[3] = static_cast<u8>(req_id & 0xFF);
+    std::memcpy(frame + DAP_WIRE_HEADER, data, len);
+
+    return m_daemon.send(DAP_CHANNEL, std::span<const u8>{frame, DAP_WIRE_HEADER + len});
+}
+
+meaproto::SendResult WirelessLink::send_dap_command(const u8 *data, usize len, u8 source, u16 req_id)
+{
+    return send_dap_frame(DAP_KIND_COMMAND, source, req_id, data, len, m_dap_cmd_frame);
+}
+
+meaproto::SendResult WirelessLink::send_dap_response(const u8 *data, usize len, u16 req_id)
+{
+    return send_dap_frame(DAP_KIND_RESPONSE, 0, req_id, data, len, m_dap_rsp_frame);
+}
+
+bool WirelessLink::can_send_dap() const
+{
+    // 连接状态必须一起判：未连接时 Core 的队列照样有空位
+    return m_daemon.connected() && m_daemon.can_send(DAP_CHANNEL);
+}
+
+u32 WirelessLink::disconnect_generation() const
+{
+    return m_disconnect_generation.load(std::memory_order_relaxed);
+}
+
+void WirelessLink::dap_task_fn(void *arg)
+{
+    auto *self = static_cast<WirelessLink *>(arg);
+    DAP_Setup();
+
+    while (true)
+    {
+        if (xQueueReceive(self->m_dap_queue, &self->m_dap_exec, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+
+        DapExecuteRequest &request = self->m_dap_exec;
+        // 单包尺寸按主机的传输通道选：HID 是定长报告，vendor bulk 受 CMSIS-DAP
+        // 单字节 Transfer Count 的安全上限约束
+        DAP_Data.packet_size = (request.source == DAP_CHANNEL_VENDOR_BULK)
+                                   ? static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX)
+                                   : DAP_HID_PACKET_SIZE;
+        const u16 resp_len =
+            dap_execute_once(request.data, request.len, self->m_dap_response, sizeof(self->m_dap_response));
+        (void)self->send_dap_response(self->m_dap_response, resp_len, request.req_id);
+    }
+}
+
 void WirelessLink::on_connected()
 {
     ESP_LOGI(TAG, "meaproto connected");
@@ -144,6 +256,7 @@ void WirelessLink::on_connected()
 
 void WirelessLink::on_disconnected(meaproto::DisconnectReason reason)
 {
+    m_disconnect_generation.fetch_add(1, std::memory_order_relaxed);
     flush_uart_egress();
     ESP_LOGW(TAG, "meaproto disconnected (reason %u)", static_cast<unsigned>(reason));
 }
@@ -364,6 +477,13 @@ esp_err_t WirelessLink::init()
         return ESP_ERR_NO_MEM;
     }
 
+    m_dap_queue = xQueueCreate(DAP_EXEC_QUEUE_DEPTH, sizeof(DapExecuteRequest));
+    if (m_dap_queue == nullptr)
+    {
+        ESP_LOGE(TAG, "Failed to create wireless DAP queue");
+        return ESP_ERR_NO_MEM;
+    }
+
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     // 注入丢帧的随机序列：两端各自用 esp_random 播种，不共享序列——固定种子会
     // 让两台设备在相同帧号上同时丢帧，制造出现实里不存在的人为相关
@@ -382,6 +502,13 @@ esp_err_t WirelessLink::init()
     constexpr unsigned channel_count = static_cast<unsigned>(sizeof(CHANNELS) / sizeof(CHANNELS[0]));
     const usize storage_size = meaproto::Core::storage_bytes(channels(), LINK_CONFIG, EspNowTransport::MTU);
     ESP_LOGI(TAG, "channels %u, protocol storage %u bytes", channel_count, static_cast<unsigned>(storage_size));
+
+    // 执行任务的优先级与本地 DAP 执行器一致：SWD 位碰撞期间不可被抢占
+    if (xTaskCreate(dap_task_fn, "dap-wireless", 8192, this, 24, &m_dap_task) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create wireless DAP task");
+        return ESP_ERR_NO_MEM;
+    }
 
     m_daemon.start();
 

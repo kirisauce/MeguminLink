@@ -7,13 +7,16 @@
 #include "esp_wifi.h" // IWYU pragma: export
 #include "meaproto/config.hpp"
 #include "meaproto/daemon.hpp"
-#include "meguminlink/common.hpp"            // IWYU pragma: keep
+#include "meguminlink/common.hpp" // IWYU pragma: keep
+#include "meguminlink/dap_executor.hpp"
+#include "meguminlink/dap_frame.hpp"
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/espnow_transport.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/uart_egress.hpp"
 #include "sdkconfig.h"
 
+#include <atomic>
 #include <span>
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
@@ -74,6 +77,32 @@ inline constexpr usize UART_LINE_CODING_SIZE = 7;
  * 响应头与批量数据不会把单条消息顶出通道上限。
  */
 inline constexpr u16 DAP_CHANNEL_PAYLOAD = 1280;
+
+/**
+ * DAP 通道的载荷头：kind（命令/响应）、来源通道与请求号。
+ *
+ * 来源通道决定接收端回答 DAP_Info 时上报的单包尺寸；请求号由发送端分配、对端
+ * 原样带回，响应按它配对。头之后是裸 CMSIS-DAP 命令或响应字节。
+ */
+inline constexpr usize DAP_WIRE_HEADER = 4;
+inline constexpr u8 DAP_KIND_COMMAND = 0;
+inline constexpr u8 DAP_KIND_RESPONSE = 1;
+
+/** 无线 DAP 执行队列深度：S3 跟随 USB 命令队列深度，C3 只作接收端，取一半 */
+#if CONFIG_IDF_TARGET_ESP32C3
+inline constexpr u8 DAP_EXEC_QUEUE_DEPTH = 4;
+#else
+inline constexpr u8 DAP_EXEC_QUEUE_DEPTH = CONFIG_MEGUMINLINK_PACKET_BUFFER_DEPTH;
+#endif
+
+/** 一条待执行的无线 DAP 命令 */
+struct DapExecuteRequest
+{
+    u8 source = 0;  /**< 主机侧 USB 传输通道（DAP_CHANNEL_*） */
+    u16 req_id = 0; /**< 请求号：响应原样带回 */
+    u16 len = 0;
+    u8 data[DAP_CHANNEL_PAYLOAD - DAP_WIRE_HEADER] = {};
+};
 
 /**
  * 通道表：同一 id 的上行与下行各自维护序号与窗口，通道之间完全隔离。
@@ -153,6 +182,22 @@ class WirelessLink : private meaproto::Sink
      * 建立之前，要么本来就不该重传（探活重传会污染 RTT 判定）。
      */
     esp_err_t send(const u8 *dest_mac, const Packet &packet);
+
+    /**
+     * 提交一条 DAP 命令（发送端，USB 任务上下文）。data 是裸命令字节。
+     *
+     * 返回 Busy 时调用方应把命令留在 USB 队列里：取出来再丢，主机那条命令就等不到响应。
+     */
+    meaproto::SendResult send_dap_command(const u8 *data, usize len, u8 source, u16 req_id);
+
+    /** 回一条 DAP 响应（接收端，dap-wireless 任务上下文） */
+    meaproto::SendResult send_dap_response(const u8 *data, usize len, u16 req_id);
+
+    /** DAP 通道发送队列是否还有空位（背压用） */
+    bool can_send_dap() const;
+
+    /** 连接断开的累计次数：发送端据此判掉在途命令 */
+    u32 disconnect_generation() const;
 
     /**
      * 打包一条存活探测包并发送给已配对 peer（Ping/Pong 同构，token 由探测方
@@ -275,6 +320,15 @@ class WirelessLink : private meaproto::Sink
     void handle_frame(const u8 *src_mac, const u8 *data, usize len);
     void handle_tx_result(bool ok);
 
+    /** DAP 通道分派：命令入执行队列，响应交给 USB 侧 */
+    void handle_dap_message(std::span<const u8> data);
+
+    /** DAP 载荷组帧并提交（kind + source + req_id + 字节） */
+    meaproto::SendResult send_dap_frame(u8 kind, u8 source, u16 req_id, const u8 *data, usize len, u8 *frame);
+
+    /** 无线 DAP 执行任务：取命令、执行、回响应 */
+    static void dap_task_fn(void *arg);
+
     /** UART 通道分派：按来源标记写端口或应用线编码 */
     void handle_uart_message(std::span<const u8> data);
 
@@ -340,6 +394,19 @@ class WirelessLink : private meaproto::Sink
     u8 m_pack_frame[DAP_FRAME_MAX_SIZE] = {};
     /** 接收业务包的反序列化存储：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉交付任务的栈 */
     u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE] = {};
+
+    /** 无线 DAP：执行队列与任务独立，命令执行不拖住协议任务的 ACK 与保活 */
+    QueueHandle_t m_dap_queue = nullptr;
+    TaskHandle_t m_dap_task = nullptr;
+    DapExecuteRequest m_dap_exec = {};             /**< 执行任务独占的取件缓冲 */
+    DapExecuteRequest m_dap_post = {};             /**< 协议任务入队用的拷贝缓冲 */
+    u8 m_dap_response[DAP_MAX_RESPONSE_SIZE] = {}; /**< 执行结果 */
+    u8 m_dap_cmd_frame[DAP_CHANNEL_PAYLOAD] = {};  /**< 命令组帧（USB 任务） */
+    u8 m_dap_rsp_frame[DAP_CHANNEL_PAYLOAD] = {};  /**< 响应组帧（执行任务） */
+    /** 超过通道上限被拒的次数 */
+    volatile u32 m_dap_too_large = 0;
+    /** 断开次数：on_disconnected 递增，发送端比较它来清在途命令表 */
+    std::atomic<u32> m_disconnect_generation{0};
 
     // ---- 串口 ----
     /** 令牌桶容量：两帧 */
