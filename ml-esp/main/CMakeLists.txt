@@ -6,6 +6,7 @@ list(APPEND __src
     ${CMAKE_CURRENT_LIST_DIR}/wireless/frame.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/espnow_transport.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/link.cc
+    ${CMAKE_CURRENT_LIST_DIR}/wireless/uart_egress.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq_link.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/pairing.cc)

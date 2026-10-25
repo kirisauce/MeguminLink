@@ -132,7 +132,7 @@ class Application
 
     /**
      * 本机某个端口收到数据 → 按当前模式选路。Local：CDC 与本机 UART 直通；
-     * Wireless：转发不可用，数据丢弃。
+     * Wireless：入无线链路的出向缓冲，由主循环按额度排空。
      * 调用方：S3 侧 UART 桥任务、C3 侧 UART 桥任务。
      *
      * @param source 数据来自哪个端口（UartSource::Host / Target）
@@ -182,20 +182,26 @@ class Application
     /** 当前模式与配对状态对应的设备场景（主循环交给 LED 门面下发） */
     LedRequest led_request() const;
 
+    /** 无线模式下补读主机 CDC：出向缓冲腾出空间后把端点重新打开 */
+    static void fill_host_uart(void *ctx);
+
     /** 消费配置通道投递的动作（主循环调用；NVS/wifi/重启都只在这里做） */
     void consume_pending_action();
 
     /** 清除配对记录并重新开始配对流程（ClearPair 动作） */
     void clear_pairing();
 
+    /** 串口出向丢字节日志的限速时刻 */
+    u32 m_uart_drop_log_ms = 0;
+
     SemaphoreHandle_t m_rx_mutex;
     std::vector<ReceivedPacket> m_received_packets;
     PairingState m_pairing;
 
     /**
-     * 无线 DAP 响应队列（发送端用）：接收回调把响应连同可靠传输序号入队，
-     * dap_task 出队后按序号配回挂起的命令。深度对齐 USB 命令队列（两者都受
-     * 在途窗口约束），存不下时丢弃并告警——等待中的命令最终由超时销账。
+     * 无线 DAP 响应队列（发送端用）：接收回调把响应连同请求号入队，dap_task
+     * 出队后按请求号配回挂起的命令。深度对齐 USB 命令队列，存不下时丢弃并
+     * 告警——等待中的命令最终由超时销账。
      */
     QueueHandle_t m_wireless_response_queue = nullptr;
 

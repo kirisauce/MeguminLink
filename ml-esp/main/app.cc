@@ -32,6 +32,9 @@ namespace
  */
 constexpr u32 RESTART_DELAY_MS = 100;
 
+/** 串口出向丢字节日志的限速间隔 */
+constexpr u32 UART_DROP_LOG_INTERVAL_MS = 1000;
+
 const char *mode_to_string(Mode mode)
 {
     switch (mode)
@@ -83,6 +86,8 @@ Application::Application()
 #endif
     // 本机串口桥：驱动、两个队列与两条任务都由它自己建立，两端同一实现
     ESP_ERROR_CHECK(m_uart_bridge.init());
+    // 主机方向的补读原语：出向缓冲腾出空间后由主循环调用
+    m_wireless_link.set_host_uart_fill(&Application::fill_host_uart, this);
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -235,13 +240,53 @@ ConfigChannel &Application::config_channel()
     return m_config_channel;
 }
 
+void Application::fill_host_uart(void *ctx)
+{
+#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
+    auto *self = static_cast<Application *>(ctx);
+    if (self->m_mode != Mode::Wireless)
+    {
+        return;
+    }
+
+    auto &link = self->m_wireless_link;
+    auto &cdc = self->m_usb.cdc();
+    u8 buffer[256];
+
+    // 放不下一整块就不取：CDC FIFO 被填满后端点 NAK，把压力传回主机
+    while (link.uart_egress_space(UartSource::Host) >= sizeof(buffer))
+    {
+        const size_t n = cdc.read(buffer, sizeof(buffer));
+        if (n == 0)
+        {
+            break;
+        }
+        link.push_uart_egress(buffer, n, UartSource::Host);
+        self->m_config_channel.add_uart_wireless_tx(static_cast<u16>(n));
+    }
+#else
+    (void)ctx;
+#endif
+}
+
 void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSource source)
 {
     // 本机某个端口收到数据，按当前模式选路。路径实现各自在自己的对象里：
     // 无线在 WirelessLink、本机 UART 在 UartBridge、CDC 在 CmsisDapUsb。
     if (m_mode == Mode::Wireless)
     {
-        // 无线串口转发不可用
+        // 入队即算交给链路：真正的发出由 UART 通道负责，这里只应对缓冲满
+        const size_t queued = m_wireless_link.send_uart_data(data, len, source);
+        if (queued < len)
+        {
+            const u32 now = now_ms();
+            if (static_cast<i32>(now - m_uart_drop_log_ms) >= 0)
+            {
+                m_uart_drop_log_ms = now + UART_DROP_LOG_INTERVAL_MS;
+                ESP_LOGW(TAG, "Wireless UART: egress full, %u of %u bytes dropped", static_cast<unsigned>(len - queued),
+                         static_cast<unsigned>(len));
+            }
+        }
         return;
     }
 
@@ -266,9 +311,10 @@ void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSo
 
 void Application::route_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
-    // 与 forward_uart_data_from_port 同一套选路：Wireless 不下发，Local 直接设本机 UART。
+    // 与 forward_uart_data_from_port 同一套选路：Wireless 同步给配对 peer，Local 设本机 UART。
     if (m_mode == Mode::Wireless)
     {
+        (void)m_wireless_link.send_line_coding(baud, data_bits, stop_bits, parity);
         return;
     }
 
@@ -517,11 +563,15 @@ void Application::consume_pending_action()
 
 void Application::run()
 {
+    // 空闲节拍；串口出向有积压时缩短，令牌桶放开后立刻续发
+    constexpr u32 idle_ms = 200;
+    constexpr u32 uart_busy_ms = 2;
+    u32 wait_ms = idle_ms;
+
     while (true)
     {
         // 主循环只做"每拍一次的杂务"：可靠传输有自己的任务，不需要在这里驱动
-        constexpr u32 idle_ms = 200;
-        xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(idle_ms));
+        xSemaphoreTake(m_main_task_wake, pdMS_TO_TICKS(wait_ms));
 
         // 配置通道投递的动作先执行：模式与配对状态随之改变，LED 随后刷新
         consume_pending_action();
@@ -667,6 +717,8 @@ void Application::run()
             break;
         }
         }
+
+        wait_ms = m_wireless_link.poll_uart_egress() ? uart_busy_ms : idle_ms;
     }
 }
 

@@ -127,6 +127,12 @@ bool WirelessLink::connecting() const
 
 void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
 {
+    if (channel == UART_CHANNEL)
+    {
+        handle_uart_message(data);
+        return;
+    }
+
     ESP_LOGD(TAG, "channel %u message (%u bytes) not dispatched", static_cast<unsigned>(channel.value),
              static_cast<unsigned>(data.size()));
 }
@@ -138,7 +144,198 @@ void WirelessLink::on_connected()
 
 void WirelessLink::on_disconnected(meaproto::DisconnectReason reason)
 {
+    flush_uart_egress();
     ESP_LOGW(TAG, "meaproto disconnected (reason %u)", static_cast<unsigned>(reason));
+}
+
+void WirelessLink::handle_uart_message(std::span<const u8> data)
+{
+    if (data.empty())
+    {
+        return;
+    }
+
+    const u8 source = data[0];
+    const std::span<const u8> body = data.subspan(1);
+
+    if (source == UART_SOURCE_LINE_CODING)
+    {
+        if (body.size() != UART_LINE_CODING_SIZE)
+        {
+            ESP_LOGW(TAG, "Line coding payload of %u bytes, dropped", static_cast<unsigned>(body.size()));
+            return;
+        }
+        const u32 baud = (static_cast<u32>(body[0]) << 24) | (static_cast<u32>(body[1]) << 16) |
+                         (static_cast<u32>(body[2]) << 8) | static_cast<u32>(body[3]);
+        Application::get_instance().uart_bridge().configure(baud, body[4], body[5], body[6]);
+        return;
+    }
+
+    if (body.empty())
+    {
+        return;
+    }
+    const UartSource port = (source == UART_SOURCE_HOST) ? UartSource::Host : UartSource::Target;
+    Application::get_instance().uart_bridge().push_inbound(body.data(), body.size(), port);
+}
+
+size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
+{
+    UartEgress &egress = uart_egress(source);
+    size_t done = 0;
+
+    // 缓冲满了就等一等，让空口追上；等不到的部分丢弃，由调用方记账
+    for (u32 waited = 0; done < len && waited <= UART_PUSH_WAIT_MS; waited += UART_PUSH_WAIT_STEP_MS)
+    {
+        done += egress.push(data + done, len - done);
+        if (done == len)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(UART_PUSH_WAIT_STEP_MS));
+    }
+
+    if (done > 0)
+    {
+        notify_uart_egress();
+    }
+    return done;
+}
+
+size_t WirelessLink::uart_egress_space(UartSource source)
+{
+    return uart_egress(source).space();
+}
+
+size_t WirelessLink::push_uart_egress(const u8 *data, size_t len, UartSource source)
+{
+    return uart_egress(source).push(data, len);
+}
+
+void WirelessLink::flush_uart_egress()
+{
+    m_host_uart.flush();
+    m_target_uart.flush();
+}
+
+void WirelessLink::notify_uart_egress()
+{
+    xSemaphoreGive(Application::get_instance().main_task_wake());
+}
+
+void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
+{
+    m_host_uart_fill = fill;
+    m_host_uart_fill_ctx = ctx;
+}
+
+bool WirelessLink::poll_uart_egress()
+{
+    // 先补读：缓冲腾出空间后把 CDC 端点重新打开
+    if (m_host_uart_fill != nullptr)
+    {
+        m_host_uart_fill(m_host_uart_fill_ctx);
+    }
+
+    // 没有配对就没有落点
+    if (peer_mac_key().cached() == nullptr)
+    {
+        flush_uart_egress();
+        return false;
+    }
+
+    // 目标方向先排：它是对端串口回给主机的数据，卡住会把主机侧拖成超时
+    drain_uart_egress(m_target_uart, UartSource::Target);
+    drain_uart_egress(m_host_uart, UartSource::Host);
+    return (m_target_uart.size() + m_host_uart.size()) > 0;
+}
+
+WirelessLink::UartVerdict WirelessLink::uart_frame_verdict() const
+{
+    if (!m_daemon.connected())
+    {
+        return UartVerdict::Wait;
+    }
+    return m_daemon.can_send(UART_CHANNEL) ? UartVerdict::Send : UartVerdict::Wait;
+}
+
+bool WirelessLink::uart_tx_admit(usize len, UartSource source)
+{
+    // 最近提交过 DAP 业务就把串口额度压下来，把空口让给 DAP
+    const u32 now = now_ms();
+    u32 bytes_per_s = CONFIG_MEGUMINLINK_UART_TX_MAX_BPS / 10;
+    if ((now - m_last_dap_tx_ms) < DAP_BUSY_WINDOW_MS)
+    {
+        bytes_per_s = bytes_per_s * CONFIG_MEGUMINLINK_UART_TX_MIN_PERCENT / 100;
+    }
+
+    UartBucket &bucket = (source == UartSource::Host) ? m_uart_bucket_host : m_uart_bucket_target;
+    bool admit = false;
+    portENTER_CRITICAL(&bucket.lock);
+    const u32 elapsed = now - bucket.refill_ms;
+    if (elapsed > 0)
+    {
+        const u32 add = static_cast<u32>((static_cast<u64>(bytes_per_s) * elapsed) / 1000);
+        const u32 filled = bucket.tokens + add;
+        bucket.tokens = (filled < UART_BUCKET_CAP_BYTES) ? filled : UART_BUCKET_CAP_BYTES;
+        bucket.refill_ms = now;
+    }
+    if (bucket.tokens >= len)
+    {
+        bucket.tokens -= static_cast<u32>(len);
+        admit = true;
+    }
+    portEXIT_CRITICAL(&bucket.lock);
+    return admit;
+}
+
+void WirelessLink::drain_uart_egress(UartEgress &egress, UartSource source)
+{
+    while (true)
+    {
+        if (uart_frame_verdict() != UartVerdict::Send)
+        {
+            break;
+        }
+
+        const usize n = egress.peek(m_uart_frame + 1, UART_CHUNK);
+        if (n == 0)
+        {
+            break;
+        }
+        if (!uart_tx_admit(n, source))
+        {
+            break;
+        }
+
+        m_uart_frame[0] = (source == UartSource::Host) ? UART_SOURCE_HOST : UART_SOURCE_TARGET;
+        if (m_daemon.send(UART_CHANNEL, std::span<const u8>{m_uart_frame, n + 1}) != meaproto::SendResult::Ok)
+        {
+            break; // 这一帧留在缓冲里，下一轮再来
+        }
+
+        egress.consume(n);
+        Application::get_instance().config_channel().add_uart_wireless_tx(static_cast<u16>(n));
+    }
+}
+
+UartEgress &WirelessLink::uart_egress(UartSource source)
+{
+    return (source == UartSource::Host) ? m_host_uart : m_target_uart;
+}
+
+meaproto::SendResult WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
+{
+    u8 frame[1 + UART_LINE_CODING_SIZE] = {};
+    frame[0] = UART_SOURCE_LINE_CODING;
+    frame[1] = static_cast<u8>(baud >> 24);
+    frame[2] = static_cast<u8>(baud >> 16);
+    frame[3] = static_cast<u8>(baud >> 8);
+    frame[4] = static_cast<u8>(baud);
+    frame[5] = data_bits;
+    frame[6] = stop_bits;
+    frame[7] = parity;
+    return m_daemon.send(UART_CHANNEL, std::span<const u8>{frame, sizeof(frame)});
 }
 
 esp_err_t WirelessLink::init()

@@ -11,6 +11,7 @@
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/espnow_transport.hpp"
 #include "meguminlink/wireless/frame.hpp"
+#include "meguminlink/wireless/uart_egress.hpp"
 #include "sdkconfig.h"
 
 #include <span>
@@ -52,6 +53,19 @@ inline constexpr meaproto::ChannelId DAP_CHANNEL{1};
 inline constexpr meaproto::ChannelId UART_CHANNEL{2};
 /** 配置中继（对端的 EP0 控制请求） */
 inline constexpr meaproto::ChannelId CONFIG_CHANNEL{3};
+
+// ---- 串口 ----
+
+/** UART 通道载荷首字节的来源标记 */
+inline constexpr u8 UART_SOURCE_HOST = 0;        /**< 来自主机侧 CDC，接收端写本机 UART */
+inline constexpr u8 UART_SOURCE_TARGET = 1;      /**< 来自目标侧 UART，接收端写本机 CDC */
+inline constexpr u8 UART_SOURCE_LINE_CODING = 2; /**< 线编码，接收端应用到本机 UART */
+
+/** 一条 UART 消息的数据上限：通道上限减去来源标记 */
+inline constexpr usize UART_CHUNK = 512 - 1;
+
+/** 线编码载荷：4B 波特率（大端）+ 数据位 + 停止位 + 校验位 */
+inline constexpr usize UART_LINE_CODING_SIZE = 7;
 
 /**
  * DAP 通道的单条消息上限。
@@ -220,6 +234,38 @@ class WirelessLink : private meaproto::Sink
     /** 从 peer list 删除一个对端 peer（配对放弃/完成时归还槽位） */
     esp_err_t peer_remove(const u8 *peer_mac);
 
+    /**
+     * 端口数据入出向缓冲（UART 桥任务 / CDC 补读调用）。返回实际入队的字节数：
+     * 缓冲满时等空口追上，等不到的部分丢弃，由调用方记账。
+     */
+    size_t send_uart_data(const u8 *data, size_t len, UartSource source);
+
+    /** 出向缓冲还能装多少字节（调用方据此停读端点） */
+    size_t uart_egress_space(UartSource source);
+
+    /** 直接入队（不等待），返回写入字节数 */
+    size_t push_uart_egress(const u8 *data, size_t len, UartSource source);
+
+    /** 丢掉两条出向缓冲（断开或重配时清场） */
+    void flush_uart_egress();
+
+    /**
+     * 排空出向缓冲（主循环每轮调用）：按额度与通道空位逐帧提交，发不出去的留在
+     * 缓冲里。
+     * @return 仍有积压，调用方应尽快再来一次
+     */
+    bool poll_uart_egress();
+
+    /** 唤醒主循环排空（端口数据入队后调用） */
+    void notify_uart_egress();
+
+    /** 主机 CDC 的补读原语（缓冲腾出空间后由主循环调用） */
+    using HostUartFill = void (*)(void *ctx);
+    void set_host_uart_fill(HostUartFill fill, void *ctx);
+
+    /** 主机下发的线编码：走 UART 通道，与数据同序 */
+    meaproto::SendResult send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
+
   private:
     /** Transport 回调（C 函数指针，实例经 ctx 传入） */
     static void on_frame(void *ctx, const u8 *src_mac, const u8 *data, usize len);
@@ -228,6 +274,26 @@ class WirelessLink : private meaproto::Sink
 
     void handle_frame(const u8 *src_mac, const u8 *data, usize len);
     void handle_tx_result(bool ok);
+
+    /** UART 通道分派：按来源标记写端口或应用线编码 */
+    void handle_uart_message(std::span<const u8> data);
+
+    /** 串口帧的发送判定 */
+    enum class UartVerdict : u8
+    {
+        Send, /**< 通道有空位且已连接 */
+        Wait, /**< 通道队列满或未连接，这一帧留下轮 */
+    };
+
+    UartVerdict uart_frame_verdict() const;
+
+    /** 令牌桶准入（Host/Target 分开记账） */
+    bool uart_tx_admit(usize len, UartSource source);
+
+    /** 排空一条出向缓冲 */
+    void drain_uart_egress(UartEgress &egress, UartSource source);
+
+    UartEgress &uart_egress(UartSource source);
 
     /** 把一段已序列化的缓冲交给 ESP-NOW（退避窗口内直接丢弃） */
     esp_err_t send_frame(const u8 *dest_mac, const u8 *data, size_t len);
@@ -271,6 +337,35 @@ class WirelessLink : private meaproto::Sink
     u8 m_pack_frame[DAP_FRAME_MAX_SIZE] = {};
     /** 接收业务包的反序列化存储：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉交付任务的栈 */
     u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE] = {};
+
+    // ---- 串口 ----
+    /** 令牌桶容量：两帧 */
+    static constexpr u32 UART_BUCKET_CAP_BYTES = 2 * UART_CHUNK;
+    /** 判链路忙的窗口：这段时间内提交过 DAP 业务就让串口让路 */
+    static constexpr u32 DAP_BUSY_WINDOW_MS = 50;
+    /** 出向缓冲满时等待空口追上的上限 */
+    static constexpr u32 UART_PUSH_WAIT_MS = 100;
+    static constexpr u32 UART_PUSH_WAIT_STEP_MS = 2;
+
+    /** 串口出向令牌桶：桶小才能把突发摊平到毫秒级 */
+    struct UartBucket
+    {
+        portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
+        u32 tokens = UART_BUCKET_CAP_BYTES;
+        u32 refill_ms = 0;
+    };
+
+    UartEgress m_host_uart;          /**< 主机方向出向缓冲 */
+    UartEgress m_target_uart;        /**< 目标方向出向缓冲 */
+    UartBucket m_uart_bucket_host;   /**< 主机方向额度 */
+    UartBucket m_uart_bucket_target; /**< 目标方向额度 */
+    /** 最近一次提交 DAP 业务包的时刻：串口准入据此给 DAP 让路 */
+    volatile u32 m_last_dap_tx_ms = 0;
+    /** 主机 CDC 补读原语 */
+    HostUartFill m_host_uart_fill = nullptr;
+    void *m_host_uart_fill_ctx = nullptr;
+    /** 串口组帧缓冲（主循环单线程） */
+    u8 m_uart_frame[512] = {};
     /**
      * 当前 ESP-NOW 发送速率档位。只由主循环写（set_wifi_rate / poll），
      * 读取方（配置通道 GetConfig）在 EP0 上下文。
