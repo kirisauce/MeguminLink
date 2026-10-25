@@ -132,22 +132,12 @@ class Application
 
     /**
      * 本机某个端口收到数据 → 按当前模式选路。Local：CDC 与本机 UART 直通；
-     * Wireless：交给出向缓冲（配对、准入与逐帧发送都在链路侧完成）。
-     * 调用方：S3 侧 CDC RX 回调与 UART 桥任务、C3 侧 UART 桥任务。
+     * Wireless：转发不可用，数据丢弃。
+     * 调用方：S3 侧 UART 桥任务、C3 侧 UART 桥任务。
      *
-     * @param source 数据来自哪个端口，决定帧类型：UartSource::Host 来自本机 CDC、
-     *               对端据此写它的 UART TX；UartSource::Target 来自本机 UART、
-     *               对端据此写它的 CDC
+     * @param source 数据来自哪个端口（UartSource::Host / Target）
      */
     void forward_uart_data_from_port(const u8 *data, size_t len, UartSource source);
-
-    /**
-     * 无线收到对端串口帧 → 写本机端口（recv_cb 直通调用）。
-     *
-     * 与 forward_uart_data_from_port 方向相反，参数含义也不同：这里的 source 是**对端**把它
-     * 当作哪个端口的数据，决定本机写 UART TX 还是写 CDC。
-     */
-    void forward_uart_data_from_wireless(const u8 *data, size_t len, UartSource source);
 
     /**
      * 本机串口线编码变化 → 按当前模式选路。Local：直接设本机 UART；
@@ -189,14 +179,6 @@ class Application
     /** 按当前模式应用系统行为（USB 启用/禁用）；构造与 set_mode 复用 */
     void apply_mode();
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    /**
-     * 无线出向的数据来处（注册给 WirelessLink 的空闲钩子）：把 CDC 收到的字节
-     * 搬进出向缓冲。缓冲放不下一整块就停手，端点 NAK 反压主机。
-     */
-    static void fill_host_uart(void *ctx);
-#endif
-
     /** 当前模式与配对状态对应的设备场景（主循环交给 LED 门面下发） */
     LedRequest led_request() const;
 
@@ -237,10 +219,7 @@ class Application
     /** 本机串口桥（UART ↔ 对侧：无线，或 Local 模式下的主机 CDC）；两端同一实现 */
     UartBridge m_uart_bridge;
 
-    /** 串口出向缓冲满的日志限速时刻（下载突发会连续满，逐块报会把日志刷满） */
-    u32 m_uart_drop_log_ms = 0;
-
-    /** 无线链路（ESP-NOW 传输 + peer 管理 + 无线侧 DAP 执行接线，见 wireless/link.hpp） */
+    /** 无线链路（ESP-NOW 传输 + peer 管理，见 wireless/link.hpp） */
     WirelessLink m_wireless_link;
 
     /** 配置/遥测通道（统计计数器 + EP0 厂商请求处理，见 config_channel.hpp） */

@@ -207,12 +207,6 @@ class ConfigChannel
      */
     bool take_usb_config_draft(UsbCapabilitySettings *settings);
 
-    /**
-     * 把一条本机刚接受的配置命令原样转发给对端执行（无 USB 侧的设置下发
-     * 通路）。尽力而为：未配对或发送失败只记日志——本机设置已经生效，
-     * 重新下发一次即可补偿。
-     */
-    void relay_to_peer(u8 cmd, u8 arg);
 #endif
 
   private:

@@ -8,7 +8,6 @@ list(APPEND __src
     ${CMAKE_CURRENT_LIST_DIR}/wireless/link.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/arq_link.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/uart_egress.cc
     ${CMAKE_CURRENT_LIST_DIR}/wireless/pairing.cc)
 
 # 本机串口桥（UART <-> 无线；Local 模式下 UART <-> 主机 CDC）：两端共用一份实现，

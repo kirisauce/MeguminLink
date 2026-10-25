@@ -781,8 +781,7 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
         // 方向跟不上（命令没进执行队列的计数在最后一个）
         p += tlv_u32(m_response + p, TAG_ARQ_TX_DROPPED, arq.tx_dropped);
         p += tlv_u32(m_response + p, TAG_ARQ_RX_DROPPED, arq.rx_dropped);
-        p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED,
-                     Application::get_instance().wireless_link().cmd_queue_dropped());
+        p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED, 0);
     }
 
     // 对端存活探测结果：online 是最近一次的结论，ok/fail 是累计计数（上位机
@@ -812,8 +811,8 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_UART_DATA_BITS, stats.uart_data_bits);
     p += tlv_u8(m_response + p, TAG_UART_STOP_BITS, stats.uart_stop_bits);
     p += tlv_u8(m_response + p, TAG_UART_PARITY, stats.uart_parity);
-    p += tlv_u8(m_response + p, TAG_UART_RELIABLE,
-                Application::get_instance().wireless_link().uart_reliable() ? 1 : 0);
+    // 串口出向当前不走可靠传输
+    p += tlv_u8(m_response + p, TAG_UART_RELIABLE, 0);
     p += tlv_u32(m_response + p, TAG_UPTIME, static_cast<u32>(esp_timer_get_time() / 1000));
 
     return finish_response(cmd, seq, p);
@@ -1184,28 +1183,6 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
     const u8 arg = static_cast<u8>(request->wValue >> 8);
     const u8 seq = static_cast<u8>(request->wIndex & 0xFF);
 
-    // 需要两端一致的命令先转发给对端，再走本机：转发帧因此走当前（仍然可用的）
-    // 链路参数，不会出现"本机已切到问题档位、转发帧随即丢失"的两端不一致
-    if (cmd == static_cast<u8>(Cmd::SetWifiRate) && mlink::wifi_rate_supported(arg))
-    {
-        relay_to_peer(cmd, arg);
-    }
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    // 丢包注入只在发送端生效：两端必须各自持有同一个值，只改一端只降单方向的
-    // 链路质量。转发帧本身是 RelayedUsbControl，不在注入白名单里，因此丢包率
-    // 开到上限也永远改得回来。
-    else if (cmd == static_cast<u8>(Cmd::SetLoss) && arg <= mlink::MAX_LOSS_PERMILLE)
-    {
-        relay_to_peer(cmd, arg);
-    }
-#endif
-    // 串口出向的可靠性是两端各自的选择，但两端必须一致：只改一端就会出现"下载走
-    // 可靠、回包走尽力而为"的半可靠链路，吞吐与丢帧现象无法归因
-    else if (cmd == static_cast<u8>(Cmd::SetUartReliable) && arg <= 1)
-    {
-        relay_to_peer(cmd, arg);
-    }
-
     u16 len = dispatch_control(cmd, arg, seq);
     if (len > request->wLength)
     {
@@ -1213,33 +1190,6 @@ bool ConfigChannel::handle_control(u8 rhport, u8 stage, const tusb_control_reque
     }
     tud_control_xfer(rhport, request, m_response, len);
     return true;
-}
-
-void ConfigChannel::relay_to_peer(u8 cmd, u8 arg)
-{
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr)
-    {
-        ESP_LOGW(TAG, "No paired peer: command 0x%02X applied locally only", cmd);
-        return;
-    }
-
-    // 原样复刻主机那条控制请求：命令码与参数在 wValue、seq 在 wIndex，没有载荷
-    payload::RelayedUsbControl relay = {};
-    relay.len = 0;
-    relay.bm_request_type = CONTROL_DIR_IN;
-    relay.b_request = VENDOR_CODE;
-    relay.w_value = static_cast<u16>(cmd) | (static_cast<u16>(arg) << 8);
-    relay.w_index = 0;
-    relay.w_length = 0;
-    relay.data = nullptr;
-
-    const esp_err_t ret = Application::get_instance().wireless_link().send_relayed_usb_control(peer_mac, relay);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Failed to relay command 0x%02X to " MACSTR ": %s", cmd, MAC2STR(peer_mac),
-                 esp_err_to_name(ret));
-    }
 }
 
 #endif // CONFIG_MEGUMINLINK_USB_SUPPORT

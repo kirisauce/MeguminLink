@@ -32,9 +32,6 @@ namespace
  */
 constexpr u32 RESTART_DELAY_MS = 100;
 
-/** 串口出向缓冲满的日志间隔：缓冲满时每一块数据都会触发一次告警 */
-constexpr u32 UART_DROP_LOG_INTERVAL_MS = 1000;
-
 const char *mode_to_string(Mode mode)
 {
     switch (mode)
@@ -86,12 +83,6 @@ Application::Application()
 #endif
     // 本机串口桥：驱动、两个队列与两条任务都由它自己建立，两端同一实现
     ESP_ERROR_CHECK(m_uart_bridge.init());
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-    // 无线出向的数据来处：链路层的空闲钩子回头从 CDC 取字节，链路层不直接依赖 USB
-    m_wireless_link.set_host_uart_fill(&Application::fill_host_uart, this);
-#endif
-    // 串口出向可靠性：与模式无关的链路行为，随上电恢复（出厂默认开）
-    m_wireless_link.set_uart_reliable(m_uart_reliable_key.get() != 0);
 #if CONFIG_MEGUMINLINK_MODE_SWITCH_ENABLE
     ESP_ERROR_CHECK(m_button.init(static_cast<gpio_num_t>(CONFIG_MEGUMINLINK_MODE_SWITCH_GPIO)));
 #endif
@@ -114,12 +105,6 @@ void Application::set_mode(Mode new_mode)
     }
 
     m_mode = new_mode; // 先更新状态：apply_mode 按新模式应用系统行为
-
-    // 离开 Wireless 时清空两条出向缓冲：残留字节不能跨模式发出去
-    if (new_mode != Mode::Wireless)
-    {
-        m_wireless_link.flush_uart_egress();
-    }
 
     // 配对是 Wireless 子流程：离开 Wireless 即终止配对（切回时未配对会重新自动进入）
     if (new_mode != Mode::Wireless && m_pairing_active)
@@ -250,51 +235,13 @@ ConfigChannel &Application::config_channel()
     return m_config_channel;
 }
 
-#if CONFIG_MEGUMINLINK_USB_SUPPORT && CONFIG_MEGUMINLINK_USB_UART_BRIDGE_ENABLE
-void Application::fill_host_uart(void *ctx)
-{
-    auto *self = static_cast<Application *>(ctx);
-    if (self->m_mode != Mode::Wireless)
-    {
-        return;
-    }
-
-    auto &link = self->m_wireless_link;
-    auto &cdc = self->m_usb.cdc();
-    u8 buffer[256];
-
-    // 放不下一整块就不取：CDC FIFO 会被填满，端点 NAK 把压力传回主机
-    while (link.uart_egress_space(UartSource::Host) >= sizeof(buffer))
-    {
-        const size_t n = cdc.read(buffer, sizeof(buffer));
-        if (n == 0)
-        {
-            break;
-        }
-        link.push_uart_egress(buffer, n, UartSource::Host);
-        self->m_config_channel.add_uart_wireless_tx(static_cast<u16>(n));
-    }
-}
-#endif
-
 void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSource source)
 {
     // 本机某个端口收到数据，按当前模式选路。路径实现各自在自己的对象里：
     // 无线在 WirelessLink、本机 UART 在 UartBridge、CDC 在 CmsisDapUsb。
     if (m_mode == Mode::Wireless)
     {
-        // 入队即算交给链路：真正的发出与重传由 ARQ 任务负责，这里只应对缓冲满
-        const size_t queued = m_wireless_link.send_uart_data(data, len, source);
-        if (queued < len)
-        {
-            const u32 now = now_ms();
-            if (static_cast<i32>(now - m_uart_drop_log_ms) >= 0)
-            {
-                m_uart_drop_log_ms = now + UART_DROP_LOG_INTERVAL_MS;
-                ESP_LOGW(TAG, "Wireless UART: egress buffer full, %u of %u bytes dropped",
-                         static_cast<unsigned>(len - queued), static_cast<unsigned>(len));
-            }
-        }
+        // 无线串口转发不可用
         return;
     }
 
@@ -317,23 +264,11 @@ void Application::forward_uart_data_from_port(const u8 *data, size_t len, UartSo
 #endif
 }
 
-void Application::forward_uart_data_from_wireless(const u8 *data, size_t len, UartSource source)
-{
-    // 无线来的帧：写本机端口。recv_cb 跑在 esp_wifi 任务上下文，而写 UART 会
-    // 阻塞，所以桥只做一次拷贝入队，真正的写入在它自己的 tx 任务里。
-    m_uart_bridge.push_inbound(data, len, source);
-}
-
 void Application::route_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
 {
-    // 与 forward_uart_data_from_port 同一套选路：Wireless 同步给对端，Local 直接设本机 UART。
+    // 与 forward_uart_data_from_port 同一套选路：Wireless 不下发，Local 直接设本机 UART。
     if (m_mode == Mode::Wireless)
     {
-        const esp_err_t ret = m_wireless_link.send_line_coding(baud, data_bits, stop_bits, parity);
-        if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND)
-        {
-            ESP_LOGW(TAG, "Wireless UART: failed to send line coding: %s", esp_err_to_name(ret));
-        }
         return;
     }
 
@@ -479,8 +414,6 @@ void Application::consume_pending_action()
         }
         (void)m_mode_key.erase();
         (void)m_uart_reliable_key.erase();
-        // 串口可靠性是有出厂默认值的偏好项：擦掉记录后运行态也要回到默认
-        m_wireless_link.set_uart_reliable(UART_RELIABLE_DEFAULT != 0);
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
         (void)usb_capability_erase();
 #endif
@@ -548,7 +481,6 @@ void Application::consume_pending_action()
     case ConfigChannel::Action::SetUartReliable: {
         // 串口出向是否走可靠传输：立即生效并落盘，缓冲里的字节按新选择继续发
         const bool reliable = (arg != 0);
-        m_wireless_link.set_uart_reliable(reliable);
         const esp_err_t ret = m_uart_reliable_key.set(static_cast<u8>(reliable ? 1 : 0));
         if (ret != ESP_OK)
         {
@@ -722,7 +654,6 @@ void Application::run()
                     case PacketType::Pong: {
                         // 任何 Pong 都说明链路双向可用：熔断中的发送侧据此自愈
                         // （熔断期的探针 Ping 也走这里，token 由配置通道自行判弃）
-                        m_wireless_link.notify_link_alive();
                         m_config_channel.on_pong(rp.src_mac, rp.packet.payload.pong.token);
                         break;
                     }

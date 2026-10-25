@@ -13,31 +13,12 @@
 #include <esp_mac.h>
 #include <esp_random.h>
 
-// 注意 include 顺序：DAP_config.h 必须先于 DAP.h（与 usb.cc 一致）。
-// DAP_config.h 提供 DELAY_SLOW_CYCLES/PIN_DELAY_SLOW 等平台实现，
-// DAP.h 仅在未定义时提供默认值（#ifndef 保护）；顺序反了会触发宏重定义。
-// clang-format 的字典序排序会把它们排反，此处保持顺序：
-// clang-format off
-#include "DAP_config.h" // DAP_PACKET_SIZE（命令长度上限/请求缓冲）
-#include "DAP.h" // IWYU pragma: keep
-// clang-format on
-
 using namespace mlink;
 
 static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/**
- * 无线侧 DAP 执行器：命令队列深度。
- *
- * 可靠传输的 ACK 只代表"帧到了"，不代表"执行完了"：发送端窗口一释放就继续发，
- * 而本端执行是串行的，队列会以"发送速率 - 执行速率"的差值持续积压，满了就只能
- * 丢命令（那条命令的响应永远不会产生，主机侧表现为超时）。深度按一次连续写入的
- * 最大积压预留——96KB 写入实测峰值约 29 条。
- */
-constexpr size_t DAP_QUEUE_DEPTH = 32;
-
 } // namespace
 
 bool mlink::wifi_rate_supported(u8 rate)
@@ -76,44 +57,19 @@ void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
         return;
     }
 
-    // 交付回调必须只做非阻塞的事：它跑在 esp_wifi 任务里。需要碰驱动的操作
-    //（速率、线编码）因此只登记，留给主循环 poll()。
+    // 交付回调必须只做非阻塞的事：它跑在 esp_wifi 任务里
     switch (packet.packet_type)
     {
     case PacketType::DapCommand:
-        // 业务窗口：DAP 转发不可用
-        return;
-    case PacketType::DapResponse: {
-        const auto &resp = packet.payload.dap_response;
-        Application::get_instance().push_wireless_response(resp.req_id, resp.data, resp.len);
-        return;
-    }
+    case PacketType::DapResponse:
     case PacketType::UartFromHost:
-    case PacketType::UartFromTarget: {
-        const auto &uart = packet.payload.uart_data;
-        const UartSource source =
-            (packet.packet_type == PacketType::UartFromHost) ? UartSource::Host : UartSource::Target;
-        Application::get_instance().forward_uart_data_from_wireless(uart.data, uart.len, source);
+    case PacketType::UartFromTarget:
+    case PacketType::UartLineCoding:
+    case PacketType::RelayedUsbControl:
+        // 业务窗口：无线 DAP / 串口 / 中继转发不可用
         return;
-    }
-    case PacketType::UartLineCoding: {
-        const auto &lc = packet.payload.uart_line_coding;
-        portENTER_CRITICAL(&m_line_coding_lock);
-        m_pending_line_coding.baud = lc.baud;
-        m_pending_line_coding.data_bits = lc.data_bits;
-        m_pending_line_coding.stop_bits = lc.stop_bits;
-        m_pending_line_coding.parity = lc.parity;
-        m_line_coding_pending = true;
-        portEXIT_CRITICAL(&m_line_coding_lock);
-        return;
-    }
-    case PacketType::RelayedUsbControl: {
-        const auto &relay = packet.payload.relayed_usb_control;
-        Application::get_instance().config_channel().on_relayed_control(relay);
-        return;
-    }
     default: {
-        // 配对控制帧与 Ping/Pong：维持经主循环统一驱动状态机的原路径
+        // 配对控制帧与 Ping/Pong：经主循环驱动状态机
         ReceivedPacket rp = {};
         std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
         rp.packet = packet;
@@ -179,34 +135,8 @@ esp_err_t WirelessLink::init()
     transport.set_rx_observer_callback(&WirelessLink::on_rx_stats, this);
     transport.set_tx_result_callback(&WirelessLink::on_tx_result, this);
 
-    // 无线侧 DAP 执行器：命令队列 + 高优先级任务（收到 DapCommand → 执行 → 回发）
-    m_dap_queue = xQueueCreate(DAP_QUEUE_DEPTH, sizeof(DapExecuteRequest));
-    if (m_dap_queue == nullptr)
-    {
-        ESP_LOGE(TAG, "Failed to create DAP command queue");
-        ret = ESP_ERR_NO_MEM;
-        goto err;
-    }
-
-    // 优先级 24（> esp_wifi 任务 23）：单核（ESP32-C3）上保证 SWD 位碰撞
-    // 执行期间不被任务抢占（抢占会破坏 SWCLK 时序，见 usb.cc 注释）；
-    // 任务平时阻塞在队列接收上，不占用 CPU，短暂最高优先级无害。
-    // 栈 8192：DAP 执行调用链（DAP_ExecuteCommand 等）全在栈上跑，命令与响应
-    // 缓冲已经挪到对象成员，这里留的是执行链本身与余量（水位见 GetStats 0x83）。
-    if (xTaskCreate(dap_task_fn, "dap-wireless", 8192, this, 24, &m_dap_task) != pdPASS)
-    {
-        ESP_LOGE(TAG, "Failed to create wireless DAP executor task");
-        vQueueDelete(m_dap_queue);
-        m_dap_queue = nullptr;
-        ret = ESP_ERR_NO_MEM;
-        goto err;
-    }
-
     m_initialized = true;
     return ESP_OK;
-
-err:
-    return ret;
 }
 
 esp_err_t WirelessLink::peer_add(const u8 *peer_mac)
@@ -336,21 +266,6 @@ void WirelessLink::poll()
         // 只应用不回传：回传会让两端互相触发
         (void)set_wifi_rate(rate);
     }
-
-    // 2) 交付路径登记下来的线编码参数：configure 会调 UART 驱动，只登记、在这里应用。
-    portENTER_CRITICAL(&m_line_coding_lock);
-    const bool coding_pending = m_line_coding_pending;
-    const PendingLineCoding coding = m_pending_line_coding;
-    m_line_coding_pending = false;
-    portEXIT_CRITICAL(&m_line_coding_lock);
-    if (coding_pending)
-    {
-        Application::get_instance().uart_bridge().configure(coding.baud, coding.data_bits, coding.stop_bits,
-                                                            coding.parity);
-    }
-
-    // 3) 串口出向缓冲
-    poll_uart_egress();
 }
 
 esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
@@ -420,38 +335,6 @@ esp_err_t WirelessLink::send_frame(const u8 *dest_mac, const u8 *data, size_t le
     return send_ret;
 }
 
-bool WirelessLink::uart_tx_admit(size_t len, UartSource source)
-{
-    // 链路正忙就压低串口额度，把空口让给 DAP。判据是"最近提交过 DAP 业务包"的
-    // 时间戳：准入跑在每一帧串口数据上，不能在那里取锁。
-    const u32 now = now_ms();
-    u32 bytes_per_s = CONFIG_MEGUMINLINK_UART_TX_MAX_BPS / 10;
-    if ((now - m_last_dap_tx_ms) < DAP_BUSY_WINDOW_MS)
-    {
-        bytes_per_s = bytes_per_s * CONFIG_MEGUMINLINK_UART_TX_MIN_PERCENT / 100;
-    }
-
-    UartBucket &bucket = (source == UartSource::Host) ? m_uart_bucket_host : m_uart_bucket_target;
-    bool admit = false;
-    portENTER_CRITICAL(&bucket.lock);
-    const u32 elapsed = now - bucket.refill_ms;
-    if (elapsed > 0)
-    {
-        const u32 add = static_cast<u32>((static_cast<u64>(bytes_per_s) * elapsed) / 1000);
-        const u32 filled = bucket.tokens + add;
-        bucket.tokens = (filled < UART_BUCKET_CAP_BYTES) ? filled : UART_BUCKET_CAP_BYTES;
-        bucket.refill_ms = now;
-    }
-    if (bucket.tokens >= len)
-    {
-        bucket.tokens -= static_cast<u32>(len);
-        admit = true;
-    }
-    portEXIT_CRITICAL(&bucket.lock);
-
-    return admit;
-}
-
 bool WirelessLink::espnow_backoff_active(u32 now) const
 {
     return static_cast<i32>(m_espnow_backoff_until_ms - now) > 0;
@@ -500,163 +383,6 @@ void WirelessLink::clear_espnow_backoff(u32 now)
     portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
-esp_err_t WirelessLink::send_dap_command(const u8 *, const u8 *, size_t, u8, u16, u16 *)
-{
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-esp_err_t WirelessLink::send_dap_response(const u8 *, const u8 *, size_t, u16, u16)
-{
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-esp_err_t WirelessLink::send_uart_frame(const u8 *, size_t, UartSource, ArqLink::Reliability)
-{
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
-{
-    // 调用方必须是能睡的端口任务（UART 桥）：排在缓冲里的字节由主循环排空。
-    UartEgress &egress = uart_egress(source);
-    size_t done = 0;
-
-    // 目标一侧没有流控（CDC 那侧靠端点 NAK 反压）：缓冲满了就等一等，让空口追上，
-    // 等不到的才丢——屏幕回包里的确认丢一条就会让主机侧白等到超时。
-    for (u32 waited_ms = 0; done < len && waited_ms <= UART_PUSH_WAIT_MS; waited_ms += UART_PUSH_WAIT_STEP_MS)
-    {
-        done += egress.push(data + done, len - done);
-        if (done == len)
-        {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(UART_PUSH_WAIT_STEP_MS));
-    }
-
-    return done;
-}
-
-size_t WirelessLink::uart_egress_space(UartSource source)
-{
-    return uart_egress(source).space();
-}
-
-size_t WirelessLink::push_uart_egress(const u8 *data, size_t len, UartSource source)
-{
-    return uart_egress(source).push(data, len);
-}
-
-void WirelessLink::flush_uart_egress()
-{
-    m_host_uart.flush();
-    m_target_uart.flush();
-}
-
-void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
-{
-    m_host_uart_fill = fill;
-    m_host_uart_fill_ctx = ctx;
-}
-
-void WirelessLink::notify_uart_egress()
-{
-}
-
-bool WirelessLink::uart_reliable() const
-{
-    return m_uart_reliable;
-}
-
-void WirelessLink::set_uart_reliable(bool reliable)
-{
-    m_uart_reliable = reliable;
-    ESP_LOGI(TAG, "UART egress reliability %s", reliable ? "on" : "off");
-}
-
-UartEgress &WirelessLink::uart_egress(UartSource source)
-{
-    return (source == UartSource::Host) ? m_host_uart : m_target_uart;
-}
-
-void WirelessLink::poll_uart_egress()
-{
-    // 先补读：缓冲腾出空间后把 CDC 端点重新打开
-    if (m_host_uart_fill != nullptr)
-    {
-        m_host_uart_fill(m_host_uart_fill_ctx);
-    }
-
-    // 没有配对就没有落点：丢掉两条缓冲，重新配对后从新字节开始
-    if (peer_mac_key().cached() == nullptr)
-    {
-        flush_uart_egress();
-        return;
-    }
-
-    // 目标方向先排：它是对端串口回给主机的确认与数据，卡住它等于把主机侧拖成超时，
-    // 而主机方向的下载突发本来就有缓冲兜着
-    drain_uart_egress(m_target_uart, UartSource::Target);
-    drain_uart_egress(m_host_uart, UartSource::Host);
-}
-
-WirelessLink::UartVerdict WirelessLink::uart_frame_verdict() const
-{
-    return UartVerdict::Unreliable;
-}
-
-void WirelessLink::drain_uart_egress(UartEgress &egress, UartSource source)
-{
-    u8 frame[MAX_UART_PAYLOAD_SIZE];
-
-    while (true)
-    {
-        const size_t n = egress.peek(frame, sizeof(frame));
-        if (n == 0)
-        {
-            break;
-        }
-
-        const UartVerdict verdict = uart_frame_verdict();
-        if (verdict == UartVerdict::Wait)
-        {
-            // 让路只是暂缓：这一帧留在缓冲里，下一轮再看，满了照样反压主机
-            break;
-        }
-        const ArqLink::Reliability reliability =
-            (verdict == UartVerdict::Reliable) ? ArqLink::Reliability::Reliable : ArqLink::Reliability::Unreliable;
-
-        // 额度不足或驱动暂时发不出去：这一帧留在缓冲里，下一轮接着来
-        if (!uart_tx_admit(n, source))
-        {
-            break;
-        }
-        if (send_uart_frame(frame, n, source, reliability) != ESP_OK)
-        {
-            break;
-        }
-
-        egress.consume(n);
-    }
-}
-
-esp_err_t WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity)
-{
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr)
-    {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    Packet packet;
-    packet.packet_type = PacketType::UartLineCoding;
-    auto &content = packet.payload.uart_line_coding;
-    content.baud = baud;
-    content.data_bits = data_bits;
-    content.stop_bits = stop_bits;
-    content.parity = parity;
-    return send(peer_mac, packet);
-}
-
 esp_err_t WirelessLink::send_ping(const u8 *dest_mac, u32 token)
 {
     Packet packet;
@@ -672,107 +398,6 @@ esp_err_t WirelessLink::send_pong(const u8 *dest_mac, u32 token)
     packet.payload.pong.token = token;
     return send(dest_mac, packet);
 }
-
-esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const payload::RelayedUsbControl &req)
-{
-    if (req.len > payload::MAX_RELAYED_CONTROL_PAYLOAD || (req.len > 0 && req.data == nullptr))
-    {
-        ESP_LOGE(TAG, "Relayed control payload invalid (len %u, max %u)", static_cast<unsigned>(req.len),
-                 static_cast<unsigned>(payload::MAX_RELAYED_CONTROL_PAYLOAD));
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // Packet 为指针视图：载荷指向调用方缓冲，零拷贝
-    Packet packet;
-    packet.packet_type = PacketType::RelayedUsbControl;
-    packet.payload.relayed_usb_control = req;
-    return send(dest_mac, packet);
-}
-
-esp_err_t WirelessLink::submit_dap_command(const u8 *, size_t, u8, u16, u16 *)
-{
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-bool WirelessLink::take_failed_command(u16 *)
-{
-    return false;
-}
-
-bool WirelessLink::can_submit_command()
-{
-    return false;
-}
-
-// ---- 无线侧 DAP 执行接线 ----
-// 与 usb.cc 的 dap_task 对称：无线传输层负责把收到的 DapCommand 交给公共
-// 执行器（dap_executor_run）执行，并把结果以 DapResponse 帧回发给来源。
-// 执行循环、DAP_Setup 与命令日志均在 dap_executor.cc，这里只有队列、
-// 任务与输入/输出回调；状态全在 WirelessLink 对象内。
-
-bool WirelessLink::dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg)
-{
-    auto *link = static_cast<WirelessLink *>(arg);
-
-    // 落点是对象成员而不是局部变量：这条命令约 1.4 KB，放在栈上会占掉 4096
-    // 字节任务栈的三分之一，而下面还要跑 DAP_ExecuteCommand 的整条调用链。
-    // 本函数只由 dap-wireless 任务调用，单线程访问该成员。
-    DapExecuteRequest &req = link->m_dap_pending;
-    if (xQueueReceive(link->m_dap_queue, &req, portMAX_DELAY) != pdTRUE)
-    {
-        return false;
-    }
-
-    if (req.len > buf_cap)
-    {
-        // 防御：命令不得超过执行器请求缓冲（DAP_MAX_REQUEST_SIZE）
-        ESP_LOGW(TAG, "DAP command too large (%u bytes, cap %u), dropped", static_cast<unsigned>(req.len),
-                 static_cast<unsigned>(buf_cap));
-        return false;
-    }
-    std::memcpy(buf, req.data, req.len);
-    *len = req.len;
-    std::memcpy(link->m_dap_src_mac, req.src_mac, ESP_NOW_ETH_ALEN);
-    link->m_dap_cmd_seq = req.cmd_seq;
-    link->m_dap_req_id = req.req_id;
-
-    // DAP_Info 上报的单包尺寸按命令来源通道给：HID 是定长 64B 报告，只有 vendor
-    // bulk 才用得上 1274B 这个安全上限（见 DAP_REPORTED_PACKET_SIZE_MAX）。混用会
-    // 让主机按 1274 构造装不进 64B 报告的命令——那正是 DAP_TransferBlock 被截断、
-    // 执行器判长度不足而回 Invalid 的原因。
-    DAP_Data.packet_size = (req.channel == DAP_CHANNEL_HID) ? DAP_HID_PACKET_SIZE
-                                                            : static_cast<u16>(DAP_REPORTED_PACKET_SIZE_MAX);
-    return true;
-}
-
-void WirelessLink::dap_resp_sink(const u8 *data, u16 len, void *arg)
-{
-    auto *link = static_cast<WirelessLink *>(arg);
-
-    // 响应按最近一条命令的请求号回发；DAP 窗口关闭期间这里只会拿到不支持。
-    const esp_err_t ret =
-        link->send_dap_response(link->m_dap_src_mac, data, len, link->m_dap_req_id, link->m_dap_cmd_seq);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to send DAP response: %s", esp_err_to_name(ret));
-    }
-}
-
-void WirelessLink::dap_task_fn(void *arg)
-{
-    auto *link = static_cast<WirelessLink *>(arg);
-    // 复用公共执行器：取命令（无线队列）→ 执行 → 响应回发；
-    // 命令/响应缓冲用对象成员（不占任务栈，见 dap_executor.hpp）
-    dap_executor_run(WirelessLink::dap_cmd_src, WirelessLink::dap_resp_sink, arg, link->m_dap_request,
-                     sizeof(link->m_dap_request), link->m_dap_response, sizeof(link->m_dap_response));
-}
-
-u32 WirelessLink::cmd_queue_dropped() const
-{
-    return m_cmd_queue_dropped;
-}
-
-// ---- 设置与查询 ----
 
 bool WirelessLink::arq_established() const
 {
@@ -799,8 +424,3 @@ bool WirelessLink::arq_take_settings_dirty()
 {
     return false;
 }
-
-void WirelessLink::notify_link_alive()
-{
-}
-

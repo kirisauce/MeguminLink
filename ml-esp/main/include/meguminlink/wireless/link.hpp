@@ -8,7 +8,6 @@
 #include "meguminlink/common.hpp"       // IWYU pragma: keep
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/frame.hpp"
-#include "meguminlink/wireless/uart_egress.hpp"
 #include "sdkconfig.h"
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
@@ -18,23 +17,6 @@
 
 namespace mlink
 {
-/**
- * 一条待执行的 DAP 命令：命令来源（响应回发）+ 可靠传输序号 + 原样命令字节流。
- *
- * 约 1.4 KB，而且是"从命令队列取一条命令"的落点——它必须是对象成员，不能是
- * dap-wireless 任务里的局部变量：那条任务只有 4096 字节栈，下面还要跑
- * DAP_ExecuteCommand 的整条调用链。
- */
-struct DapExecuteRequest
-{
-    u8 src_mac[ESP_NOW_ETH_ALEN];
-    u16 cmd_seq; /**< 命令在可靠传输里的序号：对端重传时据此重放响应 */
-    u16 req_id;  /**< 主机分配的请求号：原样带回给主机，供它精确配对 */
-    u16 len;
-    u8 channel; /**< 主机侧 USB 传输通道（DAP_CHANNEL_*）：决定回给主机的 Packet Size */
-    u8 data[MAX_DAP_PAYLOAD_SIZE];
-};
-
 /**
  * ESP-NOW 发送速率默认档位（11g OFDM 24 Mbps）。
  *
@@ -85,106 +67,16 @@ inline constexpr u8 MAX_LOSS_PERMILLE = 255;
 class WirelessLink
 {
   public:
-    /** 初始化传输层，并创建无线侧 DAP 执行器（幂等） */
+    /** 初始化传输层并注册回调（幂等） */
     esp_err_t init();
 
     /**
      * 向指定对端（可为广播地址）发送一帧业务包。
      *
-     * 走不可靠路径：这条路是探测与配对（以及配置通道控制帧）的通道，它们要么发生
-     * 在会话建立之前，要么本来就不该重传（探活重传会污染 RTT 判定）。需要保达的
-     * 业务各有自己的 helper（DAP、线编码、中继）。
+     * 走尽力而为：这条路是探测、配对与配置通道控制帧的通道，它们要么发生在会话
+     * 建立之前，要么本来就不该重传（探活重传会污染 RTT 判定）。
      */
     esp_err_t send(const u8 *dest_mac, const Packet &packet);
-
-    /**
-     * 打包一条 DAP 命令/响应（原样字节流）为对应业务包并通过可靠传输发送给对端。
-     * 命令包额外带上主机侧通道标记（channel，见 DAP_CHANNEL_*）：对端据此回答
-     * DAP_Info 的单包尺寸；响应包不需要它。req_id 原样带到对端，响应里带回来。
-     */
-    esp_err_t send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 req_id,
-                               u16 *seq_out = nullptr);
-
-    /**
-     * 回发一条 DAP 响应。@param req_id 它回应的是哪条命令（主机分配的请求号）；
-     * @param cmd_seq 命令在可靠传输里的序号：对端重传那条命令时据此重放这条响应，
-     * 而不是把命令再执行一遍。
-     */
-    esp_err_t send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 req_id, u16 cmd_seq);
-
-    /**
-     * 串口出向准入：令牌桶限速 + DAP 让路。
-     *
-     * 两个方向各有一个桶：主机下载把自己的额度吃满时，屏幕的回包不会被饿死。
-     * 超速的部分直接丢弃，否则 ESP-NOW 的发送队列会被灌满，连 DAP 的可靠帧与
-     * 确认帧都发不出去。DAP 有在途消息时按配置比例压低额度。
-     *
-     * @param len 待发帧的载荷长度（字节）
-     * @param source 走哪个方向的桶
-     * @return true = 放行；false = 额度不足，调用方应保留数据稍后重试
-     */
-    bool uart_tx_admit(size_t len, UartSource source);
-
-    /**
-     * 无线路径：把不超过单帧上限的串口数据作为一帧发出（不切块、不过准入）。
-     * 准入与重试由调用方的队列负责，发送失败时帧仍留在调用方手里。
-     *
-     * @param reliability 本帧是否按可靠传输发（占序号、进窗口、丢帧重传）
-     */
-    esp_err_t send_uart_frame(const u8 *data, size_t len, UartSource source, ArqLink::Reliability reliability);
-
-    /**
-     * 无线路径：把一段串口数据交给对应的出向缓冲。
-     *
-     * 数据落进缓冲后由主循环的空闲钩子逐帧发出：主机一侧有 CDC 反压，缓冲满
-     * 了就不再取端点；目标一侧没有流控，缓冲满时有限等待，仍然放不下才丢弃。
-     *
-     * @param source 数据来自本机哪个端口：UartSource::Host 封成 UartFromHost 包
-     *               （对端写它的 UART TX），UartSource::Target 封成 UartFromTarget
-     *               包（对端写它的 CDC）
-     * @return 实际入队的字节数（< len 表示缓冲已满，超出部分丢弃）
-     */
-    size_t send_uart_data(const u8 *data, size_t len, UartSource source);
-
-    /**
-     * 串口出向缓冲的剩余空间（两个方向各一条，按 source 选）。
-     *
-     * 主机一次写进来的字节先落进环形缓冲，再由主循环的空闲钩子按令牌速率
-     * 逐帧发出；缓冲满了就不取新数据，端点 NAK 把压力反传给主机。
-     */
-    size_t uart_egress_space(UartSource source);
-    size_t push_uart_egress(const u8 *data, size_t len, UartSource source);
-
-    /** 丢弃两条缓冲内的全部待发字节（离开 Wireless 模式时用） */
-    void flush_uart_egress();
-
-    /**
-     * 数据的来处：由 Application 接到 USB 层，本层不直接依赖它。
-     * 回调在主循环里被调用，实现方负责"有多少空间取多少字节并 push"。
-     */
-    using HostUartFill = void (*)(void *ctx);
-    void set_host_uart_fill(HostUartFill fill, void *ctx);
-
-    /** 有新数据可发（主循环按拍排空） */
-    void notify_uart_egress();
-
-    /** 串口出向是否走可靠传输（主机经配置通道 0x1D 下发，出厂默认开） */
-    bool uart_reliable() const;
-
-    /**
-     * 设置串口出向的可靠性（主循环调用，立即生效并落盘）。
-     *
-     * 可靠模式下每帧占一个可靠传输窗口：窗口没有余量时分给 DAP，本轮不提交，
-     * 数据留在缓冲里等下一轮；缓冲满时仍旧反压主机或丢弃。
-     */
-    void set_uart_reliable(bool reliable);
-
-    /**
-     * 无线路径：打包线编码参数为 UartLineCoding 包发给已配对 peer（可靠传输：
-     * 丢了参数就静默不跟手，这条通路值得一次重传预算）。
-     * 参数为 CDC 枚举原值（见 payload::UartLineCoding），目标侧翻译后应用。
-     */
-    esp_err_t send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
     /**
      * 打包一条存活探测包并发送给已配对 peer（Ping/Pong 同构，token 由探测方
@@ -193,15 +85,6 @@ class WirelessLink
      */
     esp_err_t send_ping(const u8 *dest_mac, u32 token);
     esp_err_t send_pong(const u8 *dest_mac, u32 token);
-
-    /**
-     * 把一条 USB 控制请求原样转发给对端执行（无 USB 侧的设置下发通路）。走可靠
-     * 传输：这是一次设置下发，丢了不会有人重来。
-     * 纯载体：本函数不解释命令内容，对端用自己的配置通道命令表执行。
-     * @param req 控制请求（载荷为指针视图，调用期间须保持有效）
-     * @return 载荷超过 MAX_RELAYED_CONTROL_PAYLOAD 时返回 ESP_ERR_INVALID_SIZE
-     */
-    esp_err_t send_relayed_usb_control(const u8 *dest_mac, const payload::RelayedUsbControl &req);
 
     /** 当前 ESP-NOW 发送速率档位（wifi_phy_rate_t 原值） */
     u8 wifi_rate() const;
@@ -240,11 +123,10 @@ class WirelessLink
 #endif
 
     /**
-     * 主循环每拍调用：应用对端经 RelayedUsbControl 下发的速率档位、应用收到的
-     * 线编码参数，并排空串口出向缓冲。
+     * 主循环每拍调用：收敛 peer 登记与应用对端下发的速率档位。
      *
-     * 速率变更与 UART 参数都会操作驱动，不能在交付路径（esp_wifi 任务）里执行，
-     * 因此接收侧只登记待生效值，实际应用在这里。
+     * 速率变更会操作驱动，不能在交付路径（esp_wifi 任务）里执行，因此接收侧只登记
+     * 待生效值，实际应用在这里。
      */
     void poll();
 
@@ -264,49 +146,6 @@ class WirelessLink
     bool arq_take_settings_dirty();
 
     /**
-     * 异步转发一条 DAP 命令给配对 peer（Wireless 模式 USB→无线通路）：只负责把它
-     * 发出去并回填它的可靠传输序号，不等响应。
-     *
-     * 响应不在这里等——接收回调把它连同序号入 Application 的响应队列，USB 侧的
-     * dap_task 再按序号配回本条命令。多条命令因此可以同时在途，窗口才有意义。
-     *
-     * 提交前会先把会话握手做完（两端序号基准对齐），失败由重传兜底；重传预算在
-     * MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS 之内耗尽则判失败，那之后由
-     * take_failed_command 上抛给调用方销账。
-     *
-     * @param channel 该命令来自哪条主机侧 USB 通道（DAP_CHANNEL_*）：随命令送到对端，
-     *                供它回答 DAP_Info 的单包尺寸
-     * @param req_id  本条命令的请求号：随命令送到对端并由响应带回，用于精确配对
-     * @param seq_out 输出：本条命令的可靠传输序号（失败销账用）
-     * @return ESP_OK=已发出；否则失败（未配对 / 会话未对齐 / 发送或提交失败）
-     */
-    esp_err_t submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 req_id, u16 *seq_out);
-
-    /**
-     * 取出一条已被可靠传输判定失败的命令序号（重传耗尽）。
-     * 调用方据此把对应的在途条目销账：策略是不回响应，让主机那条命令自己超时。
-     * @return false = 当前没有待处理的失败
-     */
-    bool take_failed_command(u16 *seq_out);
-
-    /**
-     * 现在能不能提交新命令（会话已对齐、窗口还有空位）。
-     *
-     * USB 侧的 dap_task 用它做背压：不能提交时先不取命令，让命令留在队列里，
-     * 主机的 USB 写入自然被挡回；取出来再丢弃会让那条命令永远等不到响应。
-     */
-    bool can_submit_command();
-
-    /**
-     * 链路被证明可用（收到对端 Pong 一类回显）：请可靠传输清掉熔断与连续失败计数。
-     * 调用方是主循环消费 Pong 帧的分支。
-     */
-    void notify_link_alive();
-
-    /** 执行队列满被丢弃的命令数（接收侧跟不上时才会增长） */
-    u32 cmd_queue_dropped() const;
-
-    /**
      * 登记一个对端 peer（encrypt=false）。仅登记尚未存在于 peer list 的地址，
      * 重复调用是安全的。广播地址已由 init() 常驻登记，无需也不应重复登记。
      */
@@ -324,15 +163,10 @@ class WirelessLink
     void handle_frame(const u8 *src_mac, const u8 *data, usize len);
     void handle_tx_result(bool ok);
 
-    /** 无线侧 DAP 执行器回调（arg = 本对象 this）与任务入口 */
-    static bool dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg);
-    static void dap_resp_sink(const u8 *data, u16 len, void *arg);
-    static void dap_task_fn(void *arg);
-
     /** 把一段已序列化的缓冲交给 ESP-NOW（退避窗口内直接丢弃） */
     esp_err_t send_frame(const u8 *dest_mac, const u8 *data, size_t len);
 
-    /** 是否处于 ESP-NOW 发送退避窗口内（窗口内只抑制串口数据帧） */
+    /** 是否处于 ESP-NOW 发送退避窗口内（窗口内只抑制尽力而为帧） */
     bool espnow_backoff_active(u32 now) const;
 
     /**
@@ -384,29 +218,6 @@ class WirelessLink
     volatile u32 m_pending_rate = 0;
     portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
 
-    /**
-     * 对端下发的待应用线编码参数（交付路径只登记，主循环应用——configure 会调
-     * UART 驱动）。
-     */
-    struct PendingLineCoding
-    {
-        u32 baud;
-        u8 data_bits;
-        u8 stop_bits;
-        u8 parity;
-    };
-
-    portMUX_TYPE m_line_coding_lock = portMUX_INITIALIZER_UNLOCKED;
-    PendingLineCoding m_pending_line_coding = {};
-    bool m_line_coding_pending = false;
-
-    /** 串口出向令牌桶容量：两帧。桶小才能把突发摊平到毫秒级 */
-    static constexpr u32 UART_BUCKET_CAP_BYTES = 2 * MAX_UART_PAYLOAD_SIZE;
-    /** 判"链路正忙"的窗口：这段时间内提交过 DAP 业务包就让串口让路 */
-    static constexpr u32 DAP_BUSY_WINDOW_MS = 50;
-    /** 目标侧没有流控：出向缓冲满时按这个上限等待空口追上，等不到才丢 */
-    static constexpr u32 UART_PUSH_WAIT_MS = 100;
-    static constexpr u32 UART_PUSH_WAIT_STEP_MS = 2;
     /** ESP-NOW 退避：首档 20ms，逐级翻倍，200ms 封顶 */
     static constexpr u16 ESPNOW_BACKOFF_BASE_MS = 20;
     static constexpr u16 ESPNOW_BACKOFF_MAX_MS = 200;
@@ -421,24 +232,6 @@ class WirelessLink
     static constexpr u8 ESPNOW_TX_FAIL_STREAK_THRESHOLD = 8;
     /** 发送失败日志的限速间隔：差链路下每帧一条会把日志刷满 */
     static constexpr u32 ESPNOW_TX_FAIL_LOG_INTERVAL_MS = 1000;
-
-    /**
-     * 串口出向令牌桶。只有串口数据帧过这道闸（DAP 的可靠帧不受限）：桶满两帧、
-     * 按对端线速补充，链路正忙时按配置比例压低。调用方是无线发送任务与 UART
-     * 桥任务，各自加锁。
-     *
-     * 两个方向分开记账：主机下载把 Host 桶吃满时，屏幕回包的 Target 桶仍然有
-     * 额度，否则回包会被自己的下载流量饿死。
-     */
-    struct UartBucket
-    {
-        portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
-        u32 tokens = UART_BUCKET_CAP_BYTES;
-        u32 refill_ms = 0;
-    };
-
-    UartBucket m_uart_bucket_host;
-    UartBucket m_uart_bucket_target;
 
     /**
      * ESP-NOW 发送退避。撞上 NO_MEM、或发送完成回调连续报失败达到阈值时抬高；
@@ -460,47 +253,6 @@ class WirelessLink
     volatile u8 m_send_fail_streak = 0;
     volatile u32 m_send_fail_log_ms = 0;
 
-    /**
-     * 最近一次 DAP 业务包（命令/响应/转发的控制请求）提交的时刻。串口准入据此
-     * 判断链路是否正忙：准入跑在收数据的每一帧上，不能取锁。
-     *
-     * 只看"DAP 业务有没有在占空口"，与这一帧本身是否可靠无关：串口帧走可靠
-     * 传输时同样经过可靠通道，若按可靠性记账，串口流量会把自己判成"DAP 忙"
-     * 而按低额度自我限速。
-     */
-    volatile u32 m_last_dap_tx_ms = 0;
-
-    /** 两条串口出向缓冲：主机端口与目标端口各一条，字节流状态都在对象里 */
-    UartEgress m_host_uart;
-    UartEgress m_target_uart;
-
-    /** 串口出向是否走可靠传输（配置通道写，主循环读） */
-    volatile bool m_uart_reliable = true;
-
-    /** 数据来处（Application 接上 USB CDC 的读取原语） */
-    HostUartFill m_host_uart_fill = nullptr;
-    void *m_host_uart_fill_ctx = nullptr;
-
-    /** 主循环的空闲钩子：补读 CDC，再把两条出向缓冲按额度排空 */
-    void poll_uart_egress();
-
-    /** 一帧串口数据的传输判定 */
-    enum class UartVerdict : u8
-    {
-        Reliable,   /**< 走可靠传输 */
-        Unreliable, /**< 走尽力而为（开关关闭，或可靠窗口没有余量可分） */
-        Wait,       /**< 本轮不提交：窗口与待发位置让给 DAP */
-    };
-
-    /** 当前一帧串口数据该怎么发 */
-    UartVerdict uart_frame_verdict() const;
-
-    /** 排空一条出向缓冲：按额度与可靠性逐帧提交，发不出去的留在缓冲里 */
-    void drain_uart_egress(UartEgress &egress, UartSource source);
-
-    /** 按数据来处取出向缓冲 */
-    UartEgress &uart_egress(UartSource source);
-
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     /**
      * 注入丢包率（千分比）。只由主循环写（set_loss_permille），读取方是
@@ -512,26 +264,9 @@ class WirelessLink
     u32 m_loss_rng = 1;
 #endif
 
-    /** 无线侧 DAP 执行器（命令队列 + 任务 + 缓冲，状态全在对象内） */
-    QueueHandle_t m_dap_queue = nullptr;
-    TaskHandle_t m_dap_task = nullptr;
-    /** 最近一条命令的来源（响应回发地址）；仅执行任务线程读写 */
-    u8 m_dap_src_mac[ESP_NOW_ETH_ALEN];
-    /** 最近一条命令的可靠传输序号；仅执行任务线程读写（响应重放按它记账） */
-    u16 m_dap_cmd_seq = 0;
-    /** 最近一条命令的请求号；仅执行任务线程读写（响应里带回给主机） */
-    u16 m_dap_req_id = 0;
-    /** 从命令队列取出的待执行命令（不占 dap-wireless 任务栈；仅执行任务线程读写） */
-    DapExecuteRequest m_dap_pending;
-    /** 执行器命令/响应缓冲（不占任务栈，见 dap_executor.hpp） */
-    u8 m_dap_request[DAP_MAX_REQUEST_SIZE];
-    u8 m_dap_response[DAP_MAX_RESPONSE_SIZE];
-
     /** 可靠传输参数的本层副本：供配置通道读写与回显 */
     ArqSettings m_settings{};
 
-    /** 执行队列满被丢弃的命令数（接收侧跟不上时才会增长） */
-    volatile u32 m_cmd_queue_dropped = 0;
 };
 } // namespace mlink
 

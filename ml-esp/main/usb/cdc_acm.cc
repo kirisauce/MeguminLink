@@ -17,16 +17,14 @@ constexpr char TAG[] = "mlink::cdc_acm";
 u8 s_rx_buffer[256];
 
 // CDC RX 回调运行在 TinyUSB 任务上下文（tinyusb_task 派发）：只 read + 分流。
-// Local 模式：写本机 UART TX；Wireless 模式：打包为 UartFromHost 帧发给配对
-// peer（尽力而为，未配对丢弃）。
+// Local 模式：写本机 UART TX；Wireless 模式的串口转发窗口关闭，数据丢弃。
 void cdcacm_rx_callback(int interface, [[maybe_unused]] cdcacm_event_t *event)
 {
     auto &app = Application::get_instance();
 
     if (app.mode() == Mode::Wireless)
     {
-        // 读取与发送都在 ARQ 任务里：这里只唤醒它，FIFO 由它按缓冲空间取走
-        app.wireless_link().notify_uart_egress();
+        // 无线串口转发不可用：主机写入由端点反压挡住
         return;
     }
 
