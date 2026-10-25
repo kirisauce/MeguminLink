@@ -742,6 +742,31 @@ void receive_out_of_order()
     check(duo.b.sink.messages[1] == std::vector<u8>{2});
 }
 
+void unreliable_delivers_out_of_order()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 first[1] = {1};
+    const u8 second[1] = {2};
+    check(duo.a.core.send(CH_C, first) == SendResult::Ok);
+    check(duo.a.core.send(CH_C, second) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+
+    check_eq(duo.a.link.frames.size(), 2);
+    const std::vector<u8> f0 = duo.a.link.frames[0];
+    const std::vector<u8> f1 = duo.a.link.frames[1];
+    duo.a.link.frames.clear();
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f1.data(), f1.size()});
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f0.data(), f0.size()});
+
+    check_eq(duo.b.sink.messages.size(), 2);
+    check(duo.b.sink.messages[0] == std::vector<u8>{2});
+    check(duo.b.sink.messages[1] == std::vector<u8>{1});
+    check_eq(duo.b.core.snapshot().messages_delivered, 2);
+}
+
 void receive_out_of_window()
 {
     Duo duo;
@@ -1107,6 +1132,7 @@ const test::Case TESTS[] = {
     {"receive delivers in order", receive_in_order},
     {"receive delivers duplicate once", receive_duplicate_once},
     {"receive reorders out-of-order datagrams", receive_out_of_order},
+    {"unreliable channel delivers out of order", unreliable_delivers_out_of_order},
     {"receive drops out-of-window seq", receive_out_of_window},
     {"delayed ack releases window", delayed_ack_releases_window},
     {"reorder overflow keeps frame unacked", reorder_overflow_keeps_unacked},
