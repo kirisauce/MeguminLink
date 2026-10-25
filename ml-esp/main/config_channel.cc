@@ -390,22 +390,22 @@ enum : u8
     TAG_UART_PARITY = 0x38,      // u8：校验 0=无 1=奇 2=偶 3=Mark 4=Space
     TAG_UART_RELIABLE = 0x39,    // u8：串口出向是否走可靠传输 0=尽力而为 1=可靠
     // 可靠传输统计：无线段（0x20-0x2F）已排满，单开 0x70-0x7F 一段
-    TAG_ARQ_STATE = 0x70,         // u8：bit0-3 生效窗口、bit7 熔断中
-    TAG_ARQ_TX = 0x71,            // u32：首次发出的可靠消息数
-    TAG_ARQ_RETX = 0x72,          // u32：重传次数
-    TAG_ARQ_ACKED = 0x73,         // u32：被确认的消息数
-    TAG_ARQ_FAILED = 0x74,        // u32：重传耗尽被丢弃的消息数
-    TAG_ARQ_DUP = 0x75,           // u32：收到的重复帧数
-    TAG_ARQ_OOO = 0x76,           // u32：超窗被拒的帧数
-    TAG_ARQ_SKIPPED = 0x77,       // u32：因对端放弃空洞而跳过的序号数
-    TAG_ARQ_REPLAYED = 0x78,      // u32：因重复命令重放响应的次数
-    TAG_ARQ_REPLAY_MISS = 0x79,   // u32：重放未命中的次数
+    TAG_ARQ_STATE = 0x70,         // u8：bit0-3 DAP 通道窗口、bit4-6 在途帧数、bit7 固定 0
+    TAG_ARQ_TX = 0x71,            // u32：首次发出的数据报数
+    TAG_ARQ_RETX = 0x72,          // u32：数据报重传数
+    TAG_ARQ_ACKED = 0x73,         // u32：被确认的数据报数
+    TAG_ARQ_FAILED = 0x74,        // u32：固定 0（可靠消息不单条失败）
+    TAG_ARQ_DUP = 0x75,           // u32：收到的重复数据报数
+    TAG_ARQ_OOO = 0x76,           // u32：序号超出确认位图的帧数
+    TAG_ARQ_SKIPPED = 0x77,       // u32：固定 0
+    TAG_ARQ_REPLAYED = 0x78,      // u32：固定 0
+    TAG_ARQ_REPLAY_MISS = 0x79,   // u32：固定 0
     TAG_ARQ_SRTT_MS = 0x7A,       // u32：平滑往返时延（毫秒）
     TAG_ARQ_RTO_MS = 0x7B,        // u32：当前基础 RTO（毫秒）
-    TAG_ARQ_BREAKER_TRIPS = 0x7C, // u32：熔断触发次数
-    TAG_ARQ_TX_DROPPED = 0x7D,    // u32：待发环满被拒的提交数
-    TAG_ARQ_RX_DROPPED = 0x7E,    // u32：接收环满被丢弃的帧数
-    TAG_ARQ_CMD_DROPPED = 0x7F,   // u32：执行队列满被丢弃的命令数
+    TAG_ARQ_BREAKER_TRIPS = 0x7C, // u32：固定 0
+    TAG_ARQ_TX_DROPPED = 0x7D,    // u32：发送队列满被拒的提交数
+    TAG_ARQ_RX_DROPPED = 0x7E,    // u32：接收队列满被丢弃的帧数
+    TAG_ARQ_CMD_DROPPED = 0x7F,   // u32：固定 0
     TAG_UPTIME = 0x40,           // u32：上电毫秒数（49.7 天回绕）
     TAG_FW_VERSION = 0x41,       // string：应用版本（esp_app_desc.version）
     TAG_CHIP_TARGET = 0x42,      // string：目标芯片（CONFIG_IDF_TARGET）
@@ -413,15 +413,15 @@ enum : u8
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
     TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
-    TAG_CFG_ARQ_GENERATION = 0x54,  // u32：参数代数（每次下发 +1）
-    TAG_CFG_ARQ_WINDOW = 0x56,      // u8：发送窗口
-    TAG_CFG_ARQ_MAX_RETX = 0x57,    // u8：单条消息重传次数上限
-    TAG_CFG_ARQ_BREAKER = 0x58,     // u8：熔断阈值（连续失败条数）
-    TAG_CFG_ARQ_RTO_MIN = 0x59,     // u16：RTO 下限（毫秒）
+    TAG_CFG_ARQ_GENERATION = 0x54,  // u32：固定 0（运行期没有配置下发）
+    TAG_CFG_ARQ_WINDOW = 0x56,      // u8：DAP 通道发送窗口
+    TAG_CFG_ARQ_MAX_RETX = 0x57,    // u8：固定 0（可靠消息重传到超时为止）
+    TAG_CFG_ARQ_BREAKER = 0x58,     // u8：固定 0
+    TAG_CFG_ARQ_RTO_MIN = 0x59,     // u16：初始 RTO（毫秒）
     TAG_CFG_ARQ_RTO_INIT = 0x5A,    // u16：初始 RTO（毫秒）
     TAG_CFG_ARQ_RTO_MAX = 0x5B,     // u16：RTO 上限（毫秒）
     TAG_CFG_ARQ_DELAYED_ACK = 0x5C, // u16：延迟确认（毫秒）
-    TAG_CFG_ARQ_PROBE = 0x5D,       // u16：熔断试探间隔（毫秒）
+    TAG_CFG_ARQ_PROBE = 0x5D,       // u16：保活间隔（毫秒）
     // 0x55 未分配（保留号位）
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     TAG_CFG_LOSS_PERMILLE = 0x53, // u8：注入丢包率千分比 0-255
@@ -650,40 +650,37 @@ u16 ConfigChannel::build_stats_response(u8 cmd, u8 seq)
     p += tlv_u32(m_response + p, TAG_DAP_RESPONSE, stats.dap_response_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_TX, stats.wireless_tx_bytes);
     p += tlv_u32(m_response + p, TAG_WIRELESS_RX, stats.wireless_rx_bytes);
-    {
-        // 可靠传输的运行状态：丢帧是否被吸收、恢复得多快，全看这几个数
-        const ArqLink::Snapshot arq = Application::get_instance().wireless_link().arq_snapshot();
-        u8 state = static_cast<u8>(Application::get_instance().wireless_link().arq_settings().window & 0x0F);
-        const u8 in_flight = arq.in_flight < 0x07 ? arq.in_flight : 0x07;
-        state |= static_cast<u8>(in_flight << 4);
-        if (arq.breaker_open)
-        {
-            state |= 0x80;
-        }
-        p += tlv_u8(m_response + p, TAG_ARQ_STATE, state);
-        p += tlv_u32(m_response + p, TAG_ARQ_TX, arq.tx);
-        p += tlv_u32(m_response + p, TAG_ARQ_RETX, arq.retx);
-        p += tlv_u32(m_response + p, TAG_ARQ_ACKED, arq.acked);
-        p += tlv_u32(m_response + p, TAG_ARQ_FAILED, arq.failed);
-        p += tlv_u32(m_response + p, TAG_ARQ_DUP, arq.rx_duplicate);
-        p += tlv_u32(m_response + p, TAG_ARQ_OOO, arq.rx_out_of_window);
-        p += tlv_u32(m_response + p, TAG_ARQ_SKIPPED, arq.rx_skipped);
-        p += tlv_u32(m_response + p, TAG_ARQ_REPLAYED, arq.replayed);
-        p += tlv_u32(m_response + p, TAG_ARQ_REPLAY_MISS, arq.replay_missed);
-        p += tlv_u32(m_response + p, TAG_ARQ_SRTT_MS, arq.srtt_ms);
-        p += tlv_u32(m_response + p, TAG_ARQ_RTO_MS, arq.rto_ms);
-        p += tlv_u32(m_response + p, TAG_ARQ_BREAKER_TRIPS, arq.breaker_trips);
 
-        // 环满丢弃的证据：这两个数在正常链路上应当为 0——非 0 说明待发方向或接收
-        // 方向跟不上（命令没进执行队列的计数在最后一个）
-        p += tlv_u32(m_response + p, TAG_ARQ_TX_DROPPED, arq.tx_dropped);
-        p += tlv_u32(m_response + p, TAG_ARQ_RX_DROPPED, arq.rx_dropped);
+    const WirelessLink &link = Application::get_instance().wireless_link();
+    const meaproto::Stats protocol = link.stats();
+    {
+        // 可靠传输的运行状态：丢帧是否被吸收、恢复得多快，全看这几个数。
+        // 窗口取 DAP 通道（配置默认窗口 16 装不进 4 位），未连接时按 0 上报
+        u8 state = link.connected() ? static_cast<u8>(link.dap_window() & 0x0F) : 0;
+        const u32 in_flight = protocol.datagrams_in_flight < 0x07 ? protocol.datagrams_in_flight : 0x07;
+        state |= static_cast<u8>(in_flight << 4);
+        p += tlv_u8(m_response + p, TAG_ARQ_STATE, state);
+        p += tlv_u32(m_response + p, TAG_ARQ_TX, protocol.datagrams_sent);
+        p += tlv_u32(m_response + p, TAG_ARQ_RETX, protocol.datagrams_retransmitted);
+        p += tlv_u32(m_response + p, TAG_ARQ_ACKED, protocol.datagrams_acked);
+        p += tlv_u32(m_response + p, TAG_ARQ_FAILED, 0);
+        p += tlv_u32(m_response + p, TAG_ARQ_DUP, protocol.duplicate_datagrams);
+        p += tlv_u32(m_response + p, TAG_ARQ_OOO, protocol.out_of_window);
+        p += tlv_u32(m_response + p, TAG_ARQ_SKIPPED, 0);
+        p += tlv_u32(m_response + p, TAG_ARQ_REPLAYED, 0);
+        p += tlv_u32(m_response + p, TAG_ARQ_REPLAY_MISS, 0);
+        p += tlv_u32(m_response + p, TAG_ARQ_SRTT_MS, protocol.rtt_ms);
+        p += tlv_u32(m_response + p, TAG_ARQ_RTO_MS, protocol.rto_ms);
+        p += tlv_u32(m_response + p, TAG_ARQ_BREAKER_TRIPS, 0);
+
+        // 环满丢弃的证据：这两个数在正常链路上应当为 0——非 0 说明发送或接收
+        // 队列跟不上（执行队列满的计数固定为 0）
+        p += tlv_u32(m_response + p, TAG_ARQ_TX_DROPPED, protocol.tx_queue_dropped);
+        p += tlv_u32(m_response + p, TAG_ARQ_RX_DROPPED, protocol.rx_queue_dropped);
         p += tlv_u32(m_response + p, TAG_ARQ_CMD_DROPPED, 0);
     }
 
     // 对端存活：协议连接状态；往返时延是协议层的平滑估计（微秒）
-    const WirelessLink &link = Application::get_instance().wireless_link();
-    const meaproto::Stats protocol = link.stats();
     p += tlv_u8(m_response + p, TAG_PEER_ONLINE, link.connected() ? 1 : 2);
     p += tlv_u32(m_response + p, TAG_PING_RTT, protocol.rtt_ms * 1000);
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
@@ -734,16 +731,17 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_CFG_LOSS_PERMILLE, Application::get_instance().wireless_link().loss_permille());
 #endif
     {
-        const ArqSettings settings = Application::get_instance().wireless_link().arq_settings();
-        p += tlv_u32(m_response + p, TAG_CFG_ARQ_GENERATION, settings.generation);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_WINDOW, settings.window);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_MAX_RETX, settings.max_retx);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_BREAKER, settings.breaker_failures);
-        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MIN, settings.rto_min_ms);
-        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_INIT, settings.initial_rto_ms);
-        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MAX, settings.rto_max_ms);
-        p += tlv_u16(m_response + p, TAG_CFG_ARQ_DELAYED_ACK, settings.delayed_ack_ms);
-        p += tlv_u16(m_response + p, TAG_CFG_ARQ_PROBE, settings.breaker_probe_ms);
+        const WirelessLink &link = Application::get_instance().wireless_link();
+        const meaproto::Config &config = link.proto_config();
+        p += tlv_u32(m_response + p, TAG_CFG_ARQ_GENERATION, 0);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_WINDOW, link.dap_window());
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_MAX_RETX, 0);
+        p += tlv_u8(m_response + p, TAG_CFG_ARQ_BREAKER, 0);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MIN, config.rto_initial_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_INIT, config.rto_initial_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MAX, config.rto_max_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_DELAYED_ACK, config.ack_delay_ms);
+        p += tlv_u16(m_response + p, TAG_CFG_ARQ_PROBE, config.keepalive_interval_ms);
     }
 
     return finish_response(cmd, seq, p);

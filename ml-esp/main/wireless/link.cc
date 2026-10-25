@@ -780,6 +780,16 @@ meaproto::Stats WirelessLink::stats() const
     return m_daemon.snapshot();
 }
 
+const meaproto::Config &WirelessLink::proto_config() const
+{
+    return m_daemon.config();
+}
+
+u8 WirelessLink::dap_window() const
+{
+    return channels()[0].window;
+}
+
 bool WirelessLink::arq_established() const
 {
     return false;

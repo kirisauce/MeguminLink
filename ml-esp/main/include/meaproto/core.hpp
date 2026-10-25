@@ -98,6 +98,9 @@ class Core
     /** 发一个 Ping；未连接时返回 false */
     bool ping(u32 now) noexcept;
 
+    /** 构造时注入的运行参数（运行期不可改） */
+    const Config &config() const noexcept;
+
     Stats snapshot() const noexcept;
 
   private:

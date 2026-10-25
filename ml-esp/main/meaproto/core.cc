@@ -885,6 +885,11 @@ u16 Core::config_hash() const noexcept
     return m_config_hash;
 }
 
+const Config &Core::config() const noexcept
+{
+    return m_config;
+}
+
 Stats Core::snapshot() const noexcept
 {
     u32 in_flight = 0;

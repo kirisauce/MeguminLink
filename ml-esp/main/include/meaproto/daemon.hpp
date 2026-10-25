@@ -70,6 +70,9 @@ template <Transport T> class Daemon final
     bool connecting() const;
     Stats snapshot() const;
 
+    /** 构造时注入的运行参数（运行期不可改） */
+    const Config &config() const;
+
   private:
     enum class Request : u8
     {

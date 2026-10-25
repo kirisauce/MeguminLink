@@ -257,6 +257,12 @@ class WirelessLink : private meaproto::Sink
     /** 协议层统计快照（配置通道 GetStats 的数据源） */
     meaproto::Stats stats() const;
 
+    /** 协议运行参数（配置通道 GetConfig 的数据源） */
+    const meaproto::Config &proto_config() const;
+
+    /** DAP 通道的生效发送窗口（0x56 / 0x70 的窗口字段） */
+    u8 dap_window() const;
+
     /** 会话握手是否已完成（USB 侧据此在转发命令前先等一等） */
     bool arq_established() const;
 

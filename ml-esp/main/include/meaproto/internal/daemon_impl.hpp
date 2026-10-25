@@ -166,6 +166,11 @@ template <Transport T> Stats Daemon<T>::snapshot() const
     return value;
 }
 
+template <Transport T> const Config &Daemon<T>::config() const
+{
+    return m_core.config();
+}
+
 template <Transport T> SendResult Daemon<T>::send(ChannelId channel, std::span<const u8> data)
 {
     if (m_task.load(std::memory_order_relaxed) == nullptr)
