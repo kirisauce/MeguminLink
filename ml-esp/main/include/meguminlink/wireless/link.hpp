@@ -3,10 +3,11 @@
 #define __MEGUMINLINK_WIRELESS_LINK_HPP__
 
 #include "esp_err.h"
-#include "esp_now.h"                    // IWYU pragma: export
-#include "esp_wifi.h"                   // IWYU pragma: export
-#include "meguminlink/common.hpp"       // IWYU pragma: keep
+#include "esp_now.h"  // IWYU pragma: export
+#include "esp_wifi.h" // IWYU pragma: export
+#include "meaproto/config.hpp"
 #include "meaproto/daemon.hpp"
+#include "meguminlink/common.hpp"            // IWYU pragma: keep
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/espnow_transport.hpp"
 #include "meguminlink/wireless/frame.hpp"
@@ -42,6 +43,62 @@ inline constexpr u8 DEFAULT_WIFI_RATE = WIFI_PHY_RATE_24M;
  * 供配置通道在投递动作前校验，避免把非法值送进主循环。
  */
 bool wifi_rate_supported(u8 rate);
+
+// ---- 业务通道 ----
+
+/** DAP 命令与响应 */
+inline constexpr meaproto::ChannelId DAP_CHANNEL{1};
+/** 串口字节与线编码 */
+inline constexpr meaproto::ChannelId UART_CHANNEL{2};
+/** 配置中继（对端的 EP0 控制请求） */
+inline constexpr meaproto::ChannelId CONFIG_CHANNEL{3};
+
+/**
+ * DAP 通道的单条消息上限。
+ *
+ * 主机按 DAP_Info 上报的 1274 构造命令，加本层的 kind/source/req_id 头后取 1280：
+ * 响应头与批量数据不会把单条消息顶出通道上限。
+ */
+inline constexpr u16 DAP_CHANNEL_PAYLOAD = 1280;
+
+/**
+ * 通道表：同一 id 的上行与下行各自维护序号与窗口，通道之间完全隔离。
+ *
+ * 优先级数值小的先发：DAP 交互延迟直接决定调试体验，配置中继次之，串口数据最后。
+ * 队列与窗口只影响本端资源，不进 config_hash；C3 单核内存紧，按档减半。
+ */
+#if CONFIG_IDF_TARGET_ESP32C3
+inline constexpr meaproto::ChannelSpec CHANNELS[] = {
+    {DAP_CHANNEL, meaproto::Reliability::ReliableOrdered, DAP_CHANNEL_PAYLOAD, 4, 1, 4, 4},
+    {UART_CHANNEL, meaproto::Reliability::ReliableOrdered, 512, 8, 3, 8, 4},
+    {CONFIG_CHANNEL, meaproto::Reliability::ReliableOrdered, 512, 4, 2, 4, 4},
+};
+#else
+inline constexpr meaproto::ChannelSpec CHANNELS[] = {
+    {DAP_CHANNEL, meaproto::Reliability::ReliableOrdered, DAP_CHANNEL_PAYLOAD, 8, 1, 8, 8},
+    {UART_CHANNEL, meaproto::Reliability::ReliableOrdered, 512, 16, 3, 16, 8},
+    {CONFIG_CHANNEL, meaproto::Reliability::ReliableOrdered, 512, 4, 2, 4, 4},
+};
+#endif
+
+/** 协议参数：窗口、接收队列与重组槽按目标分档（见 meaproto.md §10） */
+#if CONFIG_IDF_TARGET_ESP32C3
+inline constexpr meaproto::Config LINK_CONFIG = [] {
+    meaproto::Config config;
+    config.datagram_window = 4;
+    config.rx_queue_depth = 4;
+    config.max_reassembly_slots = 1;
+    return config;
+}();
+#else
+inline constexpr meaproto::Config LINK_CONFIG = [] {
+    meaproto::Config config;
+    config.datagram_window = 16;
+    config.rx_queue_depth = 8;
+    config.max_reassembly_slots = 2;
+    return config;
+}();
+#endif
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
 /**

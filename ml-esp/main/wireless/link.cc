@@ -106,13 +106,13 @@ void WirelessLink::handle_tx_result(bool ok)
     }
 }
 
-WirelessLink::WirelessLink() : m_daemon(EspNowTransport::instance(), *this, channels())
+WirelessLink::WirelessLink() : m_daemon(EspNowTransport::instance(), *this, channels(), LINK_CONFIG)
 {
 }
 
 std::span<const meaproto::ChannelSpec> WirelessLink::channels()
 {
-    return {};
+    return CHANNELS;
 }
 
 bool WirelessLink::connected() const
@@ -127,8 +127,7 @@ bool WirelessLink::connecting() const
 
 void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
 {
-    // 本阶段没有通道：只记录大小
-    ESP_LOGD(TAG, "message on channel %u (%u bytes) dropped", static_cast<unsigned>(channel.value),
+    ESP_LOGD(TAG, "channel %u message (%u bytes) not dispatched", static_cast<unsigned>(channel.value),
              static_cast<unsigned>(data.size()));
 }
 
@@ -170,6 +169,10 @@ esp_err_t WirelessLink::init()
     transport.set_non_meaproto_frame_callback(&WirelessLink::on_frame, this);
     transport.set_rx_observer_callback(&WirelessLink::on_rx_stats, this);
     transport.set_tx_result_callback(&WirelessLink::on_tx_result, this);
+
+    constexpr unsigned channel_count = static_cast<unsigned>(sizeof(CHANNELS) / sizeof(CHANNELS[0]));
+    const usize storage_size = meaproto::Core::storage_bytes(channels(), LINK_CONFIG, EspNowTransport::MTU);
+    ESP_LOGI(TAG, "channels %u, protocol storage %u bytes", channel_count, static_cast<unsigned>(storage_size));
 
     m_daemon.start();
 
