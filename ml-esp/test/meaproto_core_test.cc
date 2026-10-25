@@ -799,6 +799,87 @@ void reorder_overflow_keeps_unacked()
     check(duo.b.sink.messages[0] == std::vector<u8>{1});
 }
 
+// ---- 可靠性切换 ----
+
+void set_reliability_requires_connection()
+{
+    ChannelRig rig;
+    check(!rig.core.set_reliability(CH_A, Reliability::Unreliable));
+
+    rig.connect();
+    check(rig.core.set_reliability(CH_A, Reliability::Unreliable));
+    check(!rig.core.set_reliability(ChannelId{9}, Reliability::Unreliable));
+}
+
+void set_reliability_clears_state()
+{
+    ChannelRig rig;
+    rig.connect();
+    const u8 payload[2] = {};
+
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    rig.core.step(rig.now);
+    check_eq(rig.core.snapshot().datagrams_in_flight, 2);
+
+    check(rig.core.set_reliability(CH_A, Reliability::Unreliable));
+    check_eq(rig.core.snapshot().datagrams_in_flight, 0);
+    check(rig.core.can_send(CH_A));
+}
+
+void set_reliability_restarts_ordering()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 first[1] = {1};
+    check(duo.a.core.send(CH_A, first) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    duo.flush(duo.a, duo.b);
+    check_eq(duo.b.sink.messages.size(), 1);
+
+    check(duo.a.core.set_reliability(CH_A, Reliability::Unreliable));
+    check(duo.b.core.set_reliability(CH_A, Reliability::Unreliable));
+
+    check(duo.a.core.send(CH_A, first) == SendResult::Ok);
+    const std::size_t before = duo.a.link.frames.size();
+    duo.a.core.step(duo.a.now);
+    check_eq(duo.a.link.frames.size(), before + 1);
+
+    duo.flush(duo.a, duo.b);
+    check_eq(duo.b.sink.messages.size(), 2);
+}
+
+void reconnect_resets_channels()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 payload[2] = {4, 2};
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    check_eq(datagram_header(duo.a.link.frames.back()).datagram_seq, 0);
+    duo.a.link.frames.clear();
+
+    duo.a.core.close(duo.a.now);
+    duo.flush(duo.a, duo.b);
+    duo.flush(duo.b, duo.a);
+    check(!duo.a.core.connected());
+
+    duo.a.core.open(duo.a.now);
+    duo.flush(duo.a, duo.b);
+    duo.flush(duo.b, duo.a);
+    check(duo.a.core.connected());
+    check(duo.b.core.connected());
+
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    check_eq(datagram_header(duo.a.link.frames.back()).datagram_seq, 0);
+
+    duo.flush(duo.a, duo.b);
+    check_eq(duo.b.sink.messages.size(), 1);
+}
+
 void send_not_connected()
 {
     ChannelRig rig;
@@ -891,6 +972,10 @@ const test::Case TESTS[] = {
     {"receive drops out-of-window seq", receive_out_of_window},
     {"delayed ack releases window", delayed_ack_releases_window},
     {"reorder overflow keeps frame unacked", reorder_overflow_keeps_unacked},
+    {"set_reliability requires connection", set_reliability_requires_connection},
+    {"set_reliability clears channel state", set_reliability_clears_state},
+    {"set_reliability restarts ordering", set_reliability_restarts_ordering},
+    {"reconnect resets channels", reconnect_resets_channels},
 };
 } // namespace
 

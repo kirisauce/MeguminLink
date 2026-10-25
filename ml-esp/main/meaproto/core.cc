@@ -157,6 +157,44 @@ bool Core::can_send(ChannelId channel) const noexcept
     return slot != nullptr && slot->count < slot->spec.queue_depth;
 }
 
+bool Core::set_reliability(ChannelId channel, Reliability reliability) noexcept
+{
+    if (m_state != State::Connected)
+    {
+        return false;
+    }
+
+    Channel *slot = find_channel(channel);
+    if (slot == nullptr)
+    {
+        return false;
+    }
+
+    slot->spec.reliability = reliability;
+    slot->reset();
+    return true;
+}
+
+void Core::Channel::reset() noexcept
+{
+    head = 0;
+    tail = 0;
+    count = 0;
+    used_slots = 0;
+    tx_seq = 0;
+    tx_ordering = 0;
+    for (WindowSlot &slot : slots)
+    {
+        slot = WindowSlot{};
+    }
+    reorder_used = 0;
+    rx_expected = 0;
+    rx_bits = 0;
+    rx_ordering = 0;
+    ack_pending = false;
+    ack_deadline_ms = 0;
+}
+
 u32 Core::rto_backoff(u8 retx) const noexcept
 {
     u32 ms = m_config.rto_initial_ms;
@@ -399,6 +437,8 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
     for (u8 i = 0; i < header.message_count && !overflow; ++i)
     {
         MessageHeader message;
+        // 消息头布局由通道的可靠性决定（线上不单独携带）
+        message.reliability = channel->spec.reliability;
         if (message.deserialize(in) != WireError::Ok || in.remaining() < message.payload_len)
         {
             return;
@@ -842,6 +882,10 @@ void Core::enter_idle(DisconnectReason reason) noexcept
     m_peer_mtu = m_mtu;
     m_handshake_retries = 0;
     m_handshake_deadline_ms = 0;
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        m_channels[i].reset();
+    }
     if (was_active)
     {
         m_sink.on_disconnected(reason);

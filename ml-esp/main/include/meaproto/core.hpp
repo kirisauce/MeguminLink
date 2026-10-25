@@ -72,6 +72,12 @@ class Core
     /** 该通道发送队列是否还有空位（背压用） */
     bool can_send(ChannelId channel) const noexcept;
 
+    /**
+     * 切换通道的可靠性策略；只在 Connected 生效，切换会清空该通道的队列、窗口与
+     * 接收侧状态，序号从 0 重新开始。两端必须同时切换。
+     */
+    bool set_reliability(ChannelId channel, Reliability reliability) noexcept;
+
     State state() const noexcept;
     bool connected() const noexcept;
     bool connecting() const noexcept;
@@ -123,6 +129,9 @@ class Core
         u16 rx_ordering = 0; /**< 下一个期望交付的消息序号 */
         bool ack_pending = false;
         u32 ack_deadline_ms = 0;
+
+        /** 清空会话状态（队列、窗口、序号、重排与确认），保留 spec 与存储指针 */
+        void reset() noexcept;
     };
 
     /** 条目头：消息长度 */
