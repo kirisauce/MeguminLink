@@ -38,14 +38,6 @@ namespace
  */
 constexpr size_t DAP_QUEUE_DEPTH = 32;
 
-/** 熔断期探针 Ping 的 token：只用于自证链路可用，与配置通道的探测 token 互不干扰 */
-constexpr u32 ARQ_PROBE_TOKEN = 0x4D4C5052; // "MLPR"
-
-/** 该业务包是不是 DAP 方向的流量（串口出向准入据此给 DAP 让路） */
-bool is_dap_traffic(PacketType type)
-{
-    return type == PacketType::DapCommand || type == PacketType::DapResponse || type == PacketType::RelayedUsbControl;
-}
 } // namespace
 
 bool mlink::wifi_rate_supported(u8 rate)
@@ -74,10 +66,61 @@ void WirelessLink::on_tx_result(void *ctx, const u8 *, bool ok)
 
 void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
 {
-    // 解析、判重、排序与业务分派都不在回调里做：回调只把原始帧交给 ARQ 层，
-    // 那里有独立的 ARQ 任务。回调里做这些会拖住 esp_wifi 任务，而在回调里发帧
-    // 更会重入 WiFi 驱动。
-    m_arq.on_frame(src_mac, data, len);
+    // 反序列化落在对象成员上：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉
+    // 任务的栈。本函数是这条路径的唯一使用者（任务上下文单线程）。
+    Packet packet;
+    if (packet.deserialize(data, len, m_rx_storage, sizeof(m_rx_storage)) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to deserialize %u-byte payload from " MACSTR, static_cast<unsigned>(len),
+                 MAC2STR(src_mac));
+        return;
+    }
+
+    // 交付回调必须只做非阻塞的事：它跑在 esp_wifi 任务里。需要碰驱动的操作
+    //（速率、线编码）因此只登记，留给主循环 poll()。
+    switch (packet.packet_type)
+    {
+    case PacketType::DapCommand:
+        // 业务窗口：DAP 转发不可用
+        return;
+    case PacketType::DapResponse: {
+        const auto &resp = packet.payload.dap_response;
+        Application::get_instance().push_wireless_response(resp.req_id, resp.data, resp.len);
+        return;
+    }
+    case PacketType::UartFromHost:
+    case PacketType::UartFromTarget: {
+        const auto &uart = packet.payload.uart_data;
+        const UartSource source =
+            (packet.packet_type == PacketType::UartFromHost) ? UartSource::Host : UartSource::Target;
+        Application::get_instance().forward_uart_data_from_wireless(uart.data, uart.len, source);
+        return;
+    }
+    case PacketType::UartLineCoding: {
+        const auto &lc = packet.payload.uart_line_coding;
+        portENTER_CRITICAL(&m_line_coding_lock);
+        m_pending_line_coding.baud = lc.baud;
+        m_pending_line_coding.data_bits = lc.data_bits;
+        m_pending_line_coding.stop_bits = lc.stop_bits;
+        m_pending_line_coding.parity = lc.parity;
+        m_line_coding_pending = true;
+        portEXIT_CRITICAL(&m_line_coding_lock);
+        return;
+    }
+    case PacketType::RelayedUsbControl: {
+        const auto &relay = packet.payload.relayed_usb_control;
+        Application::get_instance().config_channel().on_relayed_control(relay);
+        return;
+    }
+    default: {
+        // 配对控制帧与 Ping/Pong：维持经主循环统一驱动状态机的原路径
+        ReceivedPacket rp = {};
+        std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
+        rp.packet = packet;
+        Application::get_instance().push_received_packet(rp);
+        return;
+    }
+    }
 }
 
 void WirelessLink::handle_tx_result(bool ok)
@@ -92,8 +135,7 @@ void WirelessLink::handle_tx_result(bool ok)
     const u8 streak = (m_send_fail_streak < 0xFF) ? static_cast<u8>(m_send_fail_streak + 1) : 0xFF;
     m_send_fail_streak = streak;
 
-    // 连续失败达到阈值：与 NO_MEM 共用同一套退避。退避只抑制尽力而为帧，可靠帧
-    // 照发——ARQ 正靠它们在守重传，停掉只会把主机侧拖成超时。
+    // 连续失败达到阈值：与 NO_MEM 共用同一套退避
     if (streak >= ESPNOW_TX_FAIL_STREAK_THRESHOLD)
     {
         m_send_fail_streak = 0; // 重新累计：持续失败期间由退避窗口持续刷新
@@ -120,19 +162,6 @@ esp_err_t WirelessLink::init()
     if (m_tx_mutex == nullptr || m_pack_mutex == nullptr)
     {
         return ESP_ERR_NO_MEM;
-    }
-
-    {
-        // ARQ 层：自带任务与收发环，必须在注册 ESP-NOW 回调之前就绪（回调一注册
-        // 就可能进帧）。载荷上限取业务包上限（最大的业务包是 DAP 命令），
-        // frame.hpp 的 static_assert 保证它装得下。
-        const size_t arq_payload_cap = DAP_FRAME_HEADER_SIZE + DAP_FRAME_FIELDS_MAX + MAX_DAP_PAYLOAD_SIZE;
-        const esp_err_t arq_ret = m_arq.init(arq_settings_load(), arq_payload_cap);
-        ESP_RETURN_ON_ERROR(arq_ret, TAG, "m_arq.init() failed");
-
-        const ArqLink::Callbacks arq_callbacks = {this, &WirelessLink::arq_send_raw, &WirelessLink::arq_deliver,
-                                                  &WirelessLink::arq_poll};
-        m_arq.set_callbacks(arq_callbacks);
     }
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
@@ -269,9 +298,7 @@ u32 WirelessLink::next_random()
 
 bool WirelessLink::loss_should_drop()
 {
-    // 可丢性由提交方声明（见 submit_packet 的 loss_injectable）：本函数只做
-    // 概率判定。配对、探测与配置通道控制帧不参与，丢包率因此永远丢不掉
-    // "改回来"的那条控制请求。
+    // 只做概率判定，被丢的帧由调用方记账
     auto &config = Application::get_instance().config_channel();
     const u8 permille = m_loss_permille;
     if (permille == 0)
@@ -288,15 +315,13 @@ bool WirelessLink::loss_should_drop()
 
 void WirelessLink::poll()
 {
-    // 0) 配对信息交给 ESP-NOW 与 ARQ 层：单播 peer 必须先登记进 peer list，否则
-    //    手上的帧一律发送失败；ARQ 层也要知道会话对端才能握手。两者都幂等（只有
-    //    真的换了对端才会重置会话），而且执行侧（Local 模式）同样需要——它不发起
-    //    命令，但要能回应握手与响应。
+    // 0) 配对信息交给 ESP-NOW：单播 peer 必须先登记进 peer list，否则手上的帧
+    //    一律发送失败。幂等（只有真的换了对端才会变化）；执行侧（Local 模式）同样
+    //    需要——它不发起命令，但要能回应交互。
     const u8 *peer_mac = peer_mac_key().cached();
     if (peer_mac != nullptr)
     {
         (void)peer_add(peer_mac);
-        m_arq.set_peer(peer_mac);
     }
 
     // 1) 对端下发的速率档位
@@ -312,8 +337,7 @@ void WirelessLink::poll()
         (void)set_wifi_rate(rate);
     }
 
-    // 2) 交付路径登记下来的线编码参数。configure 会调 UART 驱动，而交付跑在 ARQ
-    //    任务里（正在守着重传定时器），所以只登记、在这里应用。
+    // 2) 交付路径登记下来的线编码参数：configure 会调 UART 驱动，只登记、在这里应用。
     portENTER_CRITICAL(&m_line_coding_lock);
     const bool coding_pending = m_line_coding_pending;
     const PendingLineCoding coding = m_pending_line_coding;
@@ -325,47 +349,14 @@ void WirelessLink::poll()
                                                             coding.parity);
     }
 
-    // 3) 熔断期的主动探针：主机可能根本没有命令可提交（空闲），光靠"提交时试探"
-    //    恢复不了。打一个 Ping——不可靠、不占窗口、不动会话，对端回 Pong 就证明
-    //    链路双向可用；交付路径的 Pong 分支会清掉熔断。
-    const u32 now = now_ms();
-    if (m_arq.snapshot().breaker_open && static_cast<i32>(now - m_arq_probe_tx_ms) >= 0)
-    {
-        const ArqSettings settings = m_arq.settings();
-        m_arq_probe_tx_ms = now + settings.breaker_probe_ms;
-
-        const u8 *probe_mac = peer_mac_key().cached();
-        if (probe_mac != nullptr)
-        {
-            const esp_err_t ret = send_ping(probe_mac, ARQ_PROBE_TOKEN);
-            if (ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "ARQ probe ping failed: %s", esp_err_to_name(ret));
-            }
-            else
-            {
-                ESP_LOGW(TAG, "ARQ breaker open: probe ping sent");
-            }
-        }
-    }
+    // 3) 串口出向缓冲
+    poll_uart_egress();
 }
 
 esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 {
-    // 走不可靠路径：这条路是探测、配对与配置通道控制帧的通道，它们要么发生在
-    // 会话建立之前，要么本来就不该重传（探活重传会污染 RTT 判定）。
-    return submit_packet(dest_mac, packet, ArqLink::Reliability::Unreliable, false);
-}
-
-esp_err_t WirelessLink::submit_packet(const u8 *dest_mac, const Packet &packet, ArqLink::Reliability reliability,
-                                      bool loss_injectable, u16 *seq_out, const ResponseContext &response)
-{
-    ArqLink::TxOptions options = {};
-    options.reliable = reliability;
-    options.loss_injectable = loss_injectable;
-
-    // 序列化缓冲是对象成员：发送 helper 会被 CDC 回调、UART 桥任务、USB 任务与
-    // 主循环调用，用互斥量把"序列化 + 提交"串起来。提交只入环，锁内不做等待。
+    // 序列化缓冲是对象成员：发送 helper 会被 CDC 回调、USB 任务与主循环调用，
+    // 用互斥量把序列化串起来。
     xSemaphoreTake(m_pack_mutex, portMAX_DELAY);
 
     const esp_err_t ret = packet.serialize(m_pack_frame, sizeof(m_pack_frame));
@@ -376,44 +367,18 @@ esp_err_t WirelessLink::submit_packet(const u8 *dest_mac, const Packet &packet, 
         return ret;
     }
 
-    const u16 len = static_cast<u16>(packet.serialized_size());
-    const ArqLink::Submit submitted =
-        response.is_response
-            ? m_arq.submit_response(response.cmd_seq, m_pack_frame, len, dest_mac, options)
-            : m_arq.submit(m_pack_frame, len, dest_mac, options, seq_out);
-
+    const esp_err_t send_ret = send_frame(dest_mac, m_pack_frame, packet.serialized_size());
     xSemaphoreGive(m_pack_mutex);
-
-    // DAP 业务一旦提交就认定链路进入"DAP 忙"窗口：串口准入据此压低额度，把空口
-    // 留给命令与响应。只按业务类型记账，串口帧自己走可靠通道不算在内。
-    if (submitted == ArqLink::Submit::Ok && is_dap_traffic(packet.packet_type))
-    {
-        m_last_dap_tx_ms = now_ms();
-    }
-
-    switch (submitted)
-    {
-    case ArqLink::Submit::Ok:
-        return ESP_OK;
-    case ArqLink::Submit::NoPeer:
-        return ESP_ERR_NOT_FOUND;
-    case ArqLink::Submit::QueueFull:
-        return ESP_ERR_NO_MEM;
-    default:
-        return ESP_ERR_INVALID_STATE;
-    }
+    return send_ret;
 }
 
-esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len, bool reliable,
-                                 bool loss_injectable)
+esp_err_t WirelessLink::send_frame(const u8 *dest_mac, const u8 *data, size_t len)
 {
-    // reliable 表示"本帧属于可靠传输机制"（数据帧、纯确认与会话重置）：它们是
-    // 空口的主要用户，撞上发送锁时也值得等。
     const u32 now = now_ms();
 
     // 退避窗口内不再触碰驱动。持续满速冲击会把 ESP-NOW 的发送队列带进不可恢复
-    // 的状态（NO_MEM，或对端持续不应答），只有重启设备才能解开——宁可丢尽力而为的帧。
-    if (!reliable && espnow_backoff_active(now))
+    // 的状态（NO_MEM，或对端持续不应答），只有重启设备才能解开——宁可丢帧。
+    if (espnow_backoff_active(now))
     {
         return ESP_ERR_TIMEOUT;
     }
@@ -422,24 +387,20 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
     {
         return ESP_ERR_INVALID_STATE;
     }
-    if (xSemaphoreTake(m_tx_mutex, reliable ? portMAX_DELAY : 0) != pdTRUE)
+    if (xSemaphoreTake(m_tx_mutex, 0) != pdTRUE)
     {
         return ESP_ERR_TIMEOUT;
     }
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    // 注入丢帧，只对调用方声明可丢的帧生效。被丢的帧照旧计入 wl_tx_bytes：真实
-    // 丢包时底层发送也是返回成功、这个计数照样加，两种丢帧因此在统计上
-    // 不可区分（差别只在 send_cb 那条 ESP-NOW send failed 日志——注入不产生它，
-    // 逐帧日志会扰动时序）。
-    if (loss_injectable && loss_should_drop())
+    // 注入丢帧：被丢的帧照旧计入 wl_tx_bytes，真实丢包时底层发送也返回成功、
+    // 这个计数照样加，两种丢帧在统计上不可区分。
+    if (loss_should_drop())
     {
         xSemaphoreGive(m_tx_mutex);
         Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(len));
         return ESP_OK;
     }
-#else
-    (void)loss_injectable;
 #endif
 
     const esp_err_t send_ret = EspNowTransport::instance().send_to(dest_mac, std::span<const u8>{data, len});
@@ -461,8 +422,8 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
 
 bool WirelessLink::uart_tx_admit(size_t len, UartSource source)
 {
-    // 链路正忙就压低串口额度，把空口让给 DAP。判据用"最近提交过 DAP 业务包"的
-    // 时间戳而不是 ARQ 的 in_flight：准入跑在每一帧串口数据上，不能在那里取锁。
+    // 链路正忙就压低串口额度，把空口让给 DAP。判据是"最近提交过 DAP 业务包"的
+    // 时间戳：准入跑在每一帧串口数据上，不能在那里取锁。
     const u32 now = now_ms();
     u32 bytes_per_s = CONFIG_MEGUMINLINK_UART_TX_MAX_BPS / 10;
     if ((now - m_last_dap_tx_ms) < DAP_BUSY_WINDOW_MS)
@@ -539,79 +500,24 @@ void WirelessLink::clear_espnow_backoff(u32 now)
     portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
-esp_err_t WirelessLink::send_dap_command(const u8 *dest_mac, const u8 *data, size_t len, u8 channel, u16 req_id,
-                                         u16 *seq_out)
+esp_err_t WirelessLink::send_dap_command(const u8 *, const u8 *, size_t, u8, u16, u16 *)
 {
-    if (len > MAX_DAP_PAYLOAD_SIZE)
-    {
-        ESP_LOGE(TAG, "DAP command too large (%u bytes, max %u)", static_cast<unsigned>(len),
-                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // Packet 为指针视图：data 指向调用方命令缓冲，零拷贝
-    Packet packet;
-    packet.packet_type = PacketType::DapCommand;
-    auto &content = packet.payload.dap_command;
-    content.req_id = req_id;
-    content.len = static_cast<u16>(len);
-    content.channel = channel;
-    content.data = data;
-    return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, seq_out);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-esp_err_t WirelessLink::send_dap_response(const u8 *dest_mac, const u8 *data, size_t len, u16 req_id, u16 cmd_seq)
+esp_err_t WirelessLink::send_dap_response(const u8 *, const u8 *, size_t, u16, u16)
 {
-    if (len > MAX_DAP_PAYLOAD_SIZE)
-    {
-        ESP_LOGE(TAG, "DAP response too large (%u bytes, max %u)", static_cast<unsigned>(len),
-                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // Packet 为指针视图：data 指向调用方响应缓冲，零拷贝
-    Packet packet;
-    packet.packet_type = PacketType::DapResponse;
-    auto &content = packet.payload.dap_response;
-    content.req_id = req_id;
-    content.len = static_cast<u16>(len);
-    content.data = data;
-
-    // ARQ 层的记账用命令的可靠传输序号（重传重放），业务层的配对用 req_id
-    const ResponseContext response = {true, cmd_seq};
-    return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, true, nullptr, response);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-esp_err_t WirelessLink::send_uart_frame(const u8 *data, size_t len, UartSource source,
-                                         ArqLink::Reliability reliability)
+esp_err_t WirelessLink::send_uart_frame(const u8 *, size_t, UartSource, ArqLink::Reliability)
 {
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr)
-    {
-        // 未配对时通常还在配对流程（PC 端不会发串口数据），DEBUG 级即可
-        ESP_LOGD(TAG, "no paired peer, %u bytes dropped", static_cast<unsigned>(len));
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    if (len > MAX_UART_PAYLOAD_SIZE)
-    {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    // Packet 为指针视图：data 指向调用方串口缓冲，零拷贝
-    Packet packet;
-    packet.packet_type = (source == UartSource::Host) ? PacketType::UartFromHost : PacketType::UartFromTarget;
-    auto &content = packet.payload.uart_data;
-    content.len = static_cast<u16>(len);
-    content.data = data;
-
-    return submit_packet(peer_mac, packet, reliability, true);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource source)
 {
-    // 调用方必须是能睡的端口任务（UART 桥），不能是 ARQ 任务：缓冲只有 ARQ 任务
-    // 在排空，在它自己的上下文里等空间会把排空一起等死。
+    // 调用方必须是能睡的端口任务（UART 桥）：排在缓冲里的字节由主循环排空。
     UartEgress &egress = uart_egress(source);
     size_t done = 0;
 
@@ -627,10 +533,6 @@ size_t WirelessLink::send_uart_data(const u8 *data, size_t len, UartSource sourc
         vTaskDelay(pdMS_TO_TICKS(UART_PUSH_WAIT_STEP_MS));
     }
 
-    if (done > 0)
-    {
-        m_arq.wake();
-    }
     return done;
 }
 
@@ -641,12 +543,7 @@ size_t WirelessLink::uart_egress_space(UartSource source)
 
 size_t WirelessLink::push_uart_egress(const u8 *data, size_t len, UartSource source)
 {
-    const size_t written = uart_egress(source).push(data, len);
-    if (written > 0)
-    {
-        m_arq.wake();
-    }
-    return written;
+    return uart_egress(source).push(data, len);
 }
 
 void WirelessLink::flush_uart_egress()
@@ -663,7 +560,6 @@ void WirelessLink::set_host_uart_fill(HostUartFill fill, void *ctx)
 
 void WirelessLink::notify_uart_egress()
 {
-    m_arq.wake();
 }
 
 bool WirelessLink::uart_reliable() const
@@ -680,11 +576,6 @@ void WirelessLink::set_uart_reliable(bool reliable)
 UartEgress &WirelessLink::uart_egress(UartSource source)
 {
     return (source == UartSource::Host) ? m_host_uart : m_target_uart;
-}
-
-void WirelessLink::arq_poll(void *ctx)
-{
-    static_cast<WirelessLink *>(ctx)->poll_uart_egress();
 }
 
 void WirelessLink::poll_uart_egress()
@@ -710,31 +601,7 @@ void WirelessLink::poll_uart_egress()
 
 WirelessLink::UartVerdict WirelessLink::uart_frame_verdict() const
 {
-    if (!m_uart_reliable)
-    {
-        return UartVerdict::Unreliable;
-    }
-
-    // 窗口只有一格时可靠通道自己都不够用：串口退回尽力而为，至少还发得出去
-    const ArqSettings settings = m_arq.settings();
-    if (settings.window <= 1)
-    {
-        return UartVerdict::Unreliable;
-    }
-
-    // DAP 的可靠消息还在待发环里排队：先让它走，窗口不会因为串口帧而晚推进
-    if (m_arq.reliable_pending() > 0)
-    {
-        return UartVerdict::Wait;
-    }
-
-    // 留一整个窗口槽给 DAP：串口最多占 window - 1 条，DAP 的命令与响应随时插得进来
-    const ArqLink::Snapshot arq = m_arq.snapshot();
-    if (static_cast<size_t>(arq.in_flight) + 1 >= settings.window)
-    {
-        return UartVerdict::Wait;
-    }
-    return UartVerdict::Reliable;
+    return UartVerdict::Unreliable;
 }
 
 void WirelessLink::drain_uart_egress(UartEgress &egress, UartSource source)
@@ -769,13 +636,6 @@ void WirelessLink::drain_uart_egress(UartEgress &egress, UartSource source)
         }
 
         egress.consume(n);
-
-        // 可靠帧进的是待发环，真正发出在下一轮 drain_tx：立刻唤醒把窗口推进一格，
-        // 否则只能等兜底节拍，一拍的节流就够把下载拖成超时
-        if (reliability == ArqLink::Reliability::Reliable)
-        {
-            m_arq.wake();
-        }
     }
 }
 
@@ -794,8 +654,7 @@ esp_err_t WirelessLink::send_line_coding(u32 baud, u8 data_bits, u8 stop_bits, u
     content.data_bits = data_bits;
     content.stop_bits = stop_bits;
     content.parity = parity;
-    // 线编码丢了就静默不跟手，值得一次重传预算
-    return submit_packet(peer_mac, packet, ArqLink::Reliability::Reliable, true);
+    return send(peer_mac, packet);
 }
 
 esp_err_t WirelessLink::send_ping(const u8 *dest_mac, u32 token)
@@ -827,62 +686,22 @@ esp_err_t WirelessLink::send_relayed_usb_control(const u8 *dest_mac, const paylo
     Packet packet;
     packet.packet_type = PacketType::RelayedUsbControl;
     packet.payload.relayed_usb_control = req;
-    // 这是一次设置下发，丢了不会有人重来：走可靠路径，且不参与注入丢帧
-    // （否则丢包率调高时连"改回来"的控制请求都要靠重传才到）
-    return submit_packet(dest_mac, packet, ArqLink::Reliability::Reliable, false);
+    return send(dest_mac, packet);
 }
 
-esp_err_t WirelessLink::submit_dap_command(const u8 *cmd, size_t len, u8 channel, u16 req_id, u16 *seq_out)
+esp_err_t WirelessLink::submit_dap_command(const u8 *, size_t, u8, u16, u16 *)
 {
-    const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac == nullptr)
-    {
-        ESP_LOGW(TAG, "Wireless: no paired peer, %u-byte DAP request dropped", static_cast<unsigned>(len));
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // 会话握手（ArqReset）必须先完成：两端序号基准没对齐时发出去的命令会被对端
-    // 当成重复帧丢掉，而对端回报的累积确认号又会把它"确认"掉，命令静默消失。
-    // 握手由 ARQ 任务周期重发 + 对端回显驱动，这里只等结果。
-    m_arq.set_peer(peer_mac);
-    const TickType_t handshake_start = xTaskGetTickCount();
-    while (!m_arq.established())
-    {
-        if (static_cast<u32>((xTaskGetTickCount() - handshake_start) * portTICK_PERIOD_MS) >=
-            ArqLink::HANDSHAKE_TIMEOUT_MS)
-        {
-            ESP_LOGW(TAG, "Wireless: ARQ session not aligned within %u ms, %u-byte request dropped",
-                     static_cast<unsigned>(ArqLink::HANDSHAKE_TIMEOUT_MS), static_cast<unsigned>(len));
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    u16 seq = 0;
-    const esp_err_t ret = send_dap_command(peer_mac, cmd, len, channel, req_id, &seq);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Wireless: cannot submit %u-byte DAP request: %s", static_cast<unsigned>(len),
-                 esp_err_to_name(ret));
-        return ret;
-    }
-
-    if (seq_out != nullptr)
-    {
-        *seq_out = seq;
-    }
-    ESP_LOGD(TAG, "Wireless: DAP request %uB seq=%u submitted", static_cast<unsigned>(len), seq);
-    return ESP_OK;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-bool WirelessLink::take_failed_command(u16 *seq_out)
+bool WirelessLink::take_failed_command(u16 *)
 {
-    return m_arq.take_failed(seq_out);
+    return false;
 }
 
 bool WirelessLink::can_submit_command()
 {
-    return m_arq.can_submit();
+    return false;
 }
 
 // ---- 无线侧 DAP 执行接线 ----
@@ -930,9 +749,7 @@ void WirelessLink::dap_resp_sink(const u8 *data, u16 len, void *arg)
 {
     auto *link = static_cast<WirelessLink *>(arg);
 
-    // 响应走可靠传输，序号与确认由 ARQ 层给，并记下它回的是哪条命令——对端重传
-    // 那条命令时据此重放这条响应，而不是把命令再执行一遍。窗口满不会丢响应：
-    // 它在 ARQ 层的待发环里等窗口空位。
+    // 响应按最近一条命令的请求号回发；DAP 窗口关闭期间这里只会拿到不支持。
     const esp_err_t ret =
         link->send_dap_response(link->m_dap_src_mac, data, len, link->m_dap_req_id, link->m_dap_cmd_seq);
     if (ret != ESP_OK)
@@ -950,165 +767,40 @@ void WirelessLink::dap_task_fn(void *arg)
                      sizeof(link->m_dap_request), link->m_dap_response, sizeof(link->m_dap_response));
 }
 
-esp_err_t WirelessLink::dap_execute(const u8 *src_mac, u16 cmd_seq, u16 req_id, const u8 *data, size_t len,
-                                    u8 channel)
-{
-    if (m_dap_queue == nullptr)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (len > MAX_DAP_PAYLOAD_SIZE)
-    {
-        ESP_LOGW(TAG, "DAP command too large (%u bytes, max %u), dropped", static_cast<unsigned>(len),
-                 static_cast<unsigned>(MAX_DAP_PAYLOAD_SIZE));
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    DapExecuteRequest req = {};
-    std::memcpy(req.src_mac, src_mac, ESP_NOW_ETH_ALEN);
-    req.cmd_seq = cmd_seq;
-    req.req_id = req_id;
-    req.len = static_cast<u16>(len);
-    req.channel = channel;
-    std::memcpy(req.data, data, len);
-
-    if (xQueueSend(m_dap_queue, &req, 0) != pdTRUE)
-    {
-        m_cmd_queue_dropped = m_cmd_queue_dropped + 1;
-        ESP_LOGW(TAG, "DAP command queue full, command dropped");
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
 u32 WirelessLink::cmd_queue_dropped() const
 {
     return m_cmd_queue_dropped;
 }
 
-// ---- ARQ 接线 ----
-// ARQ 层自带任务，本层与它之间只有两件事：把一帧缓冲发出去（arq_send_raw），
-// 以及把一条到达的载荷交给业务（arq_deliver）。序号、窗口、重传与确认全在那一层，
-// 本层不参与——它只知道"这是什么业务包"。
+// ---- 设置与查询 ----
 
 bool WirelessLink::arq_established() const
 {
-    return m_arq.established();
+    return false;
 }
 
 ArqLink::Snapshot WirelessLink::arq_snapshot() const
 {
-    return m_arq.snapshot();
+    return {};
 }
 
 ArqSettings WirelessLink::arq_settings() const
 {
-    return m_arq.settings();
+    return m_settings;
 }
 
 esp_err_t WirelessLink::arq_apply_settings(const ArqSettings &settings)
 {
-    return m_arq.apply_settings(settings);
+    m_settings = settings;
+    return ESP_OK;
 }
 
 bool WirelessLink::arq_take_settings_dirty()
 {
-    return m_arq.take_settings_dirty();
+    return false;
 }
 
 void WirelessLink::notify_link_alive()
 {
-    m_arq.request_link_alive();
 }
 
-void WirelessLink::arq_send_raw(void *ctx, const u8 *dest_mac, const u8 *data, size_t len, bool reliable,
-                                bool loss_injectable)
-{
-    auto *self = static_cast<WirelessLink *>(ctx);
-    const esp_err_t ret = self->send_raw(dest_mac, data, len, reliable, loss_injectable);
-    if (ret != ESP_OK && reliable)
-    {
-        ESP_LOGW(TAG, "Failed to send reliable frame to " MACSTR ": %s", MAC2STR(dest_mac), esp_err_to_name(ret));
-    }
-}
-
-void WirelessLink::arq_deliver(void *ctx, const u8 *src_mac, u16 seq, const u8 *payload, u16 len)
-{
-    auto *self = static_cast<WirelessLink *>(ctx);
-    auto &app = Application::get_instance();
-
-    // 反序列化落在对象成员上：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉 ARQ
-    // 任务的栈。本函数是这条路径的唯一使用者（任务上下文单线程）。
-    Packet packet;
-    if (packet.deserialize(payload, len, self->m_rx_storage, sizeof(self->m_rx_storage)) != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Failed to deserialize %u-byte payload from " MACSTR, static_cast<unsigned>(len),
-                 MAC2STR(src_mac));
-        return;
-    }
-
-    // 交付回调必须只做非阻塞的事：它跑在 ARQ 任务里，重活会推迟重传定时器。
-    // 需要碰驱动的操作（速率、线编码）因此只登记，留给主循环 poll()。
-    switch (packet.packet_type)
-    {
-    case PacketType::DapCommand: {
-        // 命令直通投递（不经主循环）。A/B 实测（2026-08-15）：这是最大收益项——
-        // 接收端（C3，单核）原来每帧要经主循环中转，而 esp_wifi 任务收帧后持续
-        // 占用 CPU，主循环迟迟得不到调度，每命令多 ~9ms。
-        const auto &cmd = packet.payload.dap_command;
-        const esp_err_t ret = self->dap_execute(src_mac, seq, cmd.req_id, cmd.data, cmd.len, cmd.channel);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGW(TAG, "Failed to enqueue DAP command from " MACSTR ": %s", MAC2STR(src_mac),
-                     esp_err_to_name(ret));
-        }
-        return;
-    }
-    case PacketType::DapResponse: {
-        // 响应带上它所回应的命令序号：USB 侧按它精确配对，重传触发的响应重放
-        // 因此会被识别为重复而丢弃，不会让主机端的响应流多出一条
-        const auto &resp = packet.payload.dap_response;
-        app.push_wireless_response(resp.req_id, resp.data, resp.len);
-        return;
-    }
-    case PacketType::UartFromHost: {
-        // 方向由包类型承载——来自主机侧的写本机 UART TX。只做一次拷贝入队，真正的
-        // 写入（写 UART 会阻塞）留给桥的 tx 任务。
-        const auto &uart = packet.payload.uart_data;
-        app.forward_uart_data_from_wireless(uart.data, uart.len, UartSource::Host);
-        return;
-    }
-    case PacketType::UartFromTarget: {
-        const auto &uart = packet.payload.uart_data;
-        app.forward_uart_data_from_wireless(uart.data, uart.len, UartSource::Target);
-        return;
-    }
-    case PacketType::UartLineCoding: {
-        // configure 会调 UART 驱动，不能占着 ARQ 任务的重传定时器：登记给主循环
-        const auto &lc = packet.payload.uart_line_coding;
-        portENTER_CRITICAL(&self->m_line_coding_lock);
-        self->m_pending_line_coding.baud = lc.baud;
-        self->m_pending_line_coding.data_bits = lc.data_bits;
-        self->m_pending_line_coding.stop_bits = lc.stop_bits;
-        self->m_pending_line_coding.parity = lc.parity;
-        self->m_line_coding_pending = true;
-        portEXIT_CRITICAL(&self->m_line_coding_lock);
-        return;
-    }
-    case PacketType::RelayedUsbControl: {
-        // 对端转发的 USB 控制请求（无 USB 侧的设置下发通路）：与 USB 侧同一张命令表，
-        // 这里只解包投递，执行在主循环——命令可能操作 WiFi 驱动，不能在交付路径里重入。
-        const auto &relay = packet.payload.relayed_usb_control;
-        app.config_channel().on_relayed_control(relay);
-        return;
-    }
-    default: {
-        // 配对控制帧与 Ping/Pong：维持经主循环统一驱动状态机的原路径
-        ReceivedPacket rp = {};
-        std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
-        rp.packet = packet;
-        app.push_received_packet(rp);
-        return;
-    }
-    }
-}

@@ -35,13 +35,6 @@ struct DapExecuteRequest
     u8 data[MAX_DAP_PAYLOAD_SIZE];
 };
 
-/** 响应型提交的上下文：本条载荷回应的是哪条命令（序号由对端分配） */
-struct ResponseContext
-{
-    bool is_response = false;
-    u16 cmd_seq = 0;
-};
-
 /**
  * ESP-NOW 发送速率默认档位（11g OFDM 24 Mbps）。
  *
@@ -87,14 +80,12 @@ inline constexpr u8 MAX_LOSS_PERMILLE = 255;
  * 业务包回发给来源；发送端（USB 侧）经 submit_dap_command 提交命令，响应由接收
  * 回调入队后按命令的请求号配回。
  *
- * 可靠性归 arq_link 管：本层只负责"这是什么业务包"，每条发送通路在调用
- * m_arq.submit 时显式给出自己的可靠性等级——本层不按包类型猜。
  * 实例由 Application 持有（m_wireless_link），与 m_usb/m_pairing 同模式。
  */
 class WirelessLink
 {
   public:
-    /** 初始化 WiFi/ESP-NOW、登记广播 peer，并创建无线侧 DAP 执行器（幂等） */
+    /** 初始化传输层，并创建无线侧 DAP 执行器（幂等） */
     esp_err_t init();
 
     /**
@@ -145,7 +136,7 @@ class WirelessLink
     /**
      * 无线路径：把一段串口数据交给对应的出向缓冲。
      *
-     * 数据落进缓冲后由 ARQ 任务的空闲钩子逐帧发出：主机一侧有 CDC 反压，缓冲满
+     * 数据落进缓冲后由主循环的空闲钩子逐帧发出：主机一侧有 CDC 反压，缓冲满
      * 了就不再取端点；目标一侧没有流控，缓冲满时有限等待，仍然放不下才丢弃。
      *
      * @param source 数据来自本机哪个端口：UartSource::Host 封成 UartFromHost 包
@@ -158,7 +149,7 @@ class WirelessLink
     /**
      * 串口出向缓冲的剩余空间（两个方向各一条，按 source 选）。
      *
-     * 主机一次写进来的字节先落进环形缓冲，再由 ARQ 任务的空闲钩子按令牌速率
+     * 主机一次写进来的字节先落进环形缓冲，再由主循环的空闲钩子按令牌速率
      * 逐帧发出；缓冲满了就不取新数据，端点 NAK 把压力反传给主机。
      */
     size_t uart_egress_space(UartSource source);
@@ -169,12 +160,12 @@ class WirelessLink
 
     /**
      * 数据的来处：由 Application 接到 USB 层，本层不直接依赖它。
-     * 回调在 ARQ 任务里被调用，实现方负责"有多少空间取多少字节并 push"。
+     * 回调在主循环里被调用，实现方负责"有多少空间取多少字节并 push"。
      */
     using HostUartFill = void (*)(void *ctx);
     void set_host_uart_fill(HostUartFill fill, void *ctx);
 
-    /** 有新数据可发：唤醒 ARQ 任务立即排空，不用等兜底节拍 */
+    /** 有新数据可发（主循环按拍排空） */
     void notify_uart_egress();
 
     /** 串口出向是否走可靠传输（主机经配置通道 0x1D 下发，出厂默认开） */
@@ -249,10 +240,10 @@ class WirelessLink
 #endif
 
     /**
-     * 主循环每拍调用：应用对端经 RelayedUsbControl 下发的速率档位、应用可靠
-     * 传输收到的线编码参数，并在链路熔断时打主动探针。
+     * 主循环每拍调用：应用对端经 RelayedUsbControl 下发的速率档位、应用收到的
+     * 线编码参数，并排空串口出向缓冲。
      *
-     * 速率变更与 UART 参数都会操作驱动，不能在交付路径（ARQ 任务）里执行，
+     * 速率变更与 UART 参数都会操作驱动，不能在交付路径（esp_wifi 任务）里执行，
      * 因此接收侧只登记待生效值，实际应用在这里。
      */
     void poll();
@@ -324,19 +315,6 @@ class WirelessLink
     /** 从 peer list 删除一个对端 peer（配对放弃/完成时归还槽位） */
     esp_err_t peer_remove(const u8 *peer_mac);
 
-    /**
-     * 投递一条无线接收到的 DAP 命令给执行器（异步入队，立即返回）。
-     * @param src_mac 命令来源 MAC（响应回发地址，6 字节）
-     * @param cmd_seq 该命令在可靠传输里的序号；回响应时按它记账，
-     *                对端重传同一条命令时据此重放响应而不是重新执行
-     * @param req_id  主机为该命令分配的请求号：响应原样带回，供主机精确配对
-     * @param data    DAP 命令原样字节流
-     * @param len     命令长度（> MAX_DAP_PAYLOAD_SIZE 时拒绝）
-     * @param channel 该命令来自的主机侧 USB 通道（DAP_CHANNEL_*）：执行器据此回答
-     *                DAP_Info 的单包尺寸
-     */
-    esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, u16 req_id, const u8 *data, size_t len, u8 channel);
-
   private:
     /** Transport 回调（C 函数指针，实例经 ctx 传入） */
     static void on_frame(void *ctx, const u8 *src_mac, const u8 *data, usize len);
@@ -351,26 +329,8 @@ class WirelessLink
     static void dap_resp_sink(const u8 *data, u16 len, void *arg);
     static void dap_task_fn(void *arg);
 
-    /** ARQ 层的裸发送回调：只把这段缓冲交给 ESP-NOW，不认识内容 */
-    static void arq_send_raw(void *ctx, const u8 *dest_mac, const u8 *data, size_t len, bool reliable,
-                             bool loss_injectable);
-
-    /** ARQ 层的交付回调：解析业务包并按类型分派（跑在 ARQ 任务上下文） */
-    static void arq_deliver(void *ctx, const u8 *src_mac, u16 seq, const u8 *payload, u16 len);
-
-    /**
-     * 把一段缓冲发给 ESP-NOW。只取发送锁，不碰 ARQ 状态——本函数的调用方（ARQ
-     * 任务）正是 ARQ 状态的持有者，反过来再取会死锁。
-     */
-    esp_err_t send_raw(const u8 *dest_mac, const u8 *data, size_t len, bool reliable, bool loss_injectable);
-
-    /**
-     * 序列化一个业务包并交给 ARQ 层（命令与响应共用这一条出口）。序列化缓冲是
-     * 对象成员，多上下文调用由 m_pack_mutex 串起来（提交本身是异步入环，锁内
-     * 不做等待）。
-     */
-    esp_err_t submit_packet(const u8 *dest_mac, const Packet &packet, ArqLink::Reliability reliability,
-                            bool loss_injectable, u16 *seq_out = nullptr, const ResponseContext &response = ResponseContext{});
+    /** 把一段已序列化的缓冲交给 ESP-NOW（退避窗口内直接丢弃） */
+    esp_err_t send_frame(const u8 *dest_mac, const u8 *data, size_t len);
 
     /** 是否处于 ESP-NOW 发送退避窗口内（窗口内只抑制串口数据帧） */
     bool espnow_backoff_active(u32 now) const;
@@ -398,7 +358,7 @@ class WirelessLink
      * 本次发送是否按注入丢包率丢弃。
      *
      * 判定、计数与 PRNG 推进都在调用方持有发送锁期间完成，因此不需要额外的
-     * 临界区（发送会被 ARQ 任务、UART 桥任务与主循环调用）。
+     * 临界区（发送会被 UART 桥任务、USB 任务与主循环调用）。
      */
     bool loss_should_drop();
 #endif
@@ -425,8 +385,8 @@ class WirelessLink
     portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
 
     /**
-     * 对端下发的待应用线编码参数（ARQ 交付路径只登记，主循环应用——configure 会
-     * 调 UART 驱动，不该占用 ARQ 任务的重传定时器）。
+     * 对端下发的待应用线编码参数（交付路径只登记，主循环应用——configure 会调
+     * UART 驱动）。
      */
     struct PendingLineCoding
     {
@@ -495,14 +455,14 @@ class WirelessLink
 
     /**
      * 发送完成回调报失败的连续次数（成功清零）与最近一条失败日志的时刻。
-     * 两者都只由 send_cb（esp_wifi 任务）读写，不需要额外同步。
+     * 两者都只由发送结果回调（esp_wifi 任务）读写，不需要额外同步。
      */
     volatile u8 m_send_fail_streak = 0;
     volatile u32 m_send_fail_log_ms = 0;
 
     /**
      * 最近一次 DAP 业务包（命令/响应/转发的控制请求）提交的时刻。串口准入据此
-     * 判断链路是否正忙：查 ARQ 快照要取锁，而准入跑在收数据的每一帧上。
+     * 判断链路是否正忙：准入跑在收数据的每一帧上，不能取锁。
      *
      * 只看"DAP 业务有没有在占空口"，与这一帧本身是否可靠无关：串口帧走可靠
      * 传输时同样经过可靠通道，若按可靠性记账，串口流量会把自己判成"DAP 忙"
@@ -514,16 +474,15 @@ class WirelessLink
     UartEgress m_host_uart;
     UartEgress m_target_uart;
 
-    /** 串口出向是否走可靠传输（主循环写，ARQ 任务读） */
+    /** 串口出向是否走可靠传输（配置通道写，主循环读） */
     volatile bool m_uart_reliable = true;
 
     /** 数据来处（Application 接上 USB CDC 的读取原语） */
     HostUartFill m_host_uart_fill = nullptr;
     void *m_host_uart_fill_ctx = nullptr;
 
-    /** ARQ 任务的空闲钩子：补读 CDC，再把两条出向缓冲按额度排空 */
+    /** 主循环的空闲钩子：补读 CDC，再把两条出向缓冲按额度排空 */
     void poll_uart_egress();
-    static void arq_poll(void *ctx);
 
     /** 一帧串口数据的传输判定 */
     enum class UartVerdict : u8
@@ -568,19 +527,8 @@ class WirelessLink
     u8 m_dap_request[DAP_MAX_REQUEST_SIZE];
     u8 m_dap_response[DAP_MAX_RESPONSE_SIZE];
 
-    /**
-     * ARQ 层（任务 + 收发状态机 + 会话握手 + 重放，见 arq_link.hpp）。
-     * 它自己持有自己的任务与状态，本层只提交字节与接收交付。
-     */
-    ArqLink m_arq;
-
-    /**
-     * 上一次熔断探针（Ping）的发出时刻。
-     *
-     * 熔断期间主机可能根本没有命令要提交（空闲），光靠"提交时试探"恢复不了；
-     * 主循环按这个时刻周期性地主动打一个探针，把链路状态问回来。
-     */
-    u32 m_arq_probe_tx_ms = 0;
+    /** 可靠传输参数的本层副本：供配置通道读写与回显 */
+    ArqSettings m_settings{};
 
     /** 执行队列满被丢弃的命令数（接收侧跟不上时才会增长） */
     volatile u32 m_cmd_queue_dropped = 0;
