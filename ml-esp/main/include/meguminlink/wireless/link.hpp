@@ -338,9 +338,13 @@ class WirelessLink
     esp_err_t dap_execute(const u8 *src_mac, u16 cmd_seq, u16 req_id, const u8 *data, size_t len, u8 channel);
 
   private:
-    /** ESP-NOW 接收/发送回调（esp_now 要求 C 函数指针，无 arg；经 Application 访问） */
-    static void recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data, int data_len);
-    static void send_cb(const wifi_tx_info_t *send_info, esp_now_send_status_t send_status);
+    /** Transport 回调（C 函数指针，实例经 ctx 传入） */
+    static void on_frame(void *ctx, const u8 *src_mac, const u8 *data, usize len);
+    static void on_rx_stats(void *ctx, u16 bytes, i8 rssi);
+    static void on_tx_result(void *ctx, const u8 *peer_mac, bool ok);
+
+    void handle_frame(const u8 *src_mac, const u8 *data, usize len);
+    void handle_tx_result(bool ok);
 
     /** 无线侧 DAP 执行器回调（arg = 本对象 this）与任务入口 */
     static bool dap_cmd_src(u8 *buf, size_t buf_cap, u16 *len, void *arg);

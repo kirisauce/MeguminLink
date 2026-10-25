@@ -19,6 +19,36 @@ namespace
 {
 /** 发送失败日志的限速间隔 */
 constexpr u32 TX_FAIL_LOG_INTERVAL_MS = 1000;
+
+/**
+ * 由速率枚举值推导 PHY 模式。ESP-NOW 的速率配置要求 phymode 与 rate 一致，
+ * 而 phymode 完全由档位所在段决定（CCK 属 11b、OFDM 属 11g、MCS 属 HT20）。
+ * @return false = 该档位不在 ESP-NOW 可配置的范围内
+ */
+bool phymode_for_rate(u8 rate, wifi_phy_mode_t *mode)
+{
+    if (rate <= WIFI_PHY_RATE_11M_S)
+    {
+        // 0x00-0x07：CCK（短/长前导）。0x04 是 wifi_phy_rate_t 里的空洞
+        if (rate == 0x04)
+        {
+            return false;
+        }
+        *mode = WIFI_PHY_MODE_11B;
+        return true;
+    }
+    if (rate <= WIFI_PHY_RATE_9M)
+    {
+        *mode = WIFI_PHY_MODE_11G; // 0x08-0x0F：OFDM 6-54M
+        return true;
+    }
+    if (rate <= WIFI_PHY_RATE_MCS7_SGI)
+    {
+        *mode = WIFI_PHY_MODE_HT20; // 0x10-0x1F：HT20 MCS0-7（LGI/SGI）
+        return true;
+    }
+    return false; // 超出 11b/11g/HT20：本链路不做支持
+}
 } // namespace
 
 EspNowTransport &EspNowTransport::instance() noexcept
@@ -120,12 +150,12 @@ void EspNowTransport::unbind()
 
 bool EspNowTransport::send(std::span<const u8> data) noexcept
 {
-    return m_bound && send_raw(m_peer_mac, data);
+    return m_bound && transmit(m_peer_mac, data) == ESP_OK;
 }
 
-bool EspNowTransport::send_to(const u8 *peer_mac, std::span<const u8> data) noexcept
+esp_err_t EspNowTransport::send_to(const u8 *peer_mac, std::span<const u8> data) noexcept
 {
-    return send_raw(peer_mac, data);
+    return transmit(peer_mac, data);
 }
 
 void EspNowTransport::set_receive_handler(meaproto::ReceiveFn callback, void *ctx) noexcept
@@ -144,6 +174,12 @@ void EspNowTransport::set_rx_observer_callback(RxObserverFn callback, void *ctx)
 {
     m_rx_observer_callback = callback;
     m_rx_observer_ctx = ctx;
+}
+
+void EspNowTransport::set_tx_result_callback(TxResultFn callback, void *ctx) noexcept
+{
+    m_tx_result_callback = callback;
+    m_tx_result_ctx = ctx;
 }
 
 u32 EspNowTransport::tx_frames() const noexcept
@@ -200,17 +236,20 @@ esp_err_t EspNowTransport::peer_remove(const u8 *peer_mac)
     return ret;
 }
 
-bool EspNowTransport::send_raw(const u8 *peer_mac, std::span<const u8> data) noexcept
+esp_err_t EspNowTransport::transmit(const u8 *peer_mac, std::span<const u8> data) noexcept
 {
-    if (!m_initialized || peer_mac == nullptr || data.empty() || data.size() > ESP_NOW_MAX_DATA_LEN_V2 ||
-        m_tx_mutex == nullptr)
+    if (!m_initialized || peer_mac == nullptr || data.empty() || m_tx_mutex == nullptr)
     {
-        return false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (data.size() > ESP_NOW_MAX_DATA_LEN_V2)
+    {
+        return ESP_ERR_INVALID_SIZE;
     }
 
     if (xSemaphoreTake(m_tx_mutex, pdMS_TO_TICKS(1)) != pdTRUE)
     {
-        return false;
+        return ESP_ERR_TIMEOUT;
     }
     const esp_err_t ret = esp_now_send(peer_mac, data.data(), data.size());
     xSemaphoreGive(m_tx_mutex);
@@ -218,11 +257,44 @@ bool EspNowTransport::send_raw(const u8 *peer_mac, std::span<const u8> data) noe
     if (ret != ESP_OK)
     {
         ++m_tx_failures;
-        return false;
+        return ret;
     }
 
     ++m_tx_frames;
-    return true;
+    return ESP_OK;
+}
+
+esp_err_t EspNowTransport::set_peer_rate(const u8 *peer_mac, u8 rate)
+{
+    if (peer_mac == nullptr || std::memcmp(peer_mac, ESP_NOW_BROADCAST, ESP_NOW_ETH_ALEN) == 0)
+    {
+        return ESP_OK;
+    }
+
+    wifi_phy_mode_t phymode = WIFI_PHY_MODE_HT20;
+    if (!phymode_for_rate(rate, &phymode))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_now_rate_config_t rate_cfg = {};
+    rate_cfg.phymode = phymode;
+    rate_cfg.rate = static_cast<wifi_phy_rate_t>(rate);
+    rate_cfg.ersu = false;
+    rate_cfg.dcm = false;
+    const esp_err_t ret = esp_now_set_peer_rate_config(peer_mac, &rate_cfg);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(0x%02X) failed: %s", static_cast<unsigned>(rate),
+                 esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+bool EspNowTransport::rate_supported(u8 rate) noexcept
+{
+    wifi_phy_mode_t mode;
+    return phymode_for_rate(rate, &mode);
 }
 
 void EspNowTransport::recv_cb(const esp_now_recv_info_t *info, const u8 *data, int len)
@@ -240,38 +312,39 @@ void EspNowTransport::recv_cb(const esp_now_recv_info_t *info, const u8 *data, i
         self.m_rx_observer_callback(self.m_rx_observer_ctx, static_cast<u16>(size), rssi);
     }
 
-    // 首字节高 4 位是协议版本：meaproto 帧交协议层（只认已绑定 peer），其余交非协议回调
-    if (!meaproto::is_protocol_frame(data[0]))
-    {
-        if (self.m_non_meaproto_frame_callback != nullptr)
-        {
-            self.m_non_meaproto_frame_callback(self.m_non_meaproto_frame_ctx, info->src_addr, data, size);
-        }
-        return;
-    }
-
-    if (self.m_receive_callback != nullptr && self.m_bound &&
+    // 协议回调在、peer 已绑定、来源匹配且首字节是协议版本：交协议层；其余交非协议回调
+    if (self.m_receive_callback != nullptr && self.m_bound && meaproto::is_protocol_frame(data[0]) &&
         std::memcmp(info->src_addr, self.m_peer_mac, ESP_NOW_ETH_ALEN) == 0)
     {
         self.m_receive_callback(self.m_receive_ctx, data, size);
+        return;
+    }
+
+    if (self.m_non_meaproto_frame_callback != nullptr)
+    {
+        self.m_non_meaproto_frame_callback(self.m_non_meaproto_frame_ctx, info->src_addr, data, size);
     }
 }
 
-void EspNowTransport::send_cb([[maybe_unused]] const wifi_tx_info_t *info, esp_now_send_status_t status)
+void EspNowTransport::send_cb(const wifi_tx_info_t *info, esp_now_send_status_t status)
 {
-    if (status == ESP_NOW_SEND_SUCCESS)
-    {
-        return;
-    }
-
     EspNowTransport &self = instance();
-    ++self.m_tx_failures;
+    const bool ok = (status == ESP_NOW_SEND_SUCCESS);
 
-    const u32 now = static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (static_cast<i32>(now - self.m_next_fail_log_ms) < 0)
+    if (!ok)
     {
-        return;
+        ++self.m_tx_failures;
+
+        const u32 now = static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (static_cast<i32>(now - self.m_next_fail_log_ms) >= 0)
+        {
+            self.m_next_fail_log_ms = now + TX_FAIL_LOG_INTERVAL_MS;
+            ESP_LOGW(TAG, "ESP-NOW send failed (%u total)", static_cast<unsigned>(self.m_tx_failures));
+        }
     }
-    self.m_next_fail_log_ms = now + TX_FAIL_LOG_INTERVAL_MS;
-    ESP_LOGW(TAG, "ESP-NOW send failed (%u total)", static_cast<unsigned>(self.m_tx_failures));
+
+    if (self.m_tx_result_callback != nullptr)
+    {
+        self.m_tx_result_callback(self.m_tx_result_ctx, (info != nullptr) ? info->des_addr : nullptr, ok);
+    }
 }

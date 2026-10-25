@@ -41,37 +41,6 @@ constexpr size_t DAP_QUEUE_DEPTH = 32;
 /** 熔断期探针 Ping 的 token：只用于自证链路可用，与配置通道的探测 token 互不干扰 */
 constexpr u32 ARQ_PROBE_TOKEN = 0x4D4C5052; // "MLPR"
 
-/**
- * 由速率枚举值推导 PHY 模式。ESP-NOW 的速率配置要求 phymode 与 rate 一致，
- * 而 phymode 完全由档位所在段决定（CCK 属 11b、OFDM 属 11g、MCS 属 HT20），
- * 因此按段推导而不是维护一张与枚举同步的手写表。
- * @return false = 该档位不在 ESP-NOW 可配置的范围内
- */
-bool phymode_for_rate(u8 rate, wifi_phy_mode_t *mode)
-{
-    if (rate <= WIFI_PHY_RATE_11M_S)
-    {
-        // 0x00-0x07：CCK（短/长前导）。0x04 是 wifi_phy_rate_t 里的空洞
-        if (rate == 0x04)
-        {
-            return false;
-        }
-        *mode = WIFI_PHY_MODE_11B;
-        return true;
-    }
-    if (rate <= WIFI_PHY_RATE_9M)
-    {
-        *mode = WIFI_PHY_MODE_11G; // 0x08-0x0F：OFDM 6-54M
-        return true;
-    }
-    if (rate <= WIFI_PHY_RATE_MCS7_SGI)
-    {
-        *mode = WIFI_PHY_MODE_HT20; // 0x10-0x1F：HT20 MCS0-7（LGI/SGI）
-        return true;
-    }
-    return false; // 超出 11b/11g/HT20：本链路不做支持
-}
-
 /** 该业务包是不是 DAP 方向的流量（串口出向准入据此给 DAP 让路） */
 bool is_dap_traffic(PacketType type)
 {
@@ -81,60 +50,60 @@ bool is_dap_traffic(PacketType type)
 
 bool mlink::wifi_rate_supported(u8 rate)
 {
-    wifi_phy_mode_t mode;
-    return phymode_for_rate(rate, &mode);
+    return EspNowTransport::rate_supported(rate);
 }
 
-// ---- ESP-NOW 回调（esp_now 要求 C 函数指针，无 arg 参数；经 Application 访问） ----
+// ---- Transport 回调（C 函数指针，实例经 ctx 传入） ----
 
-void WirelessLink::recv_cb(const esp_now_recv_info_t *recv_info, const u8 *data, int data_len)
+void WirelessLink::on_frame(void *ctx, const u8 *src_mac, const u8 *data, usize len)
 {
-    if (recv_info == nullptr || recv_info->src_addr == nullptr || data == nullptr || data_len <= 0)
-    {
-        return;
-    }
+    static_cast<WirelessLink *>(ctx)->handle_frame(src_mac, data, len);
+}
 
+void WirelessLink::on_rx_stats(void *, u16 bytes, i8 rssi)
+{
     // 链路层统计：收到的每一帧都计（含被判为畸形的帧——它们同样占用了空口与
     // ESP-NOW 任务），RSSI 随帧更新
-    if (recv_info->rx_ctrl != nullptr)
-    {
-        Application::get_instance().config_channel().add_wireless_rx(static_cast<u16>(data_len),
-                                                                     recv_info->rx_ctrl->rssi);
-    }
+    Application::get_instance().config_channel().add_wireless_rx(bytes, rssi);
+}
 
+void WirelessLink::on_tx_result(void *ctx, const u8 *, bool ok)
+{
+    static_cast<WirelessLink *>(ctx)->handle_tx_result(ok);
+}
+
+void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
+{
     // 解析、判重、排序与业务分派都不在回调里做：回调只把原始帧交给 ARQ 层，
     // 那里有独立的 ARQ 任务。回调里做这些会拖住 esp_wifi 任务，而在回调里发帧
     // 更会重入 WiFi 驱动。
-    Application::get_instance().wireless_link().m_arq.on_frame(recv_info->src_addr, data,
-                                                               static_cast<size_t>(data_len));
+    m_arq.on_frame(src_mac, data, len);
 }
 
-void WirelessLink::send_cb([[maybe_unused]] const wifi_tx_info_t *send_info, esp_now_send_status_t send_status)
+void WirelessLink::handle_tx_result(bool ok)
 {
-    auto &self = Application::get_instance().wireless_link();
-
-    if (send_status == ESP_NOW_SEND_SUCCESS)
+    if (ok)
     {
-        self.m_send_fail_streak = 0;
+        m_send_fail_streak = 0;
         return;
     }
 
     const u32 now = now_ms();
-    const u8 streak = (self.m_send_fail_streak < 0xFF) ? static_cast<u8>(self.m_send_fail_streak + 1) : 0xFF;
-    self.m_send_fail_streak = streak;
+    const u8 streak = (m_send_fail_streak < 0xFF) ? static_cast<u8>(m_send_fail_streak + 1) : 0xFF;
+    m_send_fail_streak = streak;
 
     // 连续失败达到阈值：与 NO_MEM 共用同一套退避。退避只抑制尽力而为帧，可靠帧
     // 照发——ARQ 正靠它们在守重传，停掉只会把主机侧拖成超时。
     if (streak >= ESPNOW_TX_FAIL_STREAK_THRESHOLD)
     {
-        self.m_send_fail_streak = 0; // 重新累计：持续失败期间由退避窗口持续刷新
-        self.enter_espnow_backoff(now);
+        m_send_fail_streak = 0; // 重新累计：持续失败期间由退避窗口持续刷新
+        enter_espnow_backoff(now);
     }
 
     // 失败日志限速：差链路下每帧一条会把日志刷满
-    if (static_cast<i32>(now - self.m_send_fail_log_ms) >= 0)
+    if (static_cast<i32>(now - m_send_fail_log_ms) >= 0)
     {
-        self.m_send_fail_log_ms = now + ESPNOW_TX_FAIL_LOG_INTERVAL_MS;
+        m_send_fail_log_ms = now + ESPNOW_TX_FAIL_LOG_INTERVAL_MS;
         ESP_LOGW(TAG, "ESP-NOW send failed (streak %u)", streak);
     }
 }
@@ -173,56 +142,13 @@ esp_err_t WirelessLink::init()
 #endif
 
     esp_err_t ret;
-    ret = mlink::nvs_flash_init();
-    ESP_RETURN_ON_ERROR(ret, TAG, "mlink::nvs_flash_init() failed");
+    EspNowTransport &transport = EspNowTransport::instance();
+    ret = transport.init();
+    ESP_RETURN_ON_ERROR(ret, TAG, "EspNowTransport::init() failed");
 
-    ret = esp_netif_init();
-    ESP_RETURN_ON_ERROR(ret, TAG, "esp_netif_init() failed");
-    ret = esp_event_loop_create_default();
-    ESP_RETURN_ON_ERROR(ret, TAG, "esp_event_loop_create_default() failed");
-
-    {
-        wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ret = esp_wifi_init(&wifi_init_cfg);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_init() failed");
-        ESP_LOGI(TAG, "WiFi initialized");
-
-        ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_storage() failed");
-    }
-
-    {
-        ret = esp_wifi_set_mode(WIFI_MODE_STA);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_mode() failed");
-
-        wifi_config_t wifi_cfg = {};
-        ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_config() failed");
-
-        ret = esp_wifi_start();
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_start() failed");
-
-        // 禁用 WiFi 省电（modem sleep）。A/B 实测（2026-08-15，两端一致）：
-        // PS 默认（MIN_MODEM）3.28-3.40s vs PS 禁用 3.12-3.17s，禁用省电
-        // 贡献 ~0.2s（往返 ~0.3ms/命令）。保留禁用。
-        ret = esp_wifi_set_ps(WIFI_PS_NONE);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s", esp_err_to_name(ret));
-
-        ret = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        ESP_RETURN_ON_ERROR(ret, TAG, "esp_wifi_set_channel() failed");
-    }
-
-    ret = esp_now_init();
-    ESP_RETURN_ON_ERROR(ret, TAG, "esp_now_init() failed");
-
-    ret = peer_add(ESP_NOW_BROADCAST);
-    ESP_RETURN_ON_ERROR(ret, TAG, "peer_add(ESP_NOW_BROADCAST) failed: %s", esp_err_to_name(ret));
-
-    ret = esp_now_register_recv_cb(recv_cb);
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to register ESP-NOW receive callback: %s", esp_err_to_name(ret));
-
-    ret = esp_now_register_send_cb(send_cb);
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to register ESP-NOW send callback: %s", esp_err_to_name(ret));
+    transport.set_non_meaproto_frame_callback(&WirelessLink::on_frame, this);
+    transport.set_rx_observer_callback(&WirelessLink::on_rx_stats, this);
+    transport.set_tx_result_callback(&WirelessLink::on_tx_result, this);
 
     // 无线侧 DAP 执行器：命令队列 + 高优先级任务（收到 DapCommand → 执行 → 回发）
     m_dap_queue = xQueueCreate(DAP_QUEUE_DEPTH, sizeof(DapExecuteRequest));
@@ -256,54 +182,25 @@ err:
 
 esp_err_t WirelessLink::peer_add(const u8 *peer_mac)
 {
-    if (esp_now_is_peer_exist(peer_mac))
-    {
-        // 已存在也确保速率配置正确（重复调用幂等）。
-        return set_peer_rate(peer_mac);
-    }
-
-    esp_now_peer_info_t peer = {};
-    std::memcpy(peer.peer_addr, peer_mac, ESP_NOW_ETH_ALEN);
-    peer.channel = 0;
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
-
-    const esp_err_t ret = esp_now_add_peer(&peer);
+    EspNowTransport &transport = EspNowTransport::instance();
+    const esp_err_t ret = transport.peer_add(peer_mac);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to add peer " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
         return ret;
     }
 
-    return set_peer_rate(peer_mac);
+    // 重复调用是幂等的；速率配置在 peer 存在后总是重新下发给驱动
+    return transport.set_peer_rate(peer_mac, m_rate);
+}
+
+esp_err_t WirelessLink::peer_remove(const u8 *peer_mac)
+{
+    return EspNowTransport::instance().peer_remove(peer_mac);
 }
 
 esp_err_t WirelessLink::set_peer_rate(const u8 *peer_mac)
 {
-    if (peer_mac == nullptr || std::memcmp(peer_mac, ESP_NOW_BROADCAST, ESP_NOW_ETH_ALEN) == 0)
-    {
-        return ESP_OK;
-    }
-
-    // 对端级固定速率由 m_rate 决定。ESP-NOW 的速率以 peer rate config 为准，
-    // 仅设全局接口速率不一定生效；档位越低越稳，长帧尤其明显。
-    wifi_phy_mode_t phymode = WIFI_PHY_MODE_HT20;
-    if (!phymode_for_rate(m_rate, &phymode))
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_now_rate_config_t rate_cfg = {};
-    rate_cfg.phymode = phymode;
-    rate_cfg.rate = static_cast<wifi_phy_rate_t>(m_rate);
-    rate_cfg.ersu = false;
-    rate_cfg.dcm = false;
-    const esp_err_t ret = esp_now_set_peer_rate_config(peer_mac, &rate_cfg);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(0x%02X) failed: %s", m_rate, esp_err_to_name(ret));
-    }
-    return ret;
+    return EspNowTransport::instance().set_peer_rate(peer_mac, m_rate);
 }
 
 u8 WirelessLink::wifi_rate() const
@@ -313,10 +210,9 @@ u8 WirelessLink::wifi_rate() const
 
 esp_err_t WirelessLink::set_wifi_rate(u8 rate)
 {
-    wifi_phy_mode_t phymode = WIFI_PHY_MODE_HT20;
-    if (!phymode_for_rate(rate, &phymode))
+    if (!EspNowTransport::rate_supported(rate))
     {
-        ESP_LOGW(TAG, "Unsupported WiFi rate 0x%02X", rate);
+        ESP_LOGW(TAG, "Unsupported WiFi rate 0x%02X", static_cast<unsigned>(rate));
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -334,7 +230,7 @@ esp_err_t WirelessLink::set_wifi_rate(u8 rate)
         }
     }
 
-    ESP_LOGI(TAG, "WiFi rate set to 0x%02X (phymode %d)", rate, static_cast<int>(phymode));
+    ESP_LOGI(TAG, "WiFi rate set to 0x%02X", static_cast<unsigned>(rate));
     return ESP_OK;
 }
 
@@ -454,21 +350,6 @@ void WirelessLink::poll()
     }
 }
 
-esp_err_t WirelessLink::peer_remove(const u8 *peer_mac)
-{
-    if (!esp_now_is_peer_exist(peer_mac))
-    {
-        return ESP_OK;
-    }
-
-    const esp_err_t ret = esp_now_del_peer(peer_mac);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to remove peer " MACSTR ": %s", MAC2STR(peer_mac), esp_err_to_name(ret));
-    }
-    return ret;
-}
-
 esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 {
     // 走不可靠路径：这条路是探测、配对与配置通道控制帧的通道，它们要么发生在
@@ -548,7 +429,7 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     // 注入丢帧，只对调用方声明可丢的帧生效。被丢的帧照旧计入 wl_tx_bytes：真实
-    // 丢包时 esp_now_send 也是返回成功、这个计数照样加，两种丢帧因此在统计上
+    // 丢包时底层发送也是返回成功、这个计数照样加，两种丢帧因此在统计上
     // 不可区分（差别只在 send_cb 那条 ESP-NOW send failed 日志——注入不产生它，
     // 逐帧日志会扰动时序）。
     if (loss_injectable && loss_should_drop())
@@ -561,7 +442,7 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
     (void)loss_injectable;
 #endif
 
-    const esp_err_t send_ret = esp_now_send(dest_mac, data, len);
+    const esp_err_t send_ret = EspNowTransport::instance().send_to(dest_mac, std::span<const u8>{data, len});
     xSemaphoreGive(m_tx_mutex);
 
     if (send_ret == ESP_ERR_ESPNOW_NO_MEM)
@@ -571,7 +452,7 @@ esp_err_t WirelessLink::send_raw(const u8 *dest_mac, const u8 *data, size_t len,
     else if (send_ret == ESP_OK)
     {
         clear_espnow_backoff(now);
-        // 链路层统计：成功交给 ESP-NOW 的帧（发送结果由 send_cb 另行处理，
+        // 链路层统计：成功交给 ESP-NOW 的帧（发送结果由 tx 结果回调另行处理，
         // 这里只反映"已发出"的字节量）
         Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(len));
     }

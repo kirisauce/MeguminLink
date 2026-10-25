@@ -37,6 +37,9 @@ class EspNowTransport
     /** 收帧观测：把空口字节与 RSSI 交给射频统计 */
     using RxObserverFn = void (*)(void *ctx, u16 bytes, i8 rssi);
 
+    /** 发送结果：peer 未知时为 nullptr */
+    using TxResultFn = void (*)(void *ctx, const u8 *peer_mac, bool ok);
+
     /** 唯一实例 */
     static EspNowTransport &instance() noexcept;
 
@@ -58,13 +61,20 @@ class EspNowTransport
     void set_receive_handler(meaproto::ReceiveFn callback, void *ctx) noexcept;
 
     /** 发给任意已登记的 peer（配对帧与广播） */
-    bool send_to(const u8 *peer_mac, std::span<const u8> data) noexcept;
+    esp_err_t send_to(const u8 *peer_mac, std::span<const u8> data) noexcept;
 
     void set_non_meaproto_frame_callback(NonMeaprotoFrameFn callback, void *ctx) noexcept;
     void set_rx_observer_callback(RxObserverFn callback, void *ctx) noexcept;
+    void set_tx_result_callback(TxResultFn callback, void *ctx) noexcept;
 
     esp_err_t peer_add(const u8 *peer_mac);
     esp_err_t peer_remove(const u8 *peer_mac);
+
+    /** 对端级固定速率（广播地址跳过） */
+    esp_err_t set_peer_rate(const u8 *peer_mac, u8 rate);
+
+    /** 该速率档位是否在 ESP-NOW 可配置范围内 */
+    static bool rate_supported(u8 rate) noexcept;
 
     u32 tx_frames() const noexcept;
     u32 tx_failures() const noexcept;
@@ -75,20 +85,22 @@ class EspNowTransport
     static void recv_cb(const esp_now_recv_info_t *info, const u8 *data, int len);
     static void send_cb(const wifi_tx_info_t *info, esp_now_send_status_t status);
 
-    bool send_raw(const u8 *peer_mac, std::span<const u8> data) noexcept;
+    esp_err_t transmit(const u8 *peer_mac, std::span<const u8> data) noexcept;
 
     // ---- 生命周期与 peer ----
     bool m_initialized = false;
     bool m_bound = false;
     u8 m_peer_mac[ESP_NOW_ETH_ALEN] = {};
 
-    // ---- 收帧出口（回调与上下文成对设置）----
+    // ---- 回调出口（回调与上下文成对设置）----
     meaproto::ReceiveFn m_receive_callback = nullptr; /**< meaproto 协议帧 */
     void *m_receive_ctx = nullptr;
     NonMeaprotoFrameFn m_non_meaproto_frame_callback = nullptr; /**< 非协议帧（配对等） */
     void *m_non_meaproto_frame_ctx = nullptr;
     RxObserverFn m_rx_observer_callback = nullptr; /**< 每帧的字节数与 RSSI */
     void *m_rx_observer_ctx = nullptr;
+    TxResultFn m_tx_result_callback = nullptr; /**< 每帧的发送结果 */
+    void *m_tx_result_ctx = nullptr;
 
     // ---- 发送 ----
     SemaphoreHandle_t m_tx_mutex = nullptr; /**< esp_now_send 串行化 */
