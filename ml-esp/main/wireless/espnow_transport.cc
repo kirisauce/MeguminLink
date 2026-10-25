@@ -136,6 +136,11 @@ esp_err_t EspNowTransport::bind(const u8 *peer_mac)
     return ESP_OK;
 }
 
+bool EspNowTransport::bound_to(const u8 *peer_mac) const noexcept
+{
+    return m_bound && peer_mac != nullptr && std::memcmp(m_peer_mac, peer_mac, ESP_NOW_ETH_ALEN) == 0;
+}
+
 void EspNowTransport::unbind()
 {
     if (!m_bound)

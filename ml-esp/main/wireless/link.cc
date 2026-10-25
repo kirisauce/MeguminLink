@@ -106,6 +106,42 @@ void WirelessLink::handle_tx_result(bool ok)
     }
 }
 
+WirelessLink::WirelessLink() : m_daemon(EspNowTransport::instance(), *this, channels())
+{
+}
+
+std::span<const meaproto::ChannelSpec> WirelessLink::channels()
+{
+    return {};
+}
+
+bool WirelessLink::connected() const
+{
+    return m_daemon.connected();
+}
+
+bool WirelessLink::connecting() const
+{
+    return m_daemon.connecting();
+}
+
+void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
+{
+    // 本阶段没有通道：只记录大小
+    ESP_LOGD(TAG, "message on channel %u (%u bytes) dropped", static_cast<unsigned>(channel.value),
+             static_cast<unsigned>(data.size()));
+}
+
+void WirelessLink::on_connected()
+{
+    ESP_LOGI(TAG, "meaproto connected");
+}
+
+void WirelessLink::on_disconnected(meaproto::DisconnectReason reason)
+{
+    ESP_LOGW(TAG, "meaproto disconnected (reason %u)", static_cast<unsigned>(reason));
+}
+
 esp_err_t WirelessLink::init()
 {
     if (m_initialized)
@@ -134,6 +170,8 @@ esp_err_t WirelessLink::init()
     transport.set_non_meaproto_frame_callback(&WirelessLink::on_frame, this);
     transport.set_rx_observer_callback(&WirelessLink::on_rx_stats, this);
     transport.set_tx_result_callback(&WirelessLink::on_tx_result, this);
+
+    m_daemon.start();
 
     m_initialized = true;
     return ESP_OK;
@@ -245,13 +283,23 @@ bool WirelessLink::loss_should_drop()
 
 void WirelessLink::poll()
 {
-    // 0) 配对信息交给 ESP-NOW：单播 peer 必须先登记进 peer list，否则手上的帧
-    //    一律发送失败。幂等（只有真的换了对端才会变化）；执行侧（Local 模式）同样
-    //    需要——它不发起命令，但要能回应交互。
+    // 0) 配对状态收敛到协议连接：已配对则登记 peer、绑定传输并发起握手；未配对
+    //    则断开并把传输解绑。两步都幂等。
+    EspNowTransport &transport = EspNowTransport::instance();
     const u8 *peer_mac = peer_mac_key().cached();
-    if (peer_mac != nullptr)
+    if (peer_mac == nullptr)
+    {
+        m_daemon.close();
+        transport.unbind();
+    }
+    else
     {
         (void)peer_add(peer_mac);
+        if (!transport.bound_to(peer_mac))
+        {
+            (void)transport.bind(peer_mac);
+        }
+        m_daemon.open();
     }
 
     // 1) 对端下发的速率档位

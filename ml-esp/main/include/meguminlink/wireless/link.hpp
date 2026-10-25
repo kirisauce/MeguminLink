@@ -6,9 +6,13 @@
 #include "esp_now.h"                    // IWYU pragma: export
 #include "esp_wifi.h"                   // IWYU pragma: export
 #include "meguminlink/common.hpp"       // IWYU pragma: keep
+#include "meaproto/daemon.hpp"
 #include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
+#include "meguminlink/wireless/espnow_transport.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "sdkconfig.h"
+
+#include <span>
 
 #include <freertos/FreeRTOS.h> // QueueHandle_t / TaskHandle_t
 #include <freertos/queue.h>
@@ -56,17 +60,18 @@ inline constexpr u8 MAX_LOSS_PERMILLE = 255;
 #endif
 
 /**
- * 无线链路：ESP-NOW 传输 + peer 管理 + 业务包编解码 + 无线侧 DAP 执行接线，
- * 状态全在对象内。与 usb.cc 的 dap_task（USB 侧执行接线）对称：无线传输层把
- * 收到的 DapCommand 交给公共执行器（dap_executor_run）执行，结果以 DapResponse
- * 业务包回发给来源；发送端（USB 侧）经 submit_dap_command 提交命令，响应由接收
- * 回调入队后按命令的请求号配回。
+ * 无线链路：ESP-NOW 传输 + peer 管理 + 配对帧分派 + meaproto 连接外壳。
+ *
+ * 协议连接由 meaproto::Daemon 跑在独立任务上：配对状态变化在 poll() 里收敛成
+ * open()/close()，业务消息经 Sink 回到本类。
  *
  * 实例由 Application 持有（m_wireless_link），与 m_usb/m_pairing 同模式。
  */
-class WirelessLink
+class WirelessLink : private meaproto::Sink
 {
   public:
+    WirelessLink();
+
     /** 初始化传输层并注册回调（幂等） */
     esp_err_t init();
 
@@ -129,6 +134,10 @@ class WirelessLink
      * 待生效值，实际应用在这里。
      */
     void poll();
+
+    /** 协议连接状态 */
+    bool connected() const;
+    bool connecting() const;
 
     /** 会话握手是否已完成（USB 侧据此在转发命令前先等一等） */
     bool arq_established() const;
@@ -264,9 +273,18 @@ class WirelessLink
     u32 m_loss_rng = 1;
 #endif
 
+    // meaproto::Sink
+    void on_message(meaproto::ChannelId channel, std::span<const u8> data) override;
+    void on_connected() override;
+    void on_disconnected(meaproto::DisconnectReason reason) override;
+
+    /** 通道表：本阶段为空 */
+    static std::span<const meaproto::ChannelSpec> channels();
+
     /** 可靠传输参数的本层副本：供配置通道读写与回显 */
     ArqSettings m_settings{};
 
+    meaproto::Daemon<EspNowTransport> m_daemon;
 };
 } // namespace mlink
 

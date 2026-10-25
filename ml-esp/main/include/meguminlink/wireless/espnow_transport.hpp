@@ -53,6 +53,9 @@ class EspNowTransport
     esp_err_t bind(const u8 *peer_mac);
     void unbind();
 
+    /** 当前绑定的 peer 是否就是这个地址 */
+    bool bound_to(const u8 *peer_mac) const noexcept;
+
     // meaproto::Transport
     /** ESP-NOW v2 的载荷上限 */
     static constexpr usize MTU = ESP_NOW_MAX_DATA_LEN_V2;
