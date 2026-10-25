@@ -635,6 +635,14 @@ void unreliable_channel_skips_window()
     check_eq(rig.core.snapshot().datagrams_in_flight, 0);
 }
 
+void reorder_depth_capped_by_bitmap()
+{
+    constexpr ChannelSpec wide[] = {{CH_S, Reliability::ReliableOrdered, 32, 8, 1, 64, 4}};
+    constexpr ChannelSpec capped[] = {{CH_S, Reliability::ReliableOrdered, 32, 8, 1, 32, 4}};
+
+    check_eq(Core::storage_bytes(wide, DEFAULT_CONFIG, MTU), Core::storage_bytes(capped, DEFAULT_CONFIG, MTU));
+}
+
 // ---- 接收侧：去重、排序与延迟确认 ----
 
 /** 一对已连接的 Core：把一方发出的帧喂给另一方 */
@@ -1129,6 +1137,7 @@ const test::Case TESTS[] = {
     {"send quota limits frames per tick", quota_limits_frames_per_tick},
     {"priority orders channels", priority_orders_channels},
     {"unreliable channel skips window", unreliable_channel_skips_window},
+    {"reorder depth capped by ack bitmap", reorder_depth_capped_by_bitmap},
     {"receive delivers in order", receive_in_order},
     {"receive delivers duplicate once", receive_duplicate_once},
     {"receive reorders out-of-order datagrams", receive_out_of_order},

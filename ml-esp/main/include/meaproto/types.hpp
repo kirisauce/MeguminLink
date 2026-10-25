@@ -32,7 +32,7 @@ struct ChannelSpec
     u16 max_payload = 0;                                    /**< 单条消息的载荷上限，不含消息头 */
     u8 queue_depth = 0;                                     /**< 发送队列可排队的消息条数 */
     u8 priority = 0;                                        /**< 发送优先级，数值小的先发 */
-    u8 reorder_depth = 0;                                   /**< 接收重排缓冲可暂存的消息条数，0 时取 queue_depth */
+    u8 reorder_depth = 0;                                   /**< 接收重排缓冲条数，0 时取 queue_depth，上限 32 */
     u8 window = 0;                                          /**< 未确认帧上限，0 时取 Config::datagram_window */
 };
 

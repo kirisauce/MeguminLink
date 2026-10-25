@@ -34,7 +34,7 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
         }
 
         const u16 window = (spec.window != 0) ? spec.window : m_config.datagram_window;
-        const u16 reorder = (spec.reorder_depth != 0) ? spec.reorder_depth : spec.queue_depth;
+        const u16 reorder = reorder_capacity(spec);
         const usize queue_bytes = entry_stride(spec) * spec.queue_depth;
         const usize window_bytes = frame_stride(mtu) * window;
         const usize reorder_bytes = reorder_stride(spec) * reorder;
@@ -80,13 +80,20 @@ usize Core::reorder_stride(const ChannelSpec &spec) noexcept
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
+u16 Core::reorder_capacity(const ChannelSpec &spec) noexcept
+{
+    const u16 wanted = (spec.reorder_depth != 0) ? spec.reorder_depth : spec.queue_depth;
+    const u16 limit = static_cast<u16>(ACK_BITS_WIDTH);
+    return (wanted < limit) ? wanted : limit;
+}
+
 usize Core::storage_bytes(std::span<const ChannelSpec> channels, const Config &config, u16 mtu) noexcept
 {
     usize total = frame_stride(mtu); // 组帧暂存
     for (const ChannelSpec &spec : channels)
     {
         const u16 window = (spec.window != 0) ? spec.window : config.datagram_window;
-        const u16 reorder = (spec.reorder_depth != 0) ? spec.reorder_depth : spec.queue_depth;
+        const u16 reorder = reorder_capacity(spec);
         total += entry_stride(spec) * spec.queue_depth;
         total += frame_stride(mtu) * (window > MAX_WINDOW ? MAX_WINDOW : window);
         total += reorder_stride(spec) * reorder;

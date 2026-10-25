@@ -146,6 +146,9 @@ class Core
     /** 一个重排槽的步长（ordering + 长度 + 载荷，按 u16 对齐） */
     static usize reorder_stride(const ChannelSpec &spec) noexcept;
 
+    /** 有效重排深度：缺省取队列深度，封顶 ACK 位图宽度 */
+    static u16 reorder_capacity(const ChannelSpec &spec) noexcept;
+
     Channel *find_channel(ChannelId channel) noexcept;
     const Channel *find_channel(ChannelId channel) const noexcept;
 
