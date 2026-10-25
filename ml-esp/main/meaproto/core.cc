@@ -34,9 +34,11 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
         }
 
         const u16 window = (spec.window != 0) ? spec.window : m_config.datagram_window;
+        const u16 reorder = (spec.reorder_depth != 0) ? spec.reorder_depth : spec.queue_depth;
         const usize queue_bytes = entry_stride(spec) * spec.queue_depth;
         const usize window_bytes = frame_stride(mtu) * window;
-        if (window > MAX_WINDOW || remaining < queue_bytes + window_bytes)
+        const usize reorder_bytes = reorder_stride(spec) * reorder;
+        if (window > MAX_WINDOW || remaining < queue_bytes + window_bytes + reorder_bytes)
         {
             break;
         }
@@ -50,6 +52,10 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
         channel.window_count = window;
         cursor += window_bytes;
         remaining -= window_bytes;
+        channel.reorder = cursor;
+        channel.reorder_count = reorder;
+        cursor += reorder_bytes;
+        remaining -= reorder_bytes;
     }
 
     m_frame = cursor;
@@ -68,14 +74,22 @@ usize Core::frame_stride(u16 mtu) noexcept
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
+usize Core::reorder_stride(const ChannelSpec &spec) noexcept
+{
+    const usize raw = 2 * sizeof(u16) + spec.max_payload;
+    return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
+}
+
 usize Core::storage_bytes(std::span<const ChannelSpec> channels, const Config &config, u16 mtu) noexcept
 {
     usize total = frame_stride(mtu); // 组帧暂存
     for (const ChannelSpec &spec : channels)
     {
         const u16 window = (spec.window != 0) ? spec.window : config.datagram_window;
+        const u16 reorder = (spec.reorder_depth != 0) ? spec.reorder_depth : spec.queue_depth;
         total += entry_stride(spec) * spec.queue_depth;
         total += frame_stride(mtu) * (window > MAX_WINDOW ? MAX_WINDOW : window);
+        total += reorder_stride(spec) * reorder;
     }
     return total;
 }
@@ -174,6 +188,8 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
     header.flags = FLAG_HAS_DATA;
     header.channel = channel.spec.id.value;
     header.message_count = 1;
+    header.ack_seq = channel.rx_expected;
+    header.ack_bits = channel.rx_bits;
     if (reliable)
     {
         header.flags |= FLAG_NEEDS_ACK;
@@ -212,6 +228,7 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
     {
         return false;
     }
+    channel.ack_pending = false;
 
     if (reliable)
     {
@@ -285,6 +302,7 @@ bool Core::retransmit(u32 now) noexcept
 
 void Core::advance_datagrams(u32 now) noexcept
 {
+    flush_acks(now);
     (void)retransmit(now);
 
     for (u8 sent = 0; sent < m_config.send_quota_per_tick; ++sent)
@@ -314,10 +332,10 @@ void Core::advance_datagrams(u32 now) noexcept
     }
 }
 
-void Core::handle_datagram(std::span<const u8> frame) noexcept
+void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
 {
     DatagramHeader header;
-    if (decode(frame, header) != WireError::Ok || header.channel == 0)
+    if (decode(frame, header) != WireError::Ok || header.channel == 0 || frame.size() < DATAGRAM_HEADER_SIZE)
     {
         return;
     }
@@ -329,6 +347,203 @@ void Core::handle_datagram(std::span<const u8> frame) noexcept
     }
 
     handle_ack(*channel, header.ack_seq, header.ack_bits);
+
+    const bool needs_ack = (header.flags & FLAG_NEEDS_ACK) != 0;
+    u16 expected = channel->rx_expected;
+    u32 bits = channel->rx_bits;
+
+    if (needs_ack)
+    {
+        const u16 back = static_cast<u16>(expected - header.datagram_seq);
+        const u16 ahead = static_cast<u16>(header.datagram_seq - expected);
+
+        bool duplicate = (back != 0 && back < 0x8000);
+        if (!duplicate && ahead >= 1 && ahead <= 32 && (bits & (1u << (ahead - 1))) != 0)
+        {
+            duplicate = true;
+        }
+
+        if (duplicate)
+        {
+            // 重复帧：补发一次确认，让对端释放窗口
+            ++m_stats.duplicate_datagrams;
+            channel->ack_pending = true;
+            channel->ack_deadline_ms = now + m_config.ack_delay_ms;
+            return;
+        }
+
+        if (ahead > 32)
+        {
+            ++m_stats.out_of_window;
+            return;
+        }
+
+        if (ahead == 0)
+        {
+            expected = static_cast<u16>(expected + 1);
+            while ((bits & 1u) != 0)
+            {
+                bits >>= 1;
+                expected = static_cast<u16>(expected + 1);
+            }
+        }
+        else
+        {
+            bits |= (1u << (ahead - 1));
+        }
+    }
+
+    // 逐条消息交付；重排缓冲满时本帧不确认，靠对端重传补齐
+    BinDeserializer in{frame.data() + DATAGRAM_HEADER_SIZE, frame.size() - DATAGRAM_HEADER_SIZE};
+    bool overflow = false;
+    for (u8 i = 0; i < header.message_count && !overflow; ++i)
+    {
+        MessageHeader message;
+        if (message.deserialize(in) != WireError::Ok || in.remaining() < message.payload_len)
+        {
+            return;
+        }
+
+        if (message.fragmented)
+        {
+            // 分片重组尚未实现：丢弃该消息
+            ++m_stats.messages_dropped;
+            in.consume(message.payload_len);
+            continue;
+        }
+
+        deliver_message(*channel, message.ordering, in.current(), message.payload_len, overflow);
+        in.consume(message.payload_len);
+    }
+
+    if (overflow)
+    {
+        ++m_stats.messages_dropped;
+        return;
+    }
+
+    if (needs_ack)
+    {
+        channel->rx_expected = expected;
+        channel->rx_bits = bits;
+        channel->ack_pending = true;
+        channel->ack_deadline_ms = now + m_config.ack_delay_ms;
+    }
+}
+
+void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept
+{
+    if (channel.spec.reliability != Reliability::ReliableOrdered)
+    {
+        m_sink.on_message(channel.spec.id, std::span<const u8>{data, len});
+        ++m_stats.messages_delivered;
+        return;
+    }
+
+    const u16 ahead = static_cast<u16>(ordering - channel.rx_ordering);
+    if (ahead == 0)
+    {
+        m_sink.on_message(channel.spec.id, std::span<const u8>{data, len});
+        ++m_stats.messages_delivered;
+        channel.rx_ordering = static_cast<u16>(channel.rx_ordering + 1);
+        drain_reorder(channel);
+        return;
+    }
+
+    if (ahead >= 0x8000)
+    {
+        return; // 旧消息：已经交付过
+    }
+
+    if (channel.reorder_used >= channel.reorder_count)
+    {
+        overflow = true;
+        ++m_stats.reorder_overflow;
+        return;
+    }
+
+    u8 *slot = channel.reorder + static_cast<usize>(channel.reorder_used) * reorder_stride(channel.spec);
+    std::memcpy(slot, &ordering, sizeof(ordering));
+    std::memcpy(slot + sizeof(u16), &len, sizeof(len));
+    std::memcpy(slot + 2 * sizeof(u16), data, len);
+    ++channel.reorder_used;
+}
+
+void Core::drain_reorder(Channel &channel) noexcept
+{
+    const usize stride = reorder_stride(channel.spec);
+    bool moved = true;
+    while (moved)
+    {
+        moved = false;
+        for (u16 i = 0; i < channel.reorder_used; ++i)
+        {
+            u8 *slot = channel.reorder + static_cast<usize>(i) * stride;
+            u16 ordering = 0;
+            std::memcpy(&ordering, slot, sizeof(ordering));
+            if (ordering != channel.rx_ordering)
+            {
+                continue;
+            }
+
+            u16 len = 0;
+            std::memcpy(&len, slot + sizeof(u16), sizeof(len));
+            m_sink.on_message(channel.spec.id, std::span<const u8>{slot + 2 * sizeof(u16), len});
+            ++m_stats.messages_delivered;
+            channel.rx_ordering = static_cast<u16>(channel.rx_ordering + 1);
+
+            --channel.reorder_used;
+            if (i != channel.reorder_used)
+            {
+                u8 *last = channel.reorder + static_cast<usize>(channel.reorder_used) * stride;
+                std::memcpy(slot, last, stride);
+            }
+            moved = true;
+            break;
+        }
+    }
+}
+
+bool Core::send_ack(Channel &channel) noexcept
+{
+    if (m_frame == nullptr)
+    {
+        return false;
+    }
+
+    DatagramHeader header;
+    header.flags = FLAG_ACK_ONLY;
+    header.channel = channel.spec.id.value;
+    header.message_count = 0;
+    header.ack_seq = channel.rx_expected;
+    header.ack_bits = channel.rx_bits;
+
+    usize written = 0;
+    if (encode(header, std::span<u8>{m_frame, m_frame_cap}, written) != WireError::Ok ||
+        !m_hooks.send(m_hooks.ctx, std::span<const u8>{m_frame, written}))
+    {
+        return false;
+    }
+
+    channel.ack_pending = false;
+    return true;
+}
+
+void Core::flush_acks(u32 now) noexcept
+{
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        Channel &channel = m_channels[i];
+        if (!channel.ack_pending || time_before(now, channel.ack_deadline_ms))
+        {
+            continue;
+        }
+
+        if (!send_ack(channel))
+        {
+            return;
+        }
+    }
 }
 
 void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept
@@ -398,7 +613,7 @@ void Core::receive(u32 now, std::span<const u8> frame) noexcept
     {
         if (m_state == State::Connected)
         {
-            handle_datagram(frame);
+            handle_datagram(now, frame);
         }
         return;
     }

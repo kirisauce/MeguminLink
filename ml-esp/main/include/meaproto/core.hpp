@@ -115,6 +115,14 @@ class Core
         u16 tx_seq = 0;
         u16 tx_ordering = 0;
         WindowSlot slots[MAX_WINDOW];
+        u8 *reorder = nullptr; /**< reorder_count × 重排步长 */
+        u16 reorder_count = 0;
+        u16 reorder_used = 0;
+        u16 rx_expected = 0; /**< 下一个期望的数据报序号 */
+        u32 rx_bits = 0;     /**< expected+1+i 已收到 */
+        u16 rx_ordering = 0; /**< 下一个期望交付的消息序号 */
+        bool ack_pending = false;
+        u32 ack_deadline_ms = 0;
     };
 
     /** 条目头：消息长度 */
@@ -125,6 +133,9 @@ class Core
 
     /** 一个窗口帧槽的步长（长度前缀 + 整帧字节，按 u16 对齐） */
     static usize frame_stride(u16 mtu) noexcept;
+
+    /** 一个重排槽的步长（ordering + 长度 + 载荷，按 u16 对齐） */
+    static usize reorder_stride(const ChannelSpec &spec) noexcept;
 
     Channel *find_channel(ChannelId channel) noexcept;
     const Channel *find_channel(ChannelId channel) const noexcept;
@@ -138,11 +149,23 @@ class Core
     /** 每拍的数据报调度：先重传，再按优先级与配额发新帧 */
     void advance_datagrams(u32 now) noexcept;
 
-    /** 收到的数据报：按帧头 ACK 字段释放对应通道的窗口 */
-    void handle_datagram(std::span<const u8> frame) noexcept;
+    /** 收到的数据报：释放发送窗口、去重、排序交付并安排延迟确认 */
+    void handle_datagram(u32 now, std::span<const u8> frame) noexcept;
 
     /** 按 ack_seq / ack_bits 释放本通道窗口槽 */
     void handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept;
+
+    /** 交付一条消息；可靠通道按 ordering 排队，重排缓冲满时置 overflow */
+    void deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept;
+
+    /** 把重排缓冲里连续的消息按序交付 */
+    void drain_reorder(Channel &channel) noexcept;
+
+    /** 发一个只带 ACK 字段的数据报 */
+    bool send_ack(Channel &channel) noexcept;
+
+    /** 到期的延迟确认 */
+    void flush_acks(u32 now) noexcept;
 
     /** 重传退避：rto_initial << retx，封顶 rto_max */
     u32 rto_backoff(u8 retx) const noexcept;

@@ -7,7 +7,7 @@
 namespace meaproto
 {
 /** 通道表条目上限（编译期固定） */
-inline constexpr usize MAX_CHANNELS = 4;
+inline constexpr usize MAX_CHANNELS = 8;
 
 /** 每通道发送窗口槽上限（编译期固定） */
 inline constexpr usize MAX_WINDOW = 16;

@@ -32,8 +32,10 @@ u16 empty_hash()
 
 struct FakeSink final : Sink
 {
-    void on_message(ChannelId, std::span<const u8>) override
+    void on_message(ChannelId channel, std::span<const u8> data) override
     {
+        channels.push_back(channel);
+        messages.emplace_back(data.begin(), data.end());
     }
 
     void on_connected() override
@@ -50,6 +52,8 @@ struct FakeSink final : Sink
     int connected_count = 0;
     int disconnected_count = 0;
     DisconnectReason last_reason = DisconnectReason::Requested;
+    std::vector<ChannelId> channels;
+    std::vector<std::vector<u8>> messages;
 };
 
 /** 假空口：记录发出的每一帧，可切换成发送失败 */
@@ -440,13 +444,15 @@ constexpr ChannelId CH_A{1};
 constexpr ChannelId CH_B{2};
 constexpr ChannelId CH_C{3};
 constexpr ChannelId CH_W{4};
+constexpr ChannelId CH_R{5};
 
-/** 通道表：A 优先级 2、B 优先级 1（队列 1）、C 不可靠、W 窗口 1（队列 2） */
+/** 通道表：A 优先级 2、B 优先级 1（队列 1）、C 不可靠、W 窗口 1、R 重排 1（队列 3） */
 constexpr ChannelSpec TEST_CHANNELS[] = {
     {CH_A, Reliability::ReliableOrdered, 64, 2, 2, 2, 2},
     {CH_B, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
     {CH_C, Reliability::Unreliable, 32, 2, 3, 2, 0},
     {CH_W, Reliability::ReliableOrdered, 32, 2, 4, 2, 1},
+    {CH_R, Reliability::ReliableOrdered, 32, 3, 5, 1, 4},
 };
 
 /** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
@@ -625,6 +631,174 @@ void unreliable_channel_skips_window()
     check_eq(rig.core.snapshot().datagrams_in_flight, 0);
 }
 
+// ---- 接收侧：去重、排序与延迟确认 ----
+
+/** 一对已连接的 Core：把一方发出的帧喂给另一方 */
+struct Duo
+{
+    void connect()
+    {
+        a.core.open(a.now);
+        flush(a, b);
+        flush(b, a);
+        check(a.core.connected());
+        check(b.core.connected());
+    }
+
+    void flush(ChannelRig &from, ChannelRig &to)
+    {
+        for (const std::vector<u8> &frame : from.link.frames)
+        {
+            to.core.receive(to.now, std::span<const u8>{frame.data(), frame.size()});
+        }
+        from.link.frames.clear();
+    }
+
+    void step(u32 delta)
+    {
+        a.now += delta;
+        b.now += delta;
+        a.core.step(a.now);
+        b.core.step(b.now);
+    }
+
+    ChannelRig a;
+    ChannelRig b;
+};
+
+void receive_in_order()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 payload[3] = {7, 8, 9};
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    duo.flush(duo.a, duo.b);
+
+    check_eq(duo.b.sink.messages.size(), 1);
+    check(duo.b.sink.messages[0] == std::vector<u8>{7, 8, 9});
+    check(duo.b.sink.channels[0] == CH_A);
+}
+
+void receive_duplicate_once()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 payload[2] = {1, 1};
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+
+    const std::vector<u8> frame = duo.a.link.frames.back();
+    duo.a.link.frames.clear();
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{frame.data(), frame.size()});
+    duo.b.core.receive(duo.b.now, std::span<const u8>{frame.data(), frame.size()});
+
+    check_eq(duo.b.sink.messages.size(), 1);
+    check_eq(duo.b.core.snapshot().duplicate_datagrams, 1);
+}
+
+void receive_out_of_order()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 first[1] = {1};
+    const u8 second[1] = {2};
+    check(duo.a.core.send(CH_A, first) == SendResult::Ok);
+    check(duo.a.core.send(CH_A, second) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+
+    check_eq(duo.a.link.frames.size(), 2);
+    const std::vector<u8> f0 = duo.a.link.frames[0];
+    const std::vector<u8> f1 = duo.a.link.frames[1];
+    duo.a.link.frames.clear();
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f1.data(), f1.size()});
+    check_eq(duo.b.sink.messages.size(), 0); // 乱序的先压着重排
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f0.data(), f0.size()});
+    check_eq(duo.b.sink.messages.size(), 2);
+    check(duo.b.sink.messages[0] == std::vector<u8>{1});
+    check(duo.b.sink.messages[1] == std::vector<u8>{2});
+}
+
+void receive_out_of_window()
+{
+    Duo duo;
+    duo.connect();
+
+    DatagramHeader header;
+    header.flags = FLAG_ACK_ONLY | FLAG_NEEDS_ACK;
+    header.channel = CH_A.value;
+    header.datagram_seq = 100;
+    header.message_count = 0;
+
+    u8 buffer[32] = {};
+    usize written = 0;
+    check_eq(encode(header, std::span<u8>{buffer, sizeof(buffer)}, written), WireError::Ok);
+    duo.b.core.receive(duo.b.now, std::span<const u8>{buffer, written});
+
+    check_eq(duo.b.core.snapshot().out_of_window, 1);
+    check_eq(duo.b.sink.messages.size(), 0);
+}
+
+void delayed_ack_releases_window()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 payload[2] = {};
+    check(duo.a.core.send(CH_A, payload) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    duo.flush(duo.a, duo.b);
+    check_eq(duo.a.core.snapshot().datagrams_in_flight, 1);
+
+    const std::size_t before = duo.b.link.frames.size();
+    duo.b.core.step(duo.b.now); // 还没到 ack_delay
+    check_eq(duo.b.link.frames.size(), before);
+
+    duo.b.now += DEFAULT_CONFIG.ack_delay_ms;
+    duo.b.core.step(duo.b.now);
+    check_eq(duo.b.link.frames.size(), before + 1);
+
+    duo.flush(duo.b, duo.a);
+    check_eq(duo.a.core.snapshot().datagrams_in_flight, 0);
+}
+
+void reorder_overflow_keeps_unacked()
+{
+    Duo duo;
+    duo.connect();
+
+    const u8 first[1] = {1};
+    const u8 second[1] = {2};
+    const u8 third[1] = {3};
+    check(duo.a.core.send(CH_R, first) == SendResult::Ok);
+    check(duo.a.core.send(CH_R, second) == SendResult::Ok);
+    check(duo.a.core.send(CH_R, third) == SendResult::Ok);
+    duo.a.core.step(duo.a.now);
+    check_eq(duo.a.link.frames.size(), 3);
+
+    const std::vector<u8> f0 = duo.a.link.frames[0];
+    const std::vector<u8> f1 = duo.a.link.frames[1];
+    const std::vector<u8> f2 = duo.a.link.frames[2];
+    duo.a.link.frames.clear();
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f2.data(), f2.size()}); // 进重排
+    check_eq(duo.b.core.snapshot().reorder_overflow, 0);
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f1.data(), f1.size()}); // 重排满
+    check_eq(duo.b.core.snapshot().reorder_overflow, 1);
+    check_eq(duo.b.sink.messages.size(), 0);
+
+    duo.b.core.receive(duo.b.now, std::span<const u8>{f0.data(), f0.size()});
+    check_eq(duo.b.sink.messages.size(), 1);
+    check(duo.b.sink.messages[0] == std::vector<u8>{1});
+}
+
 void send_not_connected()
 {
     ChannelRig rig;
@@ -711,6 +885,12 @@ const test::Case TESTS[] = {
     {"send quota limits frames per tick", quota_limits_frames_per_tick},
     {"priority orders channels", priority_orders_channels},
     {"unreliable channel skips window", unreliable_channel_skips_window},
+    {"receive delivers in order", receive_in_order},
+    {"receive delivers duplicate once", receive_duplicate_once},
+    {"receive reorders out-of-order datagrams", receive_out_of_order},
+    {"receive drops out-of-window seq", receive_out_of_window},
+    {"delayed ack releases window", delayed_ack_releases_window},
+    {"reorder overflow keeps frame unacked", reorder_overflow_keeps_unacked},
 };
 } // namespace
 
