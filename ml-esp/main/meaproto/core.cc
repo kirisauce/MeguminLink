@@ -35,9 +35,9 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
 
         const u16 window = (spec.window != 0) ? spec.window : m_config.datagram_window;
         const u16 reorder = reorder_capacity(spec);
-        const usize queue_bytes = entry_stride(spec) * spec.queue_depth;
+        const usize queue_bytes = entry_stride(spec, m_config, mtu) * spec.queue_depth;
         const usize window_bytes = frame_stride(mtu) * window;
-        const usize reorder_bytes = reorder_stride(spec) * reorder;
+        const usize reorder_bytes = reorder_stride(spec, m_config) * reorder;
         if (window > MAX_WINDOW || remaining < queue_bytes + window_bytes + reorder_bytes)
         {
             break;
@@ -58,25 +58,44 @@ Core::Core(std::span<const ChannelSpec> channels, const Config &config, u16 mtu,
         remaining -= reorder_bytes;
     }
 
+    // 重组区紧跟在通道区之后
+    const usize used = m_reassembly.init(std::span<u8>{cursor, remaining}, config, mtu);
+    cursor += used;
+    remaining -= used;
+
     m_frame = cursor;
     m_frame_cap = static_cast<u16>(remaining < mtu ? remaining : mtu);
 }
 
-usize Core::entry_stride(const ChannelSpec &spec) noexcept
+u16 Core::frame_payload_capacity(Reliability reliability, u16 mtu) noexcept
 {
-    const usize raw = ENTRY_HEADER + spec.max_payload;
+    const usize header = DATAGRAM_HEADER_SIZE + MESSAGE_HEADER_BASE_SIZE +
+                         ((reliability == Reliability::ReliableOrdered) ? MESSAGE_ORDERING_SIZE : 0);
+    return (mtu > header) ? static_cast<u16>(mtu - header) : 0;
+}
+
+usize Core::message_limit(const ChannelSpec &spec, const Config &config) noexcept
+{
+    return (spec.max_payload < config.max_message_size) ? spec.max_payload : config.max_message_size;
+}
+
+usize Core::entry_stride(const ChannelSpec &spec, const Config &config, u16 mtu) noexcept
+{
+    const usize limit = message_limit(spec, config);
+    const usize capacity = frame_payload_capacity(spec.reliability, mtu);
+    const usize raw = ENTRY_HEADER + ((limit < capacity) ? limit : capacity);
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
 usize Core::frame_stride(u16 mtu) noexcept
 {
-    const usize raw = ENTRY_HEADER + mtu;
+    const usize raw = SLOT_HEADER + mtu;
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
-usize Core::reorder_stride(const ChannelSpec &spec) noexcept
+usize Core::reorder_stride(const ChannelSpec &spec, const Config &config) noexcept
 {
-    const usize raw = 2 * sizeof(u16) + spec.max_payload;
+    const usize raw = 2 * sizeof(u16) + message_limit(spec, config);
     return (raw + sizeof(u16) - 1) & ~(sizeof(u16) - 1);
 }
 
@@ -94,11 +113,11 @@ usize Core::storage_bytes(std::span<const ChannelSpec> channels, const Config &c
     {
         const u16 window = (spec.window != 0) ? spec.window : config.datagram_window;
         const u16 reorder = reorder_capacity(spec);
-        total += entry_stride(spec) * spec.queue_depth;
+        total += entry_stride(spec, config, mtu) * spec.queue_depth;
         total += frame_stride(mtu) * (window > MAX_WINDOW ? MAX_WINDOW : window);
-        total += reorder_stride(spec) * reorder;
+        total += reorder_stride(spec, config) * reorder;
     }
-    return total;
+    return total + Reassembler::bytes(config, mtu);
 }
 
 Core::Channel *Core::find_channel(ChannelId channel) noexcept
@@ -138,23 +157,64 @@ SendResult Core::send(ChannelId channel, std::span<const u8> data) noexcept
         return SendResult::InvalidChannel;
     }
 
-    if (data.size() > slot->spec.max_payload)
+    if (data.size() > message_limit(slot->spec, m_config))
     {
         return SendResult::TooLarge;
     }
 
-    if (slot->count >= slot->spec.queue_depth)
+    const bool reliable = (slot->spec.reliability == Reliability::ReliableOrdered);
+    const u16 chunk =
+        reliable ? fragment_payload_limit(m_peer_mtu) : frame_payload_capacity(slot->spec.reliability, m_peer_mtu);
+    if (chunk == 0 || (!reliable && data.size() > chunk))
+    {
+        return SendResult::TooLarge;
+    }
+
+    const usize chunks = (data.size() == 0) ? 1 : (data.size() + chunk - 1) / chunk;
+    if (static_cast<usize>(slot->count) + chunks > slot->spec.queue_depth)
     {
         return SendResult::Busy;
     }
 
-    u8 *entry = slot->queue + static_cast<usize>(slot->tail) * entry_stride(slot->spec);
-    const u16 len = static_cast<u16>(data.size());
-    std::memcpy(entry, &len, sizeof(len));
-    std::memcpy(entry + ENTRY_HEADER, data.data(), len);
+    const u16 ordering = slot->next_ordering;
+    if (reliable)
+    {
+        ++slot->next_ordering;
+    }
 
-    slot->tail = static_cast<u16>((slot->tail + 1) % slot->spec.queue_depth);
-    ++slot->count;
+    const u16 split_id = (reliable && chunks > 1) ? slot->next_split_id : 0;
+    if (split_id != 0)
+    {
+        ++slot->next_split_id;
+        if (slot->next_split_id == 0)
+        {
+            slot->next_split_id = 1;
+        }
+    }
+
+    const usize stride = entry_stride(slot->spec, m_config, m_mtu);
+    for (usize index = 0; index < chunks; ++index)
+    {
+        const usize offset = index * chunk;
+        const usize len = (data.size() - offset < chunk) ? (data.size() - offset) : chunk;
+
+        ChunkHeader header;
+        header.len = static_cast<u16>(len);
+        header.ordering = ordering;
+        header.split_id = split_id;
+        header.split_index = static_cast<u16>(index);
+        header.split_count = static_cast<u16>(chunks);
+
+        u8 *entry = slot->queue + static_cast<usize>(slot->tail) * stride;
+        std::memcpy(entry, &header, sizeof(header));
+        if (len != 0)
+        {
+            std::memcpy(entry + ENTRY_HEADER, data.data() + offset, len);
+        }
+
+        slot->tail = static_cast<u16>((slot->tail + 1) % slot->spec.queue_depth);
+        ++slot->count;
+    }
     return SendResult::Ok;
 }
 
@@ -179,6 +239,7 @@ bool Core::set_reliability(ChannelId channel, Reliability reliability) noexcept
 
     slot->spec.reliability = reliability;
     slot->reset();
+    m_reassembly.clear(channel); // 该通道未收齐的分片随序号一起作废
     return true;
 }
 
@@ -189,7 +250,8 @@ void Core::Channel::reset() noexcept
     count = 0;
     used_slots = 0;
     tx_seq = 0;
-    tx_ordering = 0;
+    next_ordering = 0;
+    next_split_id = 1;
     for (WindowSlot &slot : slots)
     {
         slot = WindowSlot{};
@@ -225,9 +287,9 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
         return false;
     }
 
-    const u8 *entry = channel.queue + static_cast<usize>(channel.head) * entry_stride(channel.spec);
-    u16 payload_len = 0;
-    std::memcpy(&payload_len, entry, sizeof(payload_len));
+    const u8 *entry = channel.queue + static_cast<usize>(channel.head) * entry_stride(channel.spec, m_config, m_mtu);
+    ChunkHeader chunk;
+    std::memcpy(&chunk, entry, sizeof(chunk));
 
     DatagramHeader header;
     header.flags = FLAG_HAS_DATA;
@@ -248,11 +310,18 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
     }
 
     MessageHeader message;
-    message.payload_len = payload_len;
+    message.payload_len = chunk.len;
     message.reliability = channel.spec.reliability;
     if (reliable)
     {
-        message.ordering = channel.tx_ordering;
+        message.ordering = chunk.ordering;
+        if (chunk.split_count >= MIN_SPLIT_COUNT)
+        {
+            message.fragmented = true;
+            message.split_id = chunk.split_id;
+            message.split_index = chunk.split_index;
+            message.split_count = chunk.split_count;
+        }
     }
 
     usize offset = written;
@@ -262,12 +331,12 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
     }
     offset += written;
 
-    if (offset + payload_len > m_frame_cap)
+    if (offset + chunk.len > m_frame_cap)
     {
         return false;
     }
-    std::memcpy(m_frame + offset, entry + ENTRY_HEADER, payload_len);
-    const usize frame_len = offset + payload_len;
+    std::memcpy(m_frame + offset, entry + ENTRY_HEADER, chunk.len);
+    const usize frame_len = offset + chunk.len;
 
     if (!m_hooks.send(m_hooks.ctx, std::span<const u8>{m_frame, frame_len}))
     {
@@ -297,21 +366,22 @@ bool Core::transmit(Channel &channel, u32 now) noexcept
         u8 *bytes = channel.window + static_cast<usize>(index) * stride;
         const u16 stored = static_cast<u16>(frame_len);
         std::memcpy(bytes, &stored, sizeof(stored));
-        std::memcpy(bytes + ENTRY_HEADER, m_frame, frame_len);
+        std::memcpy(bytes + SLOT_HEADER, m_frame, frame_len);
 
         slot->used = true;
         slot->seq = header.datagram_seq;
         slot->len = stored;
         slot->retx = 0;
+        slot->sent_ms = now;
         slot->deadline_ms = now + rto_backoff(0);
         ++channel.used_slots;
         channel.tx_seq = static_cast<u16>(channel.tx_seq + 1);
-        channel.tx_ordering = static_cast<u16>(channel.tx_ordering + 1);
     }
 
     channel.head = static_cast<u16>((channel.head + 1) % channel.spec.queue_depth);
     --channel.count;
     ++m_stats.datagrams_sent;
+    m_last_tx_ms = now;
     return true;
 }
 
@@ -331,7 +401,7 @@ bool Core::retransmit(u32 now) noexcept
             }
 
             const u8 *bytes = channel.window + static_cast<usize>(s) * stride;
-            if (!m_hooks.send(m_hooks.ctx, std::span<const u8>{bytes + ENTRY_HEADER, slot.len}))
+            if (!m_hooks.send(m_hooks.ctx, std::span<const u8>{bytes + SLOT_HEADER, slot.len}))
             {
                 return any;
             }
@@ -339,6 +409,7 @@ bool Core::retransmit(u32 now) noexcept
             slot.retx = (slot.retx < 0xFF) ? static_cast<u8>(slot.retx + 1) : 0xFF;
             slot.deadline_ms = now + rto_backoff(slot.retx);
             ++m_stats.datagrams_retransmitted;
+            m_last_tx_ms = now;
             any = true;
         }
     }
@@ -391,7 +462,8 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
         return;
     }
 
-    handle_ack(*channel, header.ack_seq, header.ack_bits);
+    handle_ack(*channel, header.ack_seq, header.ack_bits, now);
+    m_last_rx_ms = now;
 
     const bool needs_ack = (header.flags & FLAG_NEEDS_ACK) != 0;
     u16 expected = channel->rx_expected;
@@ -456,8 +528,12 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
 
         if (message.fragmented)
         {
-            // 分片重组尚未实现：丢弃该消息
-            ++m_stats.messages_dropped;
+            // 槽满或交付被打回时本帧不确认，等对端重传
+            if (!m_reassembly.push(channel->spec.id, message, in.current(), fragment_payload_limit(m_peer_mtu),
+                                   &Core::deliver_hook, this))
+            {
+                return;
+            }
             in.consume(message.payload_len);
             continue;
         }
@@ -479,6 +555,20 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
         channel->ack_pending = true;
         channel->ack_deadline_ms = now + m_config.ack_delay_ms;
     }
+}
+
+bool Core::deliver_hook(void *ctx, ChannelId channel, u16 ordering, const u8 *data, usize len) noexcept
+{
+    auto &self = *static_cast<Core *>(ctx);
+    Channel *slot = self.find_channel(channel);
+    if (slot == nullptr)
+    {
+        return true; // 通道已经不在：当作已消费
+    }
+
+    bool overflow = false;
+    self.deliver_message(*slot, ordering, data, static_cast<u16>(len), overflow);
+    return !overflow;
 }
 
 void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept
@@ -512,7 +602,7 @@ void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 l
         return;
     }
 
-    u8 *slot = channel.reorder + static_cast<usize>(channel.reorder_used) * reorder_stride(channel.spec);
+    u8 *slot = channel.reorder + static_cast<usize>(channel.reorder_used) * reorder_stride(channel.spec, m_config);
     std::memcpy(slot, &ordering, sizeof(ordering));
     std::memcpy(slot + sizeof(u16), &len, sizeof(len));
     std::memcpy(slot + 2 * sizeof(u16), data, len);
@@ -521,7 +611,7 @@ void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 l
 
 void Core::drain_reorder(Channel &channel) noexcept
 {
-    const usize stride = reorder_stride(channel.spec);
+    const usize stride = reorder_stride(channel.spec, m_config);
     bool moved = true;
     while (moved)
     {
@@ -554,7 +644,7 @@ void Core::drain_reorder(Channel &channel) noexcept
     }
 }
 
-bool Core::send_ack(Channel &channel) noexcept
+bool Core::send_ack(Channel &channel, u32 now) noexcept
 {
     if (m_frame == nullptr)
     {
@@ -576,6 +666,7 @@ bool Core::send_ack(Channel &channel) noexcept
     }
 
     channel.ack_pending = false;
+    m_last_tx_ms = now;
     return true;
 }
 
@@ -589,14 +680,14 @@ void Core::flush_acks(u32 now) noexcept
             continue;
         }
 
-        if (!send_ack(channel))
+        if (!send_ack(channel, now))
         {
             return;
         }
     }
 }
 
-void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept
+void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits, u32 now) noexcept
 {
     for (u16 s = 0; s < channel.window_count; ++s)
     {
@@ -618,10 +709,50 @@ void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept
             continue;
         }
 
+        if (slot.retx == 0)
+        {
+            // 未重传过的帧才采 RTT（Karn）
+            sample_rtt(static_cast<u32>(now - slot.sent_ms));
+        }
+
         slot.used = false;
         --channel.used_slots;
         ++m_stats.datagrams_acked;
     }
+}
+
+void Core::sample_rtt(u32 sample) noexcept
+{
+    if (sample == 0 || sample > m_config.connect_timeout_ms)
+    {
+        return;
+    }
+
+    m_rtt_ms = (m_rtt_ms == 0) ? sample : (m_rtt_ms * 7 + sample) / 8;
+
+    u32 rto = m_rtt_ms * 2;
+    if (rto < m_config.rto_initial_ms)
+    {
+        rto = m_config.rto_initial_ms;
+    }
+    m_rto_ms = (rto > m_config.rto_max_ms) ? m_config.rto_max_ms : rto;
+}
+
+bool Core::ping(u32 now) noexcept
+{
+    if (m_state != State::Connected)
+    {
+        return false;
+    }
+
+    m_ping_in_flight = m_ping_token;
+    m_ping_sent_ms = now;
+    ++m_ping_token;
+    if (m_ping_token == 0)
+    {
+        m_ping_token = 1;
+    }
+    return send_control(now, ControlType::Ping, ControlStatus::Ok, m_peer_epoch, m_ping_in_flight);
 }
 
 void Core::open(u32 now) noexcept
@@ -687,7 +818,18 @@ u32 Core::step(u32 now) noexcept
 {
     if (m_state == State::Connected)
     {
-        advance_datagrams(now);
+        if (static_cast<u32>(now - m_last_rx_ms) > m_config.connect_timeout_ms)
+        {
+            enter_idle(DisconnectReason::Timeout);
+        }
+        else
+        {
+            if (static_cast<u32>(now - m_last_tx_ms) >= m_config.keepalive_interval_ms)
+            {
+                (void)send_control(now, ControlType::KeepAlive, ControlStatus::Ok, m_peer_epoch, 0);
+            }
+            advance_datagrams(now);
+        }
     }
 
     if (m_state == State::Connecting && !time_before(now, m_handshake_deadline_ms))
@@ -752,9 +894,13 @@ Stats Core::snapshot() const noexcept
     }
 
     Stats stats = m_stats;
+    stats.fragments_reassembled = m_reassembly.completed();
+    stats.messages_dropped += m_reassembly.rejected();
     stats.connected = connected();
     stats.peer_epoch = static_cast<u16>(m_peer_epoch);
     stats.datagrams_in_flight = in_flight;
+    stats.rtt_ms = m_rtt_ms;
+    stats.rto_ms = (m_rto_ms == 0) ? m_config.rto_initial_ms : m_rto_ms;
     return stats;
 }
 
@@ -786,19 +932,34 @@ bool Core::send_control(u32 now, ControlType type, ControlStatus status, u32 pee
 
 void Core::handle_control(u32 now, const ControlFrame &frame) noexcept
 {
+    m_last_rx_ms = now;
+
     switch (frame.type)
     {
     case ControlType::ConnectRequest:
         handle_connect_request(now, frame);
         break;
     case ControlType::ConnectAccept:
-        handle_connect_accept(frame);
+        handle_connect_accept(now, frame);
         break;
     case ControlType::ConnectReject:
         handle_connect_reject(now, frame);
         break;
     case ControlType::Disconnect:
         handle_disconnect(now, frame);
+        break;
+    case ControlType::KeepAlive:
+        (void)send_control(now, ControlType::KeepAliveAck, ControlStatus::Ok, m_peer_epoch, 0);
+        break;
+    case ControlType::Ping:
+        (void)send_control(now, ControlType::Pong, ControlStatus::Ok, m_peer_epoch, frame.token);
+        break;
+    case ControlType::Pong:
+        if (m_ping_in_flight != 0 && frame.token == m_ping_in_flight)
+        {
+            sample_rtt(static_cast<u32>(now - m_ping_sent_ms));
+            m_ping_in_flight = 0;
+        }
         break;
     default:
         break;
@@ -826,6 +987,8 @@ void Core::handle_connect_request(u32 now, const ControlFrame &frame) noexcept
     m_peer_mtu = frame.mtu < m_mtu ? frame.mtu : m_mtu;
     m_state = State::Connected;
     m_handshake_retries = 0;
+    m_last_rx_ms = now;
+    m_last_tx_ms = now;
     (void)send_control(now, ControlType::ConnectAccept, ControlStatus::Ok, m_peer_epoch, 0);
     if (!already_connected)
     {
@@ -833,7 +996,7 @@ void Core::handle_connect_request(u32 now, const ControlFrame &frame) noexcept
     }
 }
 
-void Core::handle_connect_accept(const ControlFrame &frame) noexcept
+void Core::handle_connect_accept(u32 now, const ControlFrame &frame) noexcept
 {
     if (m_state != State::Connecting || frame.peer_epoch != m_own_epoch)
     {
@@ -844,6 +1007,8 @@ void Core::handle_connect_accept(const ControlFrame &frame) noexcept
     m_peer_mtu = frame.mtu < m_mtu ? frame.mtu : m_mtu;
     m_state = State::Connected;
     m_handshake_retries = 0;
+    m_last_rx_ms = now;
+    m_last_tx_ms = now;
     m_sink.on_connected();
 }
 
@@ -896,6 +1061,9 @@ void Core::enter_idle(DisconnectReason reason) noexcept
     {
         m_channels[i].reset();
     }
+    m_reassembly.clear();
+    m_ping_in_flight = 0;
+    m_ping_sent_ms = 0;
     if (was_active)
     {
         m_sink.on_disconnected(reason);
@@ -908,6 +1076,19 @@ u32 Core::next_wake(u32 now) const noexcept
     if (m_state == State::Connecting && time_before(m_handshake_deadline_ms, wake))
     {
         wake = m_handshake_deadline_ms;
+    }
+    if (m_state == State::Connected)
+    {
+        const u32 rx_deadline = m_last_rx_ms + m_config.connect_timeout_ms + 1;
+        if (time_before(rx_deadline, wake))
+        {
+            wake = rx_deadline;
+        }
+        const u32 keepalive = m_last_tx_ms + m_config.keepalive_interval_ms;
+        if (time_before(keepalive, wake))
+        {
+            wake = keepalive;
+        }
     }
     return wake;
 }

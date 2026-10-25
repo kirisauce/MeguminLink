@@ -2,9 +2,7 @@
 // 用法见同目录 Makefile：cd ml-esp/test && make meaproto-core
 
 #include "meaproto/core.hpp"
-#include "meaproto/hash.hpp"
-#include "meaproto/wire.hpp"
-#include "test_common.hpp"
+#include "meaproto_test_rig.hpp"
 
 #include <cstddef>
 #include <iterator>
@@ -15,144 +13,7 @@ using namespace meaproto;
 
 namespace
 {
-using test::check;
-using test::check_eq;
-
-constexpr u16 MTU = 1470;
-constexpr u32 START_MS = 1000;
-constexpr u32 FIRST_EPOCH = 0x01020304;
-constexpr u32 PEER_EPOCH = 0x0A0B;
-constexpr u16 PEER_MTU = 1400;
-constexpr Config DEFAULT_CONFIG = {};
-
-u16 empty_hash()
-{
-    return config_hash(std::span<const ChannelSpec>{});
-}
-
-struct FakeSink final : Sink
-{
-    void on_message(ChannelId channel, std::span<const u8> data) override
-    {
-        channels.push_back(channel);
-        messages.emplace_back(data.begin(), data.end());
-    }
-
-    void on_connected() override
-    {
-        ++connected_count;
-    }
-
-    void on_disconnected(DisconnectReason reason) override
-    {
-        ++disconnected_count;
-        last_reason = reason;
-    }
-
-    int connected_count = 0;
-    int disconnected_count = 0;
-    DisconnectReason last_reason = DisconnectReason::Requested;
-    std::vector<ChannelId> channels;
-    std::vector<std::vector<u8>> messages;
-};
-
-/** 假空口：记录发出的每一帧，可切换成发送失败 */
-struct FakeLink
-{
-    static bool send(void *ctx, std::span<const u8> data)
-    {
-        auto &self = *static_cast<FakeLink *>(ctx);
-        if (!self.accepting)
-        {
-            return false;
-        }
-        self.frames.emplace_back(data.begin(), data.end());
-        return true;
-    }
-
-    static u32 random(void *ctx)
-    {
-        auto &self = *static_cast<FakeLink *>(ctx);
-        return self.next_epoch++;
-    }
-
-    std::vector<std::vector<u8>> frames;
-    bool accepting = true;
-    u32 next_epoch = FIRST_EPOCH;
-};
-
-struct Rig
-{
-    Rig()
-        : core(std::span<const ChannelSpec>{}, DEFAULT_CONFIG, MTU, sink,
-               CoreHooks{&link, &FakeLink::send, &FakeLink::random}, {})
-    {
-    }
-
-    FakeLink link;
-    FakeSink sink;
-    Core core;
-    u32 now = START_MS;
-};
-
-ControlFrame decoded(const std::vector<u8> &bytes)
-{
-    ControlFrame frame;
-    const WireError error = decode(std::span<const u8>{bytes.data(), bytes.size()}, frame);
-    check_eq(error, WireError::Ok);
-    return frame;
-}
-
-/** 把控制帧编成字节；version 用于构造版本不符的帧 */
-std::vector<u8> encode_control(const ControlFrame &frame, u8 version = VERSION)
-{
-    u8 buffer[CONTROL_FRAME_SIZE] = {};
-    usize written = 0;
-    check_eq(encode(frame, std::span<u8>{buffer, sizeof(buffer)}, written), WireError::Ok);
-    buffer[0] = static_cast<u8>((version << VERSION_SHIFT) | FLAG_CONTROL);
-    return std::vector<u8>{buffer, buffer + written};
-}
-
-void deliver(Rig &rig, const ControlFrame &frame, u8 version = VERSION)
-{
-    const std::vector<u8> bytes = encode_control(frame, version);
-    rig.core.receive(rig.now, std::span<const u8>{bytes.data(), bytes.size()});
-}
-
-ControlFrame last_sent(const Rig &rig)
-{
-    return decoded(rig.link.frames.back());
-}
-
-ControlFrame connect_request(u32 own_epoch, u16 mtu, u16 hash)
-{
-    ControlFrame frame;
-    frame.type = ControlType::ConnectRequest;
-    frame.own_epoch = own_epoch;
-    frame.mtu = mtu;
-    frame.config_hash = hash;
-    return frame;
-}
-
-ControlFrame connect_accept(u32 own_epoch, u32 peer_epoch, u16 mtu)
-{
-    ControlFrame frame;
-    frame.type = ControlType::ConnectAccept;
-    frame.own_epoch = own_epoch;
-    frame.peer_epoch = peer_epoch;
-    frame.mtu = mtu;
-    frame.config_hash = empty_hash();
-    return frame;
-}
-
-ControlFrame disconnect(u32 own_epoch)
-{
-    ControlFrame frame;
-    frame.type = ControlType::Disconnect;
-    frame.own_epoch = own_epoch;
-    frame.config_hash = empty_hash();
-    return frame;
-}
+using namespace mptest;
 
 /** 走完 open() + ConnectAccept，进入 Connected */
 void handshake(Rig &rig)
@@ -440,72 +301,6 @@ void restart_with_new_epoch()
 
 // ---- 通道发送队列 ----
 
-constexpr ChannelId CH_A{1};
-constexpr ChannelId CH_B{2};
-constexpr ChannelId CH_C{3};
-constexpr ChannelId CH_W{4};
-constexpr ChannelId CH_R{5};
-constexpr ChannelId CH_S{6};
-
-// clang-format off
-/** 通道表：A 优先级 2、B 队列 1、C 不可靠、W 窗口 1、R 重排 1、S 大容量 */
-constexpr ChannelSpec TEST_CHANNELS[] = {
-    {CH_A, Reliability::ReliableOrdered, 64, 2, 2, 2, 2},
-    {CH_B, Reliability::ReliableOrdered, 32, 1, 1, 1, 1},
-    {CH_C, Reliability::Unreliable, 32, 2, 3, 2, 0},
-    {CH_W, Reliability::ReliableOrdered, 32, 2, 4, 2, 1},
-    {CH_R, Reliability::ReliableOrdered, 32, 3, 5, 1, 4},
-    {CH_S, Reliability::ReliableOrdered, 32, 128, 6, 64, 8},
-};
-// clang-format on
-
-/** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
-struct ChannelRig
-{
-    explicit ChannelRig(const Config &config = DEFAULT_CONFIG)
-        : storage(Core::storage_bytes(TEST_CHANNELS, config, MTU)),
-          core(TEST_CHANNELS, config, MTU, sink, CoreHooks{&link, &FakeLink::send, &FakeLink::random}, storage)
-    {
-    }
-
-    void connect()
-    {
-        core.open(now);
-        const ControlFrame accept = connect_accept(PEER_EPOCH, decoded(link.frames.back()).own_epoch, PEER_MTU);
-        const std::vector<u8> bytes = encode_control(accept);
-        core.receive(now, std::span<const u8>{bytes.data(), bytes.size()});
-    }
-
-    FakeLink link;
-    FakeSink sink;
-    std::vector<u8> storage;
-    Core core;
-    u32 now = START_MS;
-};
-
-DatagramHeader datagram_header(const std::vector<u8> &bytes)
-{
-    DatagramHeader header;
-    check_eq(decode(std::span<const u8>{bytes.data(), bytes.size()}, header), WireError::Ok);
-    return header;
-}
-
-/** 造一个只带 ACK 字段的数据报，喂给 Core 释放发送窗口 */
-void deliver_ack(Core &core, u32 now, u8 channel, u16 ack_seq, u32 ack_bits)
-{
-    DatagramHeader header;
-    header.flags = FLAG_ACK_ONLY;
-    header.channel = channel;
-    header.ack_seq = ack_seq;
-    header.ack_bits = ack_bits;
-    header.message_count = 0;
-
-    u8 buffer[32] = {};
-    usize written = 0;
-    check_eq(encode(header, std::span<u8>{buffer, sizeof(buffer)}, written), WireError::Ok);
-    core.receive(now, std::span<const u8>{buffer, written});
-}
-
 void datagram_sent_for_queued_message()
 {
     ChannelRig rig;
@@ -644,52 +439,6 @@ void reorder_depth_capped_by_bitmap()
 }
 
 // ---- 接收侧：去重、排序与延迟确认 ----
-
-/** 一对已连接的 Core：把一方发出的帧喂给另一方 */
-struct Duo
-{
-    void connect()
-    {
-        a.core.open(a.now);
-        flush(a, b);
-        flush(b, a);
-        check(a.core.connected());
-        check(b.core.connected());
-    }
-
-    /** drop_period/duplicate_every 非 0 时按帧序号注入丢包与重复 */
-    void flush(ChannelRig &from, ChannelRig &to)
-    {
-        for (const std::vector<u8> &frame : from.link.frames)
-        {
-            ++frames_seen;
-            if (drop_period != 0 && (frames_seen % static_cast<u32>(drop_period)) == 0)
-            {
-                continue;
-            }
-            to.core.receive(to.now, std::span<const u8>{frame.data(), frame.size()});
-            if (duplicate_every != 0 && (frames_seen % static_cast<u32>(duplicate_every)) == 0)
-            {
-                to.core.receive(to.now, std::span<const u8>{frame.data(), frame.size()});
-            }
-        }
-        from.link.frames.clear();
-    }
-
-    void step(u32 delta)
-    {
-        a.now += delta;
-        b.now += delta;
-        a.core.step(a.now);
-        b.core.step(b.now);
-    }
-
-    ChannelRig a;
-    ChannelRig b;
-    int drop_period = 0;
-    int duplicate_every = 0;
-    u32 frames_seen = 0;
-};
 
 void receive_in_order()
 {
@@ -923,7 +672,7 @@ void lossy_delivery_completes()
 {
     Duo duo;
     duo.connect();
-    duo.drop_period = 10;
+    duo.drop_percent = 10;
 
     check(deliver_all(duo, CH_S, 100, 20000));
     check(payloads_in_order(duo.b.sink, 100));
@@ -933,7 +682,7 @@ void heavy_loss_still_completes()
 {
     Duo duo;
     duo.connect();
-    duo.drop_period = 3;
+    duo.drop_percent = 33;
 
     check(deliver_all(duo, CH_S, 50, 60000));
     check(payloads_in_order(duo.b.sink, 50));
@@ -943,7 +692,7 @@ void duplicated_link_still_orders()
 {
     Duo duo;
     duo.connect();
-    duo.duplicate_every = 4;
+    duo.duplicate_percent = 25;
 
     check(deliver_all(duo, CH_S, 200, 20000));
     check(payloads_in_order(duo.b.sink, 200));
@@ -953,8 +702,8 @@ void loss_and_duplicates_stay_ordered()
 {
     Duo duo;
     duo.connect();
-    duo.drop_period = 50;
-    duo.duplicate_every = 7;
+    duo.drop_percent = 2;
+    duo.duplicate_percent = 15;
 
     check(deliver_all(duo, CH_S, 1000, 120000));
     check(payloads_in_order(duo.b.sink, 1000));
@@ -968,6 +717,96 @@ void sequence_wraparound()
     check(deliver_all(duo, CH_S, 65536, 200000));
     check(payloads_in_order(duo.b.sink, 65536));
     check_eq(duo.b.core.snapshot().duplicate_datagrams, 0);
+}
+
+// ---- 保活、超时与 RTT ----
+
+void keepalive_when_idle()
+{
+    ChannelRig rig;
+    rig.connect();
+    rig.link.frames.clear();
+
+    rig.now += DEFAULT_CONFIG.keepalive_interval_ms;
+    rig.core.step(rig.now);
+
+    check_eq(rig.link.frames.size(), 1);
+    check_eq(decoded(rig.link.frames.back()).type, ControlType::KeepAlive);
+
+    // 同一间隔内不重复发
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), 1);
+}
+
+void silence_times_out()
+{
+    ChannelRig rig;
+    rig.connect();
+    rig.link.frames.clear();
+
+    rig.now += DEFAULT_CONFIG.connect_timeout_ms + 1;
+    rig.core.step(rig.now);
+
+    check(!rig.core.connected());
+    check_eq(rig.sink.disconnected_count, 1);
+    check(rig.sink.last_reason == DisconnectReason::Timeout);
+}
+
+void keepalive_keeps_both_alive()
+{
+    Duo duo;
+    duo.connect();
+
+    for (u32 elapsed = 0; elapsed < 20000; elapsed += 250)
+    {
+        duo.step(250);
+        duo.flush(duo.a, duo.b);
+        duo.flush(duo.b, duo.a);
+    }
+
+    check(duo.a.core.connected());
+    check(duo.b.core.connected());
+    check_eq(duo.a.sink.disconnected_count, 0);
+}
+
+void ping_samples_rtt()
+{
+    Duo duo;
+    duo.connect();
+
+    check(duo.a.core.ping(duo.a.now));
+    duo.flush(duo.a, duo.b);
+    duo.a.now += 40;
+    duo.b.now += 40;
+    duo.flush(duo.b, duo.a);
+
+    check(duo.a.core.snapshot().rtt_ms > 0);
+    check(duo.a.core.snapshot().rto_ms >= DEFAULT_CONFIG.rto_initial_ms);
+}
+
+void pong_with_wrong_token_ignored()
+{
+    Duo duo;
+    duo.connect();
+
+    check(duo.a.core.ping(duo.a.now));
+    duo.flush(duo.a, duo.b);
+    duo.a.link.frames.clear();
+
+    ControlFrame pong;
+    pong.type = ControlType::Pong;
+    pong.token = 999;
+    pong.own_epoch = duo.a.core.peer_epoch();
+    const std::vector<u8> bytes = encode_control(pong);
+    duo.a.core.receive(duo.a.now, std::span<const u8>{bytes.data(), bytes.size()});
+
+    check_eq(duo.a.core.snapshot().rtt_ms, 0);
+}
+
+void ping_requires_connection()
+{
+    ChannelRig rig;
+    check(!rig.core.ping(rig.now));
 }
 
 // ---- 可靠性切换 ----
@@ -1150,6 +989,12 @@ const test::Case TESTS[] = {
     {"set_reliability restarts ordering", set_reliability_restarts_ordering},
     {"reconnect resets channels", reconnect_resets_channels},
     {"duplicate frames delivered once", duplicate_frames_delivered_once},
+    {"keepalive sent when idle", keepalive_when_idle},
+    {"silence times out connection", silence_times_out},
+    {"keepalive keeps both alive", keepalive_keeps_both_alive},
+    {"ping samples rtt", ping_samples_rtt},
+    {"pong with wrong token ignored", pong_with_wrong_token_ignored},
+    {"ping requires connection", ping_requires_connection},
     {"lossy link still delivers", lossy_delivery_completes},
     {"heavy loss still delivers", heavy_loss_still_completes},
     {"duplicated link still orders", duplicated_link_still_orders},

@@ -16,9 +16,10 @@ vpath %.cc ../main ../main/wireless ../main/meaproto
 # 每个测试一行：名字 = 源文件（固件源以 ../main/ 开头）
 arq           = arq_host_test.cc ../main/wireless/arq.cc
 meaproto-wire = meaproto_wire_test.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
-meaproto-core = meaproto_core_test.cc ../main/meaproto/core.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
+meaproto-core = meaproto_core_test.cc ../main/meaproto/core.cc ../main/meaproto/reassembly.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
+meaproto-fragment = meaproto_fragment_test.cc ../main/meaproto/core.cc ../main/meaproto/reassembly.cc ../main/meaproto/wire.cc ../main/meaproto/hash.cc ../main/binfmt.cc
 
-TESTS = arq meaproto-wire meaproto-core
+TESTS = arq meaproto-wire meaproto-core meaproto-fragment
 
 # 源文件 → 目标文件：../main/a/b.cc → build/obj/a/b.o，其余 → build/obj/<name>.o
 obj = $(addprefix build/obj/,$(patsubst %.cc,%.o,$(patsubst ../main/%,%,$(1))))
@@ -26,6 +27,7 @@ obj = $(addprefix build/obj/,$(patsubst %.cc,%.o,$(patsubst ../main/%,%,$(1))))
 build/bin/arq: $(call obj,$(arq))
 build/bin/meaproto-wire: $(call obj,$(meaproto-wire))
 build/bin/meaproto-core: $(call obj,$(meaproto-core))
+build/bin/meaproto-fragment: $(call obj,$(meaproto-fragment))
 
 build/bin/%:
 	@mkdir -p $(@D)
@@ -39,9 +41,9 @@ all: $(addprefix build/bin/,$(TESTS))
 
 run: arq meaproto
 
-meaproto: meaproto-wire meaproto-core
+meaproto: meaproto-wire meaproto-core meaproto-fragment
 
-arq meaproto-wire meaproto-core: %: build/bin/%
+arq meaproto-wire meaproto-core meaproto-fragment: %: build/bin/%
 	./$<
 
 clean:
@@ -49,4 +51,4 @@ clean:
 
 -include $(shell find build -name '*.d' 2>/dev/null)
 
-.PHONY: all run arq meaproto meaproto-wire meaproto-core clean
+.PHONY: all run arq meaproto meaproto-wire meaproto-core meaproto-fragment clean

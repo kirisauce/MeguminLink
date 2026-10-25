@@ -68,7 +68,6 @@ struct Stats
     u32 rx_queue_dropped = 0;
     u32 reorder_overflow = 0; /**< 重排缓冲满导致帧被丢弃 */
     u32 fragments_reassembled = 0;
-    u32 reassembly_timeouts = 0;
     u32 rtt_ms = 0;
     u32 rto_ms = 0;
     u16 peer_epoch = 0;

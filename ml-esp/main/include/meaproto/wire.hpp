@@ -36,6 +36,16 @@ inline constexpr usize MESSAGE_SPLIT_SIZE = 6;
 inline constexpr usize ACK_BITS_WIDTH = 32;
 inline constexpr u16 MIN_SPLIT_COUNT = 2;
 
+/** 分片消息头总长：datagram 头 + 基础消息头 + ordering + split 字段 */
+inline constexpr usize FRAGMENT_HEADER_SIZE =
+    DATAGRAM_HEADER_SIZE + MESSAGE_HEADER_BASE_SIZE + MESSAGE_ORDERING_SIZE + MESSAGE_SPLIT_SIZE;
+
+/** 一片能装的载荷上限 */
+inline constexpr u16 fragment_payload_limit(u16 mtu) noexcept
+{
+    return (mtu > FRAGMENT_HEADER_SIZE) ? static_cast<u16>(mtu - FRAGMENT_HEADER_SIZE) : 0;
+}
+
 /** 首字节是否属于本协议：高 4 位是版本号 */
 inline constexpr bool is_protocol_frame(u8 first_byte) noexcept
 {

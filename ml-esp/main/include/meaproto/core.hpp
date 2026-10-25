@@ -3,6 +3,7 @@
 #define __MEAPROTO_CORE_HPP__
 
 #include "meaproto/config.hpp"
+#include "meaproto/reassembly.hpp"
 #include "meaproto/sink.hpp"
 #include "meaproto/types.hpp"
 #include "meaproto/wire.hpp"
@@ -94,6 +95,9 @@ class Core
     /** 通道表摘要 */
     u16 config_hash() const noexcept;
 
+    /** 发一个 Ping；未连接时返回 false */
+    bool ping(u32 now) noexcept;
+
     Stats snapshot() const noexcept;
 
   private:
@@ -104,6 +108,7 @@ class Core
         u16 seq = 0;
         u16 len = 0;
         u8 retx = 0;
+        u32 sent_ms = 0;
         u32 deadline_ms = 0;
     };
 
@@ -119,7 +124,8 @@ class Core
         u16 window_count = 0;
         u16 used_slots = 0;
         u16 tx_seq = 0;
-        u16 tx_ordering = 0;
+        u16 next_ordering = 0; /**< 下一条消息的 ordering，send() 时分配 */
+        u16 next_split_id = 1; /**< 下一条分片消息的 split_id（0 表示未分片） */
         WindowSlot slots[MAX_WINDOW];
         u8 *reorder = nullptr; /**< reorder_count × 重排步长 */
         u16 reorder_count = 0;
@@ -134,20 +140,38 @@ class Core
         void reset() noexcept;
     };
 
-    /** 条目头：消息长度 */
-    static constexpr usize ENTRY_HEADER = sizeof(u16);
+    /** 队列条目头：一条消息可能拆成多片，每片占一个条目 */
+    struct ChunkHeader
+    {
+        u16 len = 0;         /**< 片载荷长度 */
+        u16 ordering = 0;    /**< 可靠通道内递增；同一条消息的各片相同 */
+        u16 split_id = 0;    /**< 0 表示未分片 */
+        u16 split_index = 0; /**< 片下标，0 起始 */
+        u16 split_count = 1; /**< 总片数，1 表示未分片 */
+    };
 
-    /** 一条消息的步长（长度前缀 + 载荷，按 u16 对齐） */
-    static usize entry_stride(const ChannelSpec &spec) noexcept;
+    static constexpr usize ENTRY_HEADER = sizeof(ChunkHeader);
+
+    /** 窗口帧槽的长度前缀 */
+    static constexpr usize SLOT_HEADER = sizeof(u16);
+
+    /** 一个队列条目的步长（分片头 + 片载荷，按 u16 对齐） */
+    static usize entry_stride(const ChannelSpec &spec, const Config &config, u16 mtu) noexcept;
 
     /** 一个窗口帧槽的步长（长度前缀 + 整帧字节，按 u16 对齐） */
     static usize frame_stride(u16 mtu) noexcept;
 
     /** 一个重排槽的步长（ordering + 长度 + 载荷，按 u16 对齐） */
-    static usize reorder_stride(const ChannelSpec &spec) noexcept;
+    static usize reorder_stride(const ChannelSpec &spec, const Config &config) noexcept;
 
     /** 有效重排深度：缺省取队列深度，封顶 ACK 位图宽度 */
     static u16 reorder_capacity(const ChannelSpec &spec) noexcept;
+
+    /** 单帧可承载的消息载荷上限（消息头按可靠性取 3B / 5B） */
+    static u16 frame_payload_capacity(Reliability reliability, u16 mtu) noexcept;
+
+    /** 单条消息上限：min(max_payload, max_message_size) */
+    static usize message_limit(const ChannelSpec &spec, const Config &config) noexcept;
 
     Channel *find_channel(ChannelId channel) noexcept;
     const Channel *find_channel(ChannelId channel) const noexcept;
@@ -164,8 +188,11 @@ class Core
     /** 收到的数据报：释放发送窗口、去重、排序交付并安排延迟确认 */
     void handle_datagram(u32 now, std::span<const u8> frame) noexcept;
 
-    /** 按 ack_seq / ack_bits 释放本通道窗口槽 */
-    void handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits) noexcept;
+    /** 按 ack_seq / ack_bits 释放本通道窗口槽，顺带采样 RTT */
+    void handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits, u32 now) noexcept;
+
+    /** 一次 RTT 样本进指数平滑估计器 */
+    void sample_rtt(u32 sample) noexcept;
 
     /** 交付一条消息；可靠通道按 ordering 排队，重排缓冲满时置 overflow */
     void deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept;
@@ -174,10 +201,13 @@ class Core
     void drain_reorder(Channel &channel) noexcept;
 
     /** 发一个只带 ACK 字段的数据报 */
-    bool send_ack(Channel &channel) noexcept;
+    bool send_ack(Channel &channel, u32 now) noexcept;
 
     /** 到期的延迟确认 */
     void flush_acks(u32 now) noexcept;
+
+    /** 重组器收齐消息后的交付回调 */
+    static bool deliver_hook(void *ctx, ChannelId channel, u16 ordering, const u8 *data, usize len) noexcept;
 
     /** 重传退避：rto_initial << retx，封顶 rto_max */
     u32 rto_backoff(u8 retx) const noexcept;
@@ -187,7 +217,7 @@ class Core
 
     void handle_control(u32 now, const ControlFrame &frame) noexcept;
     void handle_connect_request(u32 now, const ControlFrame &frame) noexcept;
-    void handle_connect_accept(const ControlFrame &frame) noexcept;
+    void handle_connect_accept(u32 now, const ControlFrame &frame) noexcept;
     void handle_connect_reject(u32 now, const ControlFrame &frame) noexcept;
     void handle_disconnect(u32 now, const ControlFrame &frame) noexcept;
 
@@ -233,9 +263,18 @@ class Core
     u8 *m_frame = nullptr;
     u16 m_frame_cap = 0;
 
+    // ---- 分片重组 ----
+    Reassembler m_reassembly;
+
     // ---- 运行期 ----
-    u32 m_last_tx_ms = 0; /**< 最近一次成功发送的时刻，保活用 */
-    Stats m_stats;        /**< 计数器，snapshot() 取副本 */
+    u32 m_last_tx_ms = 0;     /**< 最近一次成功发出帧的时刻，保活用 */
+    u32 m_last_rx_ms = 0;     /**< 最近一次收到合法帧的时刻，超时用 */
+    u16 m_ping_token = 1;     /**< 下一个 Ping 的 token，0 保留 */
+    u16 m_ping_in_flight = 0; /**< 在途 Ping 的 token，0 表示没有 */
+    u32 m_ping_sent_ms = 0;
+    u32 m_rtt_ms = 0; /**< 平滑后的往返时延 */
+    u32 m_rto_ms = 0; /**< 由 RTT 推出的重传基准 */
+    Stats m_stats;    /**< 计数器，snapshot() 取副本 */
 };
 } // namespace meaproto
 
