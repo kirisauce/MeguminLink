@@ -27,8 +27,9 @@
     watch -n 0.2 -d mlinkctl
     while :; do mlinkctl; sleep 0.2; done
 
-ping 是唯一的例外：设备端异步执行探测（主循环发 Ping、等 Pong），命令响应里
-没有结果，因此它会轮询统计快照直到本次探测结算或等待超时。
+ping 是唯一的例外：设备端把探测交给协议层（Ping 控制帧发出、Pong 返回后刷新
+平滑往返），命令响应里没有结果，因此它会轮询统计快照直到链路报告已连接或
+等待超时。
 
 速率请自行对两次快照的 *_bytes 差分（计数器为 u32 累计值，回绕按
 (cur - prev) & 0xFFFFFFFF 处理）。
@@ -132,7 +133,7 @@ MAGIC = 0x4D4C
 FRAME_HEADER_SIZE = 8
 MAX_RESPONSE = 512
 TIMEOUT_MS = 1000
-# ping 等待设备结算时的轮询间隔：设备端超时窗口（Kconfig 默认 500ms）远大于它，
+# ping 等待链路状态时的轮询间隔：一次控制帧往返远小于它，
 # 因此不会明显推迟结果，也不会给 USB 控制端点造成压力
 PING_POLL_S = 0.05
 
@@ -200,13 +201,10 @@ TAG_UART_STOP_BITS = 0x37
 TAG_UART_PARITY = 0x38
 TAG_UART_RELIABLE = 0x39
 
-# 对端存活探测（GetStats 的 0x22-0x25，与固件 config_channel.cc 一致）：
-# online 0=从未探测 1=在线 2=离线；rtt 是最近一次成功往返的微秒数；ok/fail 是
-# 累计计数——单次探测的结果靠两次快照差分判定，因为设备端是异步执行的
+# 对端存活探测（GetStats 的 0x22-0x23，与固件 config_channel.cc 一致）：
+# online 1=已连接 2=未连接；rtt 是协议层平滑估计的微秒数
 TAG_PEER_ONLINE = 0x22
 TAG_PING_RTT = 0x23
-TAG_PING_OK = 0x24
-TAG_PING_FAIL = 0x25
 
 PEER = {0: "unknown", 1: "online", 2: "offline"}
 
@@ -422,7 +420,7 @@ def render_uart_state(values):
 
 
 def render_peer_state(values):
-    """对端存活探测：online 带最近一次往返，ok/fail 是累计计数（老固件整组跳过）。"""
+    """对端存活探测：online 带协议层的平滑往返（老固件整组跳过）。"""
     if TAG_PEER_ONLINE not in values:
         return []
 
@@ -430,8 +428,6 @@ def render_peer_state(values):
     parts = [f"peer={PEER.get(online, '?')}"]
     if online == 1:
         parts.append(f"rtt_ms={u32_of(values, TAG_PING_RTT) / 1000:.2f}")
-    parts.append(f"ping_ok={u32_of(values, TAG_PING_OK)}")
-    parts.append(f"ping_fail={u32_of(values, TAG_PING_FAIL)}")
     return parts
 
 
@@ -999,29 +995,26 @@ def cmd_flash(args):
 
 
 def probe_once(dev, timeout_ms):
-    """发一次对端探测并等设备结算，返回 (online, rtt_us)。
+    """发一次对端探测，返回 (online, rtt_us)。
 
-    设备端异步执行（主循环发 ESP-NOW Ping、等 Pong，超时由 Kconfig 决定），命令
-    响应里没有结果：这里先取 ok/fail 计数基线，下发命令后轮询统计快照，谁增加
-    就说明本次探测是成功还是超时。
+    设备端把命令交给协议层：Ping 控制帧发出、Pong 返回后刷新平滑往返时延，命令
+    响应里没有单次结果。这里在超时窗口内轮询统计快照：协议连接保持即认为对端
+    在线，往返取协议层的平滑估计（微秒）。
     """
     before = decode(fetch(dev, CMD_GET_STATS))
-    if TAG_PING_OK not in before:
-        die("固件不支持对端探测（GetStats 里没有 peer_online / ping 计数），请更新固件")
+    if TAG_PEER_ONLINE not in before:
+        die("固件不支持对端探测（GetStats 里没有 peer_online），请更新固件")
 
-    baseline = (u32_of(before, TAG_PING_OK), u32_of(before, TAG_PING_FAIL))
     decode(fetch(dev, CMD_PING))
 
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         time.sleep(PING_POLL_S)
         stats = decode(fetch(dev, CMD_GET_STATS))
-        if (u32_of(stats, TAG_PING_OK), u32_of(stats, TAG_PING_FAIL)) != baseline:
-            if u8_of(stats, TAG_PEER_ONLINE) == 1:
-                return True, u32_of(stats, TAG_PING_RTT)
-            return False, 0
+        if u8_of(stats, TAG_PEER_ONLINE) == 1:
+            return True, u32_of(stats, TAG_PING_RTT)
 
-    die(f"探测未在 {timeout_ms} ms 内结算（设备需处于 wireless 模式，见 mlinkctl config）")
+    return False, 0
 
 
 def cmd_ping(args):
@@ -1133,7 +1126,7 @@ def build_parser():
         type=int,
         default=1000,
         metavar="MS",
-        help="单次探测等待设备结算的毫秒（默认 1000，需大于设备端探测超时）",
+        help="单次探测等待链路报告在线的毫秒（默认 1000）",
     )
     ping.set_defaults(handler=cmd_ping)
 

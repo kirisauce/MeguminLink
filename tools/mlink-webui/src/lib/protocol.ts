@@ -84,8 +84,6 @@ const TAG_UART_RELIABLE = 0x39;
 /** 对端存活探测的 tag（0x20-0x2F 无线段，紧跟空口字节计数器续编）。 */
 const TAG_PEER_ONLINE = 0x22;
 const TAG_PING_RTT = 0x23;
-const TAG_PING_OK = 0x24;
-const TAG_PING_FAIL = 0x25;
 /** 丢包注入的计数器（同在 0x20-0x2F 无线段；固件未编译该功能时不下发）。 */
 const TAG_LOSS_FRAMES = 0x26;
 const TAG_LOSS_DROPPED = 0x27;
@@ -182,11 +180,9 @@ export const USB_REJECT_TEXT: Readonly<Record<number, string>> = {
  * uart* 五项是 CDC ACM 串口状态（不在 STAT_FIELDS 里，因而也不参与速率差分）：
  * 老固件不上报这些 tag，此时为 null，界面显示「—」而不是把它们当成 0。
  *
- * peerOnline / pingRttUs / pingOk / pingFail 是对端存活探测的结果：online 是
- * 最近一次的结论（未探测为 null 或 PEER_UNKNOWN），rttUs 是最近一次成功的往返
- * （微秒，从未成功时为 0），ok/fail 是累计计数——界面点一次「探测」后，两个
- * 计数谁增加就说明这一次是成功还是超时。同样不进速率差分：它们描述探测结果，
- * 不是链路吞吐。
+ * peerOnline / pingRttUs 是对端存活探测的结果：online 由协议连接状态给出
+ * （老固件为 null 或 PEER_UNKNOWN），rttUs 是协议层平滑估计的往返（微秒）。
+ * 同样不进速率差分：它们描述链路状态，不是链路吞吐。
  */
 export type Stats = {
 	mode: number;
@@ -211,8 +207,6 @@ export type Stats = {
 	uartReliable: number | null;
 	peerOnline: number | null;
 	pingRttUs: number | null;
-	pingOk: number | null;
-	pingFail: number | null;
 	/**
 	 * 丢包注入的读数：lossFrames 是过白名单、参与判定的出向帧数，lossDropped
 	 * 是其中被判丢的帧数，两者之比即实际注入比例。固件未编译该功能时为 null。
@@ -480,7 +474,7 @@ export type UartStateKey =
 	| 'uartReliable';
 
 /** 对端存活探测字段：与串口状态同待遇，既不进 STAT_FIELDS 也不参与速率差分。 */
-export type PeerStateKey = 'peerOnline' | 'pingRttUs' | 'pingOk' | 'pingFail';
+export type PeerStateKey = 'peerOnline' | 'pingRttUs';
 
 /**
  * 丢包注入的读数字段：同样是实验读数而不是链路吞吐，既不进 STAT_FIELDS
@@ -554,8 +548,6 @@ export function decodeStats(frame: DataView): Stats {
 	stats.uartReliable = readOptional(tags.get(TAG_UART_RELIABLE));
 	stats.peerOnline = readOptional(tags.get(TAG_PEER_ONLINE));
 	stats.pingRttUs = readOptional(tags.get(TAG_PING_RTT));
-	stats.pingOk = readOptional(tags.get(TAG_PING_OK));
-	stats.pingFail = readOptional(tags.get(TAG_PING_FAIL));
 	stats.lossFrames = readOptional(tags.get(TAG_LOSS_FRAMES));
 	stats.lossDropped = readOptional(tags.get(TAG_LOSS_DROPPED));
 	stats.arqState = readOptional(tags.get(TAG_ARQ_STATE));
@@ -662,9 +654,9 @@ export async function readUsbConfig(device: USBDevice, seq: number): Promise<Usb
 /**
  * 触发一次对端存活探测（cmd 0x18）。
  *
- * 与其它动作命令同语义：只表示设备已接受投递，探测由设备主循环发出
- * ESP-NOW Ping 并等待 Pong（超时由设备的 Kconfig 决定），结果不在本次响应里
- * 返回——随后的 readStats 读 peerOnline 与 pingOk/pingFail 计数差分即可。
+ * 与其它动作命令同语义：只表示设备已接受投递，探测由协议层发出 Ping 并在
+ * 收到 Pong 后刷新平滑往返；结果不在本次响应里返回，随后的 readStats 读
+ * peerOnline 与 pingRttUs 即可。
  */
 export async function pingPeer(device: USBDevice, seq: number): Promise<void> {
 	parseFrame(await transferIn(device, CMD_PING, seq));

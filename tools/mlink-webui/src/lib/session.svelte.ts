@@ -167,8 +167,6 @@ export class MlinkSession {
 	#retryTimer: ReturnType<typeof setTimeout> | null = null;
 	/** 重新枚举的提示升级定时器。 */
 	#noticeTimer: ReturnType<typeof setTimeout> | null = null;
-	/** 探测在途时的 ok/fail 计数基线：任一个变化即说明本次探测已结算。 */
-	#pingBaseline: { ok: number; fail: number } | null = null;
 	#pingTimer: ReturnType<typeof setTimeout> | null = null;
 	/** 上一次定时探测的主机时刻（performance.now 毫秒）。 */
 	#pingProbeAt = 0;
@@ -787,9 +785,9 @@ export class MlinkSession {
 	/**
 	 * 下发一次探测命令并等轮询结算。
 	 *
-	 * 设备端异步执行：命令只投递，主循环发出 ESP-NOW Ping 并等 Pong，结果落在
-	 * GetStats 快照里。这里记下 ok/fail 计数基线，等轮询发现计数变化即认为本次
-	 * 探测结算完毕（成功后 peerOnline 变 1 且带新的 RTT，超时后变 2）。
+	 * 设备端异步执行：命令只投递，协议层发出 Ping 并在收到 Pong 后刷新平滑
+	 * 往返。本次轮询之后的快照已含新的 peerOnline / pingRttUs，下一拍轮询
+	 * 收起在途状态。
 	 *
 	 * @param report 失败时是否写 commandError：定时探测静默跳过，不每 3 秒刷一条报错
 	 */
@@ -797,8 +795,6 @@ export class MlinkSession {
 		const device = this.device;
 		if (device === null) return;
 		const generation = this.#generation;
-		this.#pingBaseline =
-			this.stats === null ? null : { ok: this.stats.pingOk ?? 0, fail: this.stats.pingFail ?? 0 };
 		this.#pingInFlight = true;
 		this.#schedulePingTimeout();
 		try {
@@ -878,12 +874,8 @@ export class MlinkSession {
 			if (previous !== null && (previous.pair !== stats.pair || previous.mode !== stats.mode)) {
 				void this.refreshConfig();
 			}
-			// 探测在途：ok/fail 任一计数变化即说明本次探测已由设备结算
-			if (this.#pingInFlight && this.#pingBaseline !== null) {
-				const ok = stats.pingOk ?? 0;
-				const fail = stats.pingFail ?? 0;
-				if (ok !== this.#pingBaseline.ok || fail !== this.#pingBaseline.fail) this.#finishPing();
-			}
+			// 探测在途：本轮快照已包含设备结算后的 peerOnline / pingRttUs
+			if (this.#pingInFlight) this.#finishPing();
 			// 定时探测由上位机发起，节拍与轮询同源（见 #schedulePingProbe）
 			this.#schedulePingProbe();
 			this.error = null;
@@ -904,7 +896,6 @@ export class MlinkSession {
 	#finishPing(): void {
 		this.#pingInFlight = false;
 		this.manualPingInFlight = false;
-		this.#pingBaseline = null;
 		if (this.#pingTimer !== null) {
 			clearTimeout(this.#pingTimer);
 			this.#pingTimer = null;
@@ -912,9 +903,8 @@ export class MlinkSession {
 	}
 
 	/**
-	 * 探测的界面兜底超时：设备端超时窗口（Kconfig，默认 500ms）加一次轮询往返
-	 * 还没看到计数变化就收起状态。老固件不支持该命令时命令本身已失败，这里只
-	 * 负责不让界面永远停在「探测中」。
+	 * 探测的界面兜底超时：一次轮询往返还没收起状态就放弃。老固件不支持该命令
+	 * 时命令本身已失败，这里只负责不让界面永远停在「探测中」。
 	 */
 	#schedulePingTimeout(): void {
 		if (this.#pingTimer !== null) clearTimeout(this.#pingTimer);
