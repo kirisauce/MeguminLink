@@ -447,6 +447,7 @@ constexpr ChannelId CH_W{4};
 constexpr ChannelId CH_R{5};
 constexpr ChannelId CH_S{6};
 
+// clang-format off
 /** 通道表：A 优先级 2、B 队列 1、C 不可靠、W 窗口 1、R 重排 1、S 大容量 */
 constexpr ChannelSpec TEST_CHANNELS[] = {
     {CH_A, Reliability::ReliableOrdered, 64, 2, 2, 2, 2},
@@ -456,6 +457,7 @@ constexpr ChannelSpec TEST_CHANNELS[] = {
     {CH_R, Reliability::ReliableOrdered, 32, 3, 5, 1, 4},
     {CH_S, Reliability::ReliableOrdered, 32, 128, 6, 64, 8},
 };
+// clang-format on
 
 /** 带通道表的 Rig：存储按通道表算出，握手后进入 Connected */
 struct ChannelRig
@@ -647,11 +649,21 @@ struct Duo
         check(b.core.connected());
     }
 
+    /** drop_period/duplicate_every 非 0 时按帧序号注入丢包与重复 */
     void flush(ChannelRig &from, ChannelRig &to)
     {
         for (const std::vector<u8> &frame : from.link.frames)
         {
+            ++frames_seen;
+            if (drop_period != 0 && (frames_seen % static_cast<u32>(drop_period)) == 0)
+            {
+                continue;
+            }
             to.core.receive(to.now, std::span<const u8>{frame.data(), frame.size()});
+            if (duplicate_every != 0 && (frames_seen % static_cast<u32>(duplicate_every)) == 0)
+            {
+                to.core.receive(to.now, std::span<const u8>{frame.data(), frame.size()});
+            }
         }
         from.link.frames.clear();
     }
@@ -666,6 +678,9 @@ struct Duo
 
     ChannelRig a;
     ChannelRig b;
+    int drop_period = 0;
+    int duplicate_every = 0;
+    u32 frames_seen = 0;
 };
 
 void receive_in_order()
@@ -803,8 +818,52 @@ void reorder_overflow_keeps_unacked()
 
 // ---- 丢包、重复与序号回绕 ----
 
+/** 持续排满发送队列并推进双方时钟，直到接收端收齐 total 条或耗尽 tick 预算 */
+bool deliver_all(Duo &duo, ChannelId channel, int total, u32 limit_ms)
+{
+    int queued = 0;
+    for (u32 elapsed = 0; elapsed < limit_ms; ++elapsed)
+    {
+        while (queued < total && duo.a.core.can_send(channel))
+        {
+            const u8 payload[2] = {static_cast<u8>(queued & 0xFF), static_cast<u8>((queued >> 8) & 0xFF)};
+            if (duo.a.core.send(channel, payload) != SendResult::Ok)
+            {
+                return false;
+            }
+            ++queued;
+        }
 
+        duo.step(1);
+        duo.flush(duo.a, duo.b);
+        duo.flush(duo.b, duo.a);
 
+        if (queued == total && duo.b.sink.messages.size() >= static_cast<std::size_t>(total))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** 收到的载荷是否正好是 0..total-1 按序 */
+bool payloads_in_order(const FakeSink &sink, int total)
+{
+    if (sink.messages.size() != static_cast<std::size_t>(total))
+    {
+        return false;
+    }
+    for (int i = 0; i < total; ++i)
+    {
+        const std::vector<u8> &message = sink.messages[i];
+        if (message.size() != 2 || message[0] != static_cast<u8>(i & 0xFF) ||
+            message[1] != static_cast<u8>((i >> 8) & 0xFF))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 void duplicate_frames_delivered_once()
 {
@@ -827,7 +886,56 @@ void duplicate_frames_delivered_once()
     check_eq(duo.b.core.snapshot().duplicate_datagrams, 2);
 }
 
+void lossy_delivery_completes()
+{
+    Duo duo;
+    duo.connect();
+    duo.drop_period = 10;
 
+    check(deliver_all(duo, CH_S, 100, 20000));
+    check(payloads_in_order(duo.b.sink, 100));
+}
+
+void heavy_loss_still_completes()
+{
+    Duo duo;
+    duo.connect();
+    duo.drop_period = 3;
+
+    check(deliver_all(duo, CH_S, 50, 60000));
+    check(payloads_in_order(duo.b.sink, 50));
+}
+
+void duplicated_link_still_orders()
+{
+    Duo duo;
+    duo.connect();
+    duo.duplicate_every = 4;
+
+    check(deliver_all(duo, CH_S, 200, 20000));
+    check(payloads_in_order(duo.b.sink, 200));
+}
+
+void loss_and_duplicates_stay_ordered()
+{
+    Duo duo;
+    duo.connect();
+    duo.drop_period = 50;
+    duo.duplicate_every = 7;
+
+    check(deliver_all(duo, CH_S, 1000, 120000));
+    check(payloads_in_order(duo.b.sink, 1000));
+}
+
+void sequence_wraparound()
+{
+    Duo duo;
+    duo.connect();
+
+    check(deliver_all(duo, CH_S, 65536, 200000));
+    check(payloads_in_order(duo.b.sink, 65536));
+    check_eq(duo.b.core.snapshot().duplicate_datagrams, 0);
+}
 
 // ---- 可靠性切换 ----
 
@@ -1007,6 +1115,11 @@ const test::Case TESTS[] = {
     {"set_reliability restarts ordering", set_reliability_restarts_ordering},
     {"reconnect resets channels", reconnect_resets_channels},
     {"duplicate frames delivered once", duplicate_frames_delivered_once},
+    {"lossy link still delivers", lossy_delivery_completes},
+    {"heavy loss still delivers", heavy_loss_still_completes},
+    {"duplicated link still orders", duplicated_link_still_orders},
+    {"loss and duplicates stay in order", loss_and_duplicates_stay_ordered},
+    {"sequence wraps without loss", sequence_wraparound},
 };
 } // namespace
 

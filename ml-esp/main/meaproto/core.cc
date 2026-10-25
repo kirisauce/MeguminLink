@@ -418,14 +418,15 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
 
         if (ahead == 0)
         {
-            // 位图跟着 expected 一起右移：bit i 始终表示 expected + 1 + i
-            expected = static_cast<u16>(expected + 1);
-            bits >>= 1;
-            while ((bits & 1u) != 0)
+            // 位图 bit i 恒表示 expected + 1 + i；低位连续的 1 是紧随其后的已收帧，一并跳过
+            u32 ones = 0;
+            while (ones < 32 && ((bits >> ones) & 1u) != 0)
             {
-                bits >>= 1;
-                expected = static_cast<u16>(expected + 1);
+                ++ones;
             }
+            const u32 shift = ones + 1;
+            bits = (shift >= 32) ? 0u : (bits >> shift);
+            expected = static_cast<u16>(expected + shift);
         }
         else
         {
