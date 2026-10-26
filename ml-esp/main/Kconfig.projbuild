@@ -214,23 +214,6 @@ endmenu
 
 menu "Wireless"
 
-config MEGUMINLINK_WIRELESS_ARQ_MAX_WINDOW
-    int "Reliable transport window limit"
-    default 8
-    range 1 8
-    help
-        Upper bound on how many DAP messages may be in flight at once. The
-        window is what overlaps the peer's execution time with the next
-        transfer; a value of 1 is plain stop-and-wait (one command on the
-        wire at a time, kept for A/B comparison against the windowed path).
-
-        Both ends size static storage from this value (the sender's window
-        buffer and the receiver's out-of-order replay storage), so raising it
-        costs RAM on both ends. The wire format already carries the window
-        and selective-ACK fields a larger window needs; only the effective
-        window limit is capped here, and the peer's advertised receive window
-        can lower it further at runtime.
-
 config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
     int "Wireless DAP response timeout (ms)"
     default 1800

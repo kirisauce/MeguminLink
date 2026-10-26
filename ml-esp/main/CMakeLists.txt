@@ -1,7 +1,7 @@
 file(GLOB __src ${CMAKE_CURRENT_LIST_DIR}/*.cc ${CMAKE_CURRENT_LIST_DIR}/*.c)
 
-# 无线域（main/wireless/）：帧编解码（frame）、ESP-NOW 链路（link）、ARQ 核心
-# 与适配层（arq / arq_link）、配对（pairing）。两端共用，无条件编译。
+# 无线域（main/wireless/）：帧编解码（frame）、ESP-NOW 传输（espnow_transport）、
+# 链路（link）、参数持久化（link_config）、配对（pairing）。两端共用，无条件编译。
 file(GLOB __wireless_src ${CMAKE_CURRENT_LIST_DIR}/wireless/*.cc)
 list(APPEND __src ${__wireless_src})
 
