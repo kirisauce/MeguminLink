@@ -413,10 +413,6 @@ enum : u8
     TAG_CFG_MODE = 0x50,         // u8：持久化的运行模式 0=Local 1=Wireless
     TAG_CFG_PEER_MAC = 0x51,     // blob 6B：已配对对端 MAC（未配对时不下发）
     TAG_CFG_WIFI_RATE = 0x52,    // u8：ESP-NOW 发送速率档位（wifi_phy_rate_t 原值）
-    TAG_CFG_ARQ_GENERATION = 0x54,  // u32：固定 0（运行期没有配置下发）
-    TAG_CFG_ARQ_WINDOW = 0x56,      // u8：DAP 通道发送窗口
-    TAG_CFG_ARQ_MAX_RETX = 0x57,    // u8：固定 0（可靠消息重传到超时为止）
-    TAG_CFG_ARQ_BREAKER = 0x58,     // u8：固定 0
     TAG_CFG_ARQ_RTO_MIN = 0x59,     // u16：初始 RTO（毫秒）
     TAG_CFG_ARQ_RTO_INIT = 0x5A,    // u16：初始 RTO（毫秒）
     TAG_CFG_ARQ_RTO_MAX = 0x5B,     // u16：RTO 上限（毫秒）
@@ -730,12 +726,7 @@ u16 ConfigChannel::build_config_response(u8 cmd, u8 seq)
     p += tlv_u8(m_response + p, TAG_CFG_LOSS_PERMILLE, Application::get_instance().wireless_link().loss_permille());
 #endif
     {
-        const WirelessLink &link = Application::get_instance().wireless_link();
-        const meaproto::Config &config = link.proto_config();
-        p += tlv_u32(m_response + p, TAG_CFG_ARQ_GENERATION, 0);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_WINDOW, link.dap_window());
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_MAX_RETX, 0);
-        p += tlv_u8(m_response + p, TAG_CFG_ARQ_BREAKER, 0);
+        const meaproto::Config &config = Application::get_instance().wireless_link().proto_config();
         p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MIN, config.rto_initial_ms);
         p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_INIT, config.rto_initial_ms);
         p += tlv_u16(m_response + p, TAG_CFG_ARQ_RTO_MAX, config.rto_max_ms);
@@ -819,18 +810,17 @@ namespace
 /**
  * SetLinkConfig OUT 载荷的 tag。载荷自成一套 TLV 空间，与响应帧的 tag 无关；
  * 只列出的字段被覆盖，没列出的保持本机当前值，因此主机可以只改一项。
+ *
+ * 只接受运行期可改的时序类字段；尺寸类（窗口、重传次数、熔断）在构造时按存储
+ * 固定，对应 tag 一律按非法处理。
  */
 enum : u8
 {
-    // 0x01 未分配（保留号位）
-    LINK_TAG_WINDOW = 0x02,      // u8：发送窗口
-    LINK_TAG_MAX_RETX = 0x03,    // u8：重传次数上限
-    LINK_TAG_BREAKER = 0x04,     // u8：熔断阈值
-    LINK_TAG_RTO_MIN = 0x05,     // u16：RTO 下限（毫秒）
+    // 0x01-0x05 未分配（窗口、重传次数、熔断与 RTO 下限没有运行期语义）
     LINK_TAG_RTO_INIT = 0x06,    // u16：初始 RTO（毫秒）
     LINK_TAG_RTO_MAX = 0x07,     // u16：RTO 上限（毫秒）
     LINK_TAG_DELAYED_ACK = 0x08, // u16：延迟确认（毫秒）
-    LINK_TAG_PROBE = 0x09,       // u16：熔断试探间隔（毫秒）
+    LINK_TAG_PROBE = 0x09,       // u16：保活间隔（毫秒）
 };
 
 u16 read_u16_be(const u8 *value)
@@ -843,7 +833,7 @@ u16 read_u16_be(const u8 *value)
  * @return true=格式合法；false=TLV 越界或取值长度不对（调用方在 DATA 阶段返回
  *         false，由 TinyUSB 在状态阶段 STALL）
  */
-bool parse_link_config(const u8 *data, usize len, ArqSettings *io)
+bool parse_link_config(const u8 *data, usize len, meaproto::Config *io)
 {
     usize pos = 0;
     while (pos + 2 <= len)
@@ -868,61 +858,27 @@ bool parse_link_config(const u8 *data, usize len, ArqSettings *io)
         const u8 *value = data + pos;
         pos += value_len;
 
+        if (value_len != 2)
+        {
+            return false;
+        }
+        const u16 parsed = read_u16_be(value);
         switch (tag)
         {
-        case LINK_TAG_WINDOW:
-            if (value_len != 1)
-            {
-                return false;
-            }
-            io->window = value[0];
-            break;
-        case LINK_TAG_MAX_RETX:
-            if (value_len != 1)
-            {
-                return false;
-            }
-            io->max_retx = value[0];
-            break;
-        case LINK_TAG_BREAKER:
-            if (value_len != 1)
-            {
-                return false;
-            }
-            io->breaker_failures = value[0];
-            break;
-        case LINK_TAG_RTO_MIN:
         case LINK_TAG_RTO_INIT:
-        case LINK_TAG_RTO_MAX:
-        case LINK_TAG_DELAYED_ACK:
-        case LINK_TAG_PROBE: {
-            if (value_len != 2)
-            {
-                return false;
-            }
-            const u16 parsed = read_u16_be(value);
-            switch (tag)
-            {
-            case LINK_TAG_RTO_MIN:
-                io->rto_min_ms = parsed;
-                break;
-            case LINK_TAG_RTO_INIT:
-                io->initial_rto_ms = parsed;
-                break;
-            case LINK_TAG_RTO_MAX:
-                io->rto_max_ms = parsed;
-                break;
-            case LINK_TAG_DELAYED_ACK:
-                io->delayed_ack_ms = parsed;
-                break;
-            default:
-                io->breaker_probe_ms = parsed;
-                break;
-            }
+            io->rto_initial_ms = parsed;
             break;
-        }
+        case LINK_TAG_RTO_MAX:
+            io->rto_max_ms = parsed;
+            break;
+        case LINK_TAG_DELAYED_ACK:
+            io->ack_delay_ms = parsed;
+            break;
+        case LINK_TAG_PROBE:
+            io->keepalive_interval_ms = parsed;
+            break;
         default:
-            return false; // 未知 tag：版本不符，宁可拒掉也不猜着执行
+            return false; // 未知或已失效的 tag：宁可拒掉也不猜着执行
         }
     }
     return true;
@@ -932,16 +888,15 @@ bool parse_link_config(const u8 *data, usize len, ArqSettings *io)
 bool ConfigChannel::stage_link_config_draft(const u8 *data, usize len)
 {
     // 以本机当前参数为底：载荷只覆盖出现的字段
-    ArqSettings draft = Application::get_instance().wireless_link().arq_settings();
+    meaproto::Config draft = Application::get_instance().wireless_link().proto_config();
     if (!parse_link_config(data, len, &draft))
     {
         return false;
     }
 
-    // 代数由设备自己推进：主机只说"要什么参数"，不掺和版本管理；对端据此判断
-    // 该听谁的
-    draft.generation += 1;
-    if (!mlink::arq_settings_valid(draft))
+    // 与 Core::apply_config 同一套拒绝条件：非法值在 DATA 阶段就 STALL
+    if (draft.rto_initial_ms == 0 || draft.rto_max_ms < draft.rto_initial_ms || draft.connect_timeout_ms == 0 ||
+        draft.keepalive_interval_ms == 0 || draft.send_quota_per_tick == 0)
     {
         return false;
     }
@@ -1126,13 +1081,13 @@ void ConfigChannel::relay_to_peer(u8 cmd, u8 arg)
 
 #endif // CONFIG_MEGUMINLINK_USB_SUPPORT
 
-bool ConfigChannel::take_link_config_draft(ArqSettings *settings)
+bool ConfigChannel::take_link_config_draft(meaproto::Config *config)
 {
     portENTER_CRITICAL(&m_link_draft_lock);
     const bool present = m_link_draft_present;
-    if (present && settings != nullptr)
+    if (present && config != nullptr)
     {
-        *settings = m_link_draft;
+        *config = m_link_draft;
     }
     m_link_draft_present = false;
     portEXIT_CRITICAL(&m_link_draft_lock);

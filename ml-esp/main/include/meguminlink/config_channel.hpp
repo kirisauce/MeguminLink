@@ -6,7 +6,7 @@
 #include "meguminlink/wireless/frame.hpp"
 #include "sdkconfig.h"
 
-#include "meguminlink/wireless/arq_link.hpp"
+#include "meaproto/config.hpp"
 
 // 统计、动作槽与草稿槽都用 portMUX_TYPE 保护，两种目标（含无 USB 的接收端）都要编译
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
@@ -138,13 +138,12 @@ class ConfigChannel
     bool take_action(Action *action, u8 *arg = nullptr);
 
     /**
-     * 取走待应用的可靠传输参数草稿并清空槽（主循环执行 SetLinkConfig 时调用）。
+     * 取走待应用的链路参数草稿并清空槽（主循环执行 SetLinkConfig 时调用）。
      *
-     * 参数由主机经 EP0 OUT 下发（无 USB 侧没有 EP0，只能靠对端在会话重置帧里
-     * 捎带过来），解析校验在 DATA 阶段完成，这里只取结果。两端都编译：主循环的
-     * 动作分派是共用的。
+     * 参数由主机经 EP0 OUT 下发，解析与校验在 DATA 阶段完成，这里只取结果。
+     * 两端都编译：主循环的动作分派是共用的。
      */
-    bool take_link_config_draft(ArqSettings *settings);
+    bool take_link_config_draft(meaproto::Config *config);
 
     /**
      * 收到对端转发的 USB 控制请求（CONFIG 通道消息，协议任务调用）。
@@ -280,10 +279,10 @@ class ConfigChannel
     u8 m_response[256];
 
     /**
-     * 可靠传输参数草稿单槽（EP0 OUT 的 DATA 阶段写、主循环执行 SetLinkConfig 时
+     * 链路参数草稿单槽（EP0 OUT 的 DATA 阶段写、主循环执行 SetLinkConfig 时
      * 取走）。只接受到此为止：参数落盘与应用都在主循环做，不占用 tinyusb 任务。
      */
-    ArqSettings m_link_draft = {};
+    meaproto::Config m_link_draft = {};
     bool m_link_draft_present = false;
     mutable portMUX_TYPE m_link_draft_lock = portMUX_INITIALIZER_UNLOCKED;
 

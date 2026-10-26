@@ -7,6 +7,7 @@
 #include "meguminlink/wireless/arq_link.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/link.hpp" // WirelessDapExecutor（DapCommand 投递）
+#include "meguminlink/wireless/link_config.hpp"
 
 #include <driver/gpio.h> // gpio_num_t（m_button.init 参数）
 #include <esp_log.h>
@@ -80,6 +81,12 @@ Application::Application()
     // 无线链路初始化（WiFi/ESP-NOW/广播 peer + 无线侧 DAP 执行器）：
     // 任何构建都创建，仅主循环投递命令时工作（Local 模式下空闲阻塞）
     ESP_ERROR_CHECK(m_wireless_link.init());
+
+    // 链路参数在协议任务起来之后才能应用（apply_config 要求任务已运行）
+    if (!m_wireless_link.apply_config(link_config_load()))
+    {
+        ESP_LOGW(TAG, "Stored link config rejected, using defaults");
+    }
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
     // USB 先起：本机串口桥的对侧端口（CDC）由它提供
     ESP_ERROR_CHECK(m_usb.init());
@@ -540,20 +547,18 @@ void Application::consume_pending_action()
         break;
     }
     case ConfigChannel::Action::SetLinkConfig: {
-        // 参数落盘 + 立即应用。应用会换新 epoch 重置会话，对端据此重新对齐序号并
-        // 采纳这份参数——参数因此不必再走那条尽力而为的中继通道。
-        ArqSettings settings = {};
-        if (m_config_channel.take_link_config_draft(&settings) &&
-            m_wireless_link.arq_apply_settings(settings) == ESP_OK)
+        // 先应用再落盘：应用失败说明参数不合法，落盘没有意义
+        meaproto::Config config = {};
+        if (m_config_channel.take_link_config_draft(&config) && m_wireless_link.apply_config(config))
         {
-            const esp_err_t ret = arq_settings_store(settings);
+            const esp_err_t ret = link_config_store(config);
             if (ret != ESP_OK)
             {
-                ESP_LOGW(TAG, "Failed to persist ARQ settings: %s", esp_err_to_name(ret));
+                ESP_LOGW(TAG, "Failed to persist link config: %s", esp_err_to_name(ret));
             }
-            ESP_LOGI(TAG, "Reliable transport settings applied (generation %u, window %u, rto %u-%u ms, retx %u)",
-                     static_cast<unsigned>(settings.generation), settings.window, settings.rto_min_ms,
-                     settings.rto_max_ms, settings.max_retx);
+            ESP_LOGI(TAG, "Link timing applied (rto %u-%u ms, ack delay %u ms, keepalive %u ms)",
+                     static_cast<unsigned>(config.rto_initial_ms), static_cast<unsigned>(config.rto_max_ms),
+                     static_cast<unsigned>(config.ack_delay_ms), static_cast<unsigned>(config.keepalive_interval_ms));
         }
         break;
     }
@@ -594,17 +599,6 @@ void Application::run()
             (void)m_wireless_link.set_uart_reliable(m_uart_reliable_key.get() != 0);
         }
         m_link_connected = link_connected;
-
-        // 参数被改动过（主机下发，或按代数/MAC 采纳了对端那份）：落盘。NVS 写入
-        // 只在主循环做，不占 tinyusb 任务，也不占 ARQ 任务（交付路径会改参数）。
-        if (m_wireless_link.arq_take_settings_dirty())
-        {
-            const esp_err_t persist_ret = arq_settings_store(m_wireless_link.arq_settings());
-            if (persist_ret != ESP_OK)
-            {
-                ESP_LOGW(TAG, "Failed to persist ARQ settings: %s", esp_err_to_name(persist_ret));
-            }
-        }
 
         // LED 随主循环节拍刷新：模式/配对变化（含按键唤醒）最迟一个节拍内反映
         m_leds.apply(led_request());

@@ -11,7 +11,6 @@
 #include "meguminlink/common.hpp" // IWYU pragma: keep
 #include "meguminlink/dap_executor.hpp"
 #include "meguminlink/dap_frame.hpp"
-#include "meguminlink/wireless/arq_link.hpp" // IWYU pragma: export
 #include "meguminlink/wireless/espnow_transport.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/uart_egress.hpp"
@@ -289,23 +288,11 @@ class WirelessLink : private meaproto::Sink
     /** 协议运行参数（配置通道 GetConfig 的数据源） */
     const meaproto::Config &proto_config() const;
 
-    /** DAP 通道的生效发送窗口（0x56 / 0x70 的窗口字段） */
+    /** 运行期改时序类参数，见 meaproto::Core::apply_config */
+    bool apply_config(const meaproto::Config &config);
+
+    /** DAP 通道的生效发送窗口（0x70 的窗口字段） */
     u8 dap_window() const;
-
-    /** 会话握手是否已完成（USB 侧据此在转发命令前先等一等） */
-    bool arq_established() const;
-
-    /** 可靠传输累计计数（统计与日志用） */
-    ArqLink::Snapshot arq_snapshot() const;
-
-    /** 当前可靠传输参数（配置读取与落盘用） */
-    ArqSettings arq_settings() const;
-
-    /** 主机下发的可靠传输参数：立即生效并置脏，落盘由主循环做 */
-    esp_err_t arq_apply_settings(const ArqSettings &settings);
-
-    /** 参数被改动过（含采纳对端参数）：主循环取走并落盘 */
-    bool arq_take_settings_dirty();
 
     /**
      * 登记一个对端 peer（encrypt=false）。仅登记尚未存在于 peer list 的地址，
@@ -472,9 +459,6 @@ class WirelessLink : private meaproto::Sink
 
     /** 通道表：本阶段为空 */
     static std::span<const meaproto::ChannelSpec> channels();
-
-    /** 可靠传输参数的本层副本：供配置通道读写与回显 */
-    ArqSettings m_settings{};
 
     meaproto::Daemon<LinkTransport> m_daemon;
 };

@@ -25,6 +25,12 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
+/** 单调毫秒时基：FreeRTOS tick 换算 */
+u32 now_ms()
+{
+    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
 /** 业务帧的发送路径：注入开启时包一层丢包装饰器，否则直接用 ESP-NOW */
 LinkTransport &link_transport()
 {
@@ -711,33 +717,12 @@ const meaproto::Config &WirelessLink::proto_config() const
     return m_daemon.config();
 }
 
+bool WirelessLink::apply_config(const meaproto::Config &config)
+{
+    return m_daemon.apply_config(config);
+}
+
 u8 WirelessLink::dap_window() const
 {
     return channels()[0].window;
-}
-
-bool WirelessLink::arq_established() const
-{
-    return false;
-}
-
-ArqLink::Snapshot WirelessLink::arq_snapshot() const
-{
-    return {};
-}
-
-ArqSettings WirelessLink::arq_settings() const
-{
-    return m_settings;
-}
-
-esp_err_t WirelessLink::arq_apply_settings(const ArqSettings &settings)
-{
-    m_settings = settings;
-    return ESP_OK;
-}
-
-bool WirelessLink::arq_take_settings_dirty()
-{
-    return false;
 }

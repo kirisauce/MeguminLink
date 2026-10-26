@@ -2,14 +2,8 @@ file(GLOB __src ${CMAKE_CURRENT_LIST_DIR}/*.cc ${CMAKE_CURRENT_LIST_DIR}/*.c)
 
 # 无线域（main/wireless/）：帧编解码（frame）、ESP-NOW 链路（link）、ARQ 核心
 # 与适配层（arq / arq_link）、配对（pairing）。两端共用，无条件编译。
-list(APPEND __src
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/frame.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/espnow_transport.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/link.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/uart_egress.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/arq.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/arq_link.cc
-    ${CMAKE_CURRENT_LIST_DIR}/wireless/pairing.cc)
+file(GLOB __wireless_src ${CMAKE_CURRENT_LIST_DIR}/wireless/*.cc)
+list(APPEND __src ${__wireless_src})
 
 # 本机串口桥（UART <-> 无线；Local 模式下 UART <-> 主机 CDC）：两端共用一份实现，
 # 对侧端口的差异在文件内用 CONFIG_MEGUMINLINK_USB_SUPPORT 表达，无条件编译。
@@ -19,13 +13,8 @@ list(APPEND __src ${CMAKE_CURRENT_LIST_DIR}/uart/uart_bridge.cc)
 # 该选项仅对 ESP32-S3 可用（见同目录 Kconfig.projbuild）。
 # 源文件逐个登记：glob 的结果在配置期固定，新增文件不会自动进构建。
 if(CONFIG_MEGUMINLINK_USB_SUPPORT)
-    list(APPEND __src
-        ${CMAKE_CURRENT_LIST_DIR}/usb/usb.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_descriptors.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/cdc_acm.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/usb_capability.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/update_mode.cc
-        ${CMAKE_CURRENT_LIST_DIR}/usb/firmware_updater.cc)
+    file(GLOB __usb_src ${CMAKE_CURRENT_LIST_DIR}/usb/*.cc)
+    list(APPEND __src ${__usb_src})
 endif()
 
 # CMSIS-DAP 固件（移植自 Arm CMSIS-DAP V2.1.2）：无条件编译。
