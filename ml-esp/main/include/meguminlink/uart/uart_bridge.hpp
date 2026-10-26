@@ -39,10 +39,19 @@ class UartBridge
     esp_err_t init();
 
     /**
-     * 对侧来了数据、要写进本机端口。由收帧回调（esp_wifi 任务上下文）调用，
-     * 只做一次拷贝入队：写端口的动作在 tx 任务里做。队列满时丢帧并计数。
+     * 对侧来了数据、要写进本机端口。只做一次拷贝入队：写端口的动作在 tx 任务里做。
+     * 队列满时丢帧并计数，返回 false，协议层据此不确认该数据报、等对端重传。
      */
-    void push_inbound(const u8 *data, size_t len, UartSource source);
+    bool push_inbound(const u8 *data, size_t len, UartSource source);
+
+    /**
+     * 入向队列是否还有余量。不足时协议层暂缓确认数据报，让对端窗口停住，
+     * 把落口速率变成端到端的节拍。
+     */
+    bool inbound_ready() const;
+
+    /** 入向队列因满丢弃的帧数 */
+    u32 inbound_dropped() const;
 
     /**
      * UART 路径：写本机 UART TX。来源有两种：对侧无线帧带来的数据，以及 Local
@@ -78,6 +87,10 @@ class UartBridge
     QueueHandle_t m_inbound_frames = nullptr;
     TaskHandle_t m_rx_task = nullptr;
     TaskHandle_t m_tx_task = nullptr;
+    u32 m_inbound_dropped = 0; /**< 入向队列满丢弃的帧数 */
+    u32 m_rx_overflows = 0;    /**< UART 接收缓冲溢出次数 */
+    u32 m_inbound_log_ms = 0;  /**< 下一次允许打印入向丢弃告警的时刻 */
+    u32 m_overflow_log_ms = 0; /**< 下一次允许打印接收溢出告警的时刻 */
 };
 } // namespace mlink
 

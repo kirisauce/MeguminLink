@@ -97,26 +97,36 @@ bool WirelessLink::connecting() const
     return m_daemon.connecting();
 }
 
-void WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
+bool WirelessLink::on_message(meaproto::ChannelId channel, std::span<const u8> data)
 {
     if (channel == DAP_CHANNEL)
     {
         handle_dap_message(data);
-        return;
+        return true;
     }
     if (channel == UART_CHANNEL)
     {
-        handle_uart_message(data);
-        return;
+        return handle_uart_message(data);
     }
     if (channel == CONFIG_CHANNEL)
     {
         handle_config_message(data);
-        return;
+        return true;
     }
 
     ESP_LOGD(TAG, "channel %u message (%u bytes) not dispatched", static_cast<unsigned>(channel.value),
              static_cast<unsigned>(data.size()));
+    return true;
+}
+
+bool WirelessLink::rx_ready(meaproto::ChannelId channel) const noexcept
+{
+    // 只有串口落口会堵：DAP 与配置通道各自在自己的队列满时回 Busy
+    if (channel == UART_CHANNEL)
+    {
+        return Application::get_instance().uart_bridge().inbound_ready();
+    }
+    return true;
 }
 
 void WirelessLink::handle_dap_message(std::span<const u8> data)
@@ -276,11 +286,11 @@ void WirelessLink::on_disconnected(meaproto::DisconnectReason reason)
     ESP_LOGW(TAG, "meaproto disconnected (reason %u)", static_cast<unsigned>(reason));
 }
 
-void WirelessLink::handle_uart_message(std::span<const u8> data)
+bool WirelessLink::handle_uart_message(std::span<const u8> data)
 {
     if (data.empty())
     {
-        return;
+        return true;
     }
 
     const u8 source = data[0];
@@ -291,21 +301,21 @@ void WirelessLink::handle_uart_message(std::span<const u8> data)
         if (body.size() != UART_LINE_CODING_SIZE)
         {
             ESP_LOGW(TAG, "Line coding payload of %u bytes, dropped", static_cast<unsigned>(body.size()));
-            return;
+            return true;
         }
         const u32 baud = (static_cast<u32>(body[0]) << 24) | (static_cast<u32>(body[1]) << 16) |
                          (static_cast<u32>(body[2]) << 8) | static_cast<u32>(body[3]);
         m_line_baud = baud;
         Application::get_instance().uart_bridge().configure(baud, body[4], body[5], body[6]);
-        return;
+        return true;
     }
 
     if (body.empty())
     {
-        return;
+        return true;
     }
     const UartSource port = (source == UART_SOURCE_HOST) ? UartSource::Host : UartSource::Target;
-    Application::get_instance().uart_bridge().push_inbound(body.data(), body.size(), port);
+    return Application::get_instance().uart_bridge().push_inbound(body.data(), body.size(), port);
 }
 
 void WirelessLink::handle_config_message(std::span<const u8> data)

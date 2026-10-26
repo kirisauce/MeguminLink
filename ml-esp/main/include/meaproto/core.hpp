@@ -205,17 +205,26 @@ class Core
     /** 一次 RTT 样本进指数平滑估计器 */
     void sample_rtt(u32 sample) noexcept;
 
-    /** 交付一条消息；可靠通道按 ordering 排队，重排缓冲满时置 overflow */
-    void deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept;
+    /** 交付一条消息；可靠通道按 ordering 排队，重排缓冲满时置 overflow，落口吃不下时返回 false */
+    bool deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept;
 
-    /** 把重排缓冲里连续的消息按序交付 */
+    /** 把重排缓冲里连续的消息按序交付；落口吃不下就停在原地，等下一拍再试 */
     void drain_reorder(Channel &channel) noexcept;
+
+    /** 落口有余量时把重排缓冲里还压着的消息交付出去 */
+    void flush_reorder() noexcept;
 
     /** 发一个只带 ACK 字段的数据报 */
     bool send_ack(Channel &channel, u32 now) noexcept;
 
     /** 到期的延迟确认 */
     void flush_acks(u32 now) noexcept;
+
+    /** 安排一次延迟确认；已经安排的更早期限不被推后 */
+    void schedule_ack(Channel &channel, u32 now) noexcept;
+
+    /** 队列非空且窗口有空位：下一拍还能继续发 */
+    bool has_sendable_backlog() const noexcept;
 
     /** 重组器收齐消息后的交付回调 */
     static bool deliver_hook(void *ctx, ChannelId channel, u16 ordering, const u8 *data, usize len) noexcept;

@@ -33,6 +33,20 @@ constexpr size_t READ_CHUNK = mlink::UART_INBOUND_FRAME_MAX;
 // 写 UART 撞上缓冲满时的让出次数上限（每次 1 tick，约 100ms）：115200 波特率
 // 下写满 256B 缓冲 ≈ 22ms，留足余量；超过即认为对端不消费，丢弃兜底。
 constexpr u32 UART_WRITE_STALL_LIMIT = 100;
+
+// 入向队列余量的低水位：剩余空位少于它就在协议层暂缓确认。取值按队列深度
+// 的四分之一，深度配得很小时退化成 1，避免永远不放行。
+constexpr UBaseType_t INBOUND_LOW_WATER =
+    (CONFIG_MEGUMINLINK_UART_INBOUND_QUEUE_DEPTH / 4 > 0) ? (CONFIG_MEGUMINLINK_UART_INBOUND_QUEUE_DEPTH / 4) : 1;
+
+// 同类告警的最小间隔
+constexpr u32 DROP_LOG_INTERVAL_MS = 1000;
+
+/** 当前毫秒时刻（tick 换算，回绕安全比较用 i32） */
+u32 now_ms() noexcept
+{
+    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
 } // namespace
 
 namespace mlink
@@ -137,9 +151,16 @@ void UartBridge::rx_task_fn(void *arg)
         }
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL: {
-            ESP_LOGW(TAG, "UART RX overflow, flushing");
-            uart_flush_input(UART_NUM);
-            xQueueReset(self->m_uart_events);
+            // 环形缓冲里还压着没读走的有效字节：冲掉只会多丢一截，只计数。
+            // 后续 UART_DATA 事件仍会把剩下的读尽（读尽循环在 UART_DATA 分支里）。
+            ++self->m_rx_overflows;
+            const u32 now = now_ms();
+            if (static_cast<i32>(now - self->m_overflow_log_ms) >= 0)
+            {
+                self->m_overflow_log_ms = now + DROP_LOG_INTERVAL_MS;
+                ESP_LOGW(TAG, "UART RX overflow (total %lu), bytes lost",
+                         static_cast<unsigned long>(self->m_rx_overflows));
+            }
             break;
         }
         default: {
@@ -149,13 +170,13 @@ void UartBridge::rx_task_fn(void *arg)
     }
 }
 
-void UartBridge::push_inbound(const u8 *data, size_t len, UartSource source)
+bool UartBridge::push_inbound(const u8 *data, size_t len, UartSource source)
 {
-    // 收帧回调（esp_wifi 任务）调用：只拷贝入队。写端口的动作在 tx 任务里做，
-    // 留在这里会把整个收发栈钉住（对端随即收不到确认，两端一起停摆）。
+    // 协议任务调用：只拷贝入队。写端口的动作在 tx 任务里做，留在这里会把整个
+    // 收发栈钉住（对端随即收不到确认，两端一起停摆）。
     if (len == 0)
     {
-        return;
+        return true;
     }
 
     InboundFrame frame = {};
@@ -167,8 +188,34 @@ void UartBridge::push_inbound(const u8 *data, size_t len, UartSource source)
     frame.len = static_cast<u16>(len);
     std::memcpy(frame.data, data, len);
 
-    // 队列满即丢：深度只吸收调度抖动，不承担吞吐（限速在对侧的出向准入里做）
-    (void)xQueueSend(m_inbound_frames, &frame, 0);
+    // 队列满即丢，但要让协议层知道：不确认这一帧，对端随后重传
+    if (xQueueSend(m_inbound_frames, &frame, 0) != pdTRUE)
+    {
+        ++m_inbound_dropped;
+        const u32 now = now_ms();
+        if (static_cast<i32>(now - m_inbound_log_ms) >= 0)
+        {
+            m_inbound_log_ms = now + DROP_LOG_INTERVAL_MS;
+            ESP_LOGW(TAG, "inbound queue full, dropped %u bytes (total %lu frames)", static_cast<unsigned>(len),
+                     static_cast<unsigned long>(m_inbound_dropped));
+        }
+        return false;
+    }
+    return true;
+}
+
+bool UartBridge::inbound_ready() const
+{
+    if (m_inbound_frames == nullptr)
+    {
+        return true; // 桥没在用：没有落口可堵，不要拦住协议确认
+    }
+    return uxQueueSpacesAvailable(m_inbound_frames) > INBOUND_LOW_WATER;
+}
+
+u32 UartBridge::inbound_dropped() const
+{
+    return m_inbound_dropped;
 }
 
 void UartBridge::tx_task_fn(void *arg)

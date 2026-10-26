@@ -32,10 +32,11 @@ inline u16 empty_hash()
 
 struct FakeSink final : Sink
 {
-    void on_message(ChannelId channel, std::span<const u8> data) override
+    bool on_message(ChannelId channel, std::span<const u8> data) override
     {
         channels.push_back(channel);
         messages.emplace_back(data.begin(), data.end());
+        return true;
     }
 
     void on_connected() override

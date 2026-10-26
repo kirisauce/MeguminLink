@@ -351,8 +351,8 @@ class WirelessLink : private meaproto::Sink
     /** 无线 DAP 执行任务：取命令、执行、回响应 */
     static void dap_task_fn(void *arg);
 
-    /** UART 通道分派：按来源标记写端口或应用线编码 */
-    void handle_uart_message(std::span<const u8> data);
+    /** UART 通道分派：按来源标记写端口或应用线编码；返回落口是否接下了这批数据 */
+    bool handle_uart_message(std::span<const u8> data);
 
     /** CONFIG 通道分派：解析转发过来的 USB 控制请求 */
     void handle_config_message(std::span<const u8> data);
@@ -453,7 +453,8 @@ class WirelessLink : private meaproto::Sink
     portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
 
     // meaproto::Sink
-    void on_message(meaproto::ChannelId channel, std::span<const u8> data) override;
+    bool on_message(meaproto::ChannelId channel, std::span<const u8> data) override;
+    bool rx_ready(meaproto::ChannelId channel) const noexcept override;
     void on_connected() override;
     void on_disconnected(meaproto::DisconnectReason reason) override;
 

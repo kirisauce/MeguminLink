@@ -156,11 +156,15 @@ menu "UART Bridge"
 # 参数。放在 USB 条件之外，非 USB 端（如 ESP32-C3 无线接收端）也能配置。
 config MEGUMINLINK_UART_RX_BUFFER_SIZE
     int "UART receive buffer size"
-    default 256
+    default 4096
+    help
+        Ring buffer for bytes arriving on the bridge port. At 921600 8N1 each
+        byte takes 10.85 us, so 256 bytes is under 3 ms of margin - less than a
+        single task switch on a busy bridge. 4 KB gives roughly 44 ms.
 
 config MEGUMINLINK_UART_TX_BUFFER_SIZE
     int "UART send buffer size"
-    default 256
+    default 2048
 
 config MEGUMINLINK_UART_EVENT_QUEUE_SIZE
     int "UART event queue size"
@@ -203,12 +207,14 @@ config MEGUMINLINK_UART_TX_MIN_PERCENT
 
 config MEGUMINLINK_UART_INBOUND_QUEUE_DEPTH
     int "Inbound UART frame queue depth (frames)"
-    default 8
+    default 32
     help
-        Frames the peer-facing receive callback may hand to the bridge before it
-        has written them to this side's port. The callback never writes the UART
-        itself, so a full queue drops the frame and counts it instead of blocking
-        the WiFi task.
+        Frames the wireless side may hand to the bridge before it has written
+        them to this side's port. Writing the port is never done in the receive
+        path, so the protocol layer stops acknowledging datagrams once the queue
+        drops below a quarter of its depth: this depth is the end-to-end backlog
+        the link may build up, not just jitter headroom. A full queue drops the
+        frame and reports back, so the peer retransmits it.
 
 endmenu
 

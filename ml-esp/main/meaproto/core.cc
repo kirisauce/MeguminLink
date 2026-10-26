@@ -11,6 +11,12 @@ namespace
 /** 没有定时器时的兜底唤醒间隔 */
 constexpr u32 IDLE_WAKE_MS = 1000;
 
+/** 还有可推进的待发数据时的续跑间隔 */
+constexpr u32 TX_RETRY_MS = 1;
+
+/** 落口挡住确认或重排交付时的重试间隔 */
+constexpr u32 RX_RETRY_MS = 2;
+
 /** u32 计时是回绕安全的比较：now 是否还没到 deadline */
 bool time_before(u32 now, u32 deadline) noexcept
 {
@@ -484,8 +490,7 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
         {
             // 重复帧：补发一次确认，让对端释放窗口
             ++m_stats.duplicate_datagrams;
-            channel->ack_pending = true;
-            channel->ack_deadline_ms = now + m_config.ack_delay_ms;
+            schedule_ack(*channel, now);
             return;
         }
 
@@ -538,7 +543,10 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
             continue;
         }
 
-        deliver_message(*channel, message.ordering, in.current(), message.payload_len, overflow);
+        if (!deliver_message(*channel, message.ordering, in.current(), message.payload_len, overflow))
+        {
+            return; // 落口吃不下：本帧不确认，等对端重传
+        }
         in.consume(message.payload_len);
     }
 
@@ -552,8 +560,7 @@ void Core::handle_datagram(u32 now, std::span<const u8> frame) noexcept
     {
         channel->rx_expected = expected;
         channel->rx_bits = bits;
-        channel->ack_pending = true;
-        channel->ack_deadline_ms = now + m_config.ack_delay_ms;
+        schedule_ack(*channel, now);
     }
 }
 
@@ -567,39 +574,43 @@ bool Core::deliver_hook(void *ctx, ChannelId channel, u16 ordering, const u8 *da
     }
 
     bool overflow = false;
-    self.deliver_message(*slot, ordering, data, static_cast<u16>(len), overflow);
-    return !overflow;
+    const bool delivered = self.deliver_message(*slot, ordering, data, static_cast<u16>(len), overflow);
+    return delivered && !overflow;
 }
 
-void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept
+bool Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 len, bool &overflow) noexcept
 {
     if (channel.spec.reliability != Reliability::ReliableOrdered)
     {
-        m_sink.on_message(channel.spec.id, std::span<const u8>{data, len});
+        // 不可靠通道没有重传可等：落口吃不下也只好作罢
         ++m_stats.messages_delivered;
-        return;
+        (void)m_sink.on_message(channel.spec.id, std::span<const u8>{data, len});
+        return true;
     }
 
     const u16 ahead = static_cast<u16>(ordering - channel.rx_ordering);
     if (ahead == 0)
     {
-        m_sink.on_message(channel.spec.id, std::span<const u8>{data, len});
+        if (!m_sink.on_message(channel.spec.id, std::span<const u8>{data, len}))
+        {
+            return false;
+        }
         ++m_stats.messages_delivered;
         channel.rx_ordering = static_cast<u16>(channel.rx_ordering + 1);
         drain_reorder(channel);
-        return;
+        return true;
     }
 
     if (ahead >= 0x8000)
     {
-        return; // 旧消息：已经交付过
+        return true; // 旧消息：已经交付过
     }
 
     if (channel.reorder_used >= channel.reorder_count)
     {
         overflow = true;
         ++m_stats.reorder_overflow;
-        return;
+        return true;
     }
 
     u8 *slot = channel.reorder + static_cast<usize>(channel.reorder_used) * reorder_stride(channel.spec, m_config);
@@ -607,6 +618,7 @@ void Core::deliver_message(Channel &channel, u16 ordering, const u8 *data, u16 l
     std::memcpy(slot + sizeof(u16), &len, sizeof(len));
     std::memcpy(slot + 2 * sizeof(u16), data, len);
     ++channel.reorder_used;
+    return true;
 }
 
 void Core::drain_reorder(Channel &channel) noexcept
@@ -628,7 +640,10 @@ void Core::drain_reorder(Channel &channel) noexcept
 
             u16 len = 0;
             std::memcpy(&len, slot + sizeof(u16), sizeof(len));
-            m_sink.on_message(channel.spec.id, std::span<const u8>{slot + 2 * sizeof(u16), len});
+            if (!m_sink.on_message(channel.spec.id, std::span<const u8>{slot + 2 * sizeof(u16), len}))
+            {
+                return; // 落口吃不下：这条留在重排缓冲里，等腾出余量再交付
+            }
             ++m_stats.messages_delivered;
             channel.rx_ordering = static_cast<u16>(channel.rx_ordering + 1);
 
@@ -640,6 +655,18 @@ void Core::drain_reorder(Channel &channel) noexcept
             }
             moved = true;
             break;
+        }
+    }
+}
+
+void Core::flush_reorder() noexcept
+{
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        Channel &channel = m_channels[i];
+        if (channel.reorder_used != 0 && m_sink.rx_ready(channel.spec.id))
+        {
+            drain_reorder(channel);
         }
     }
 }
@@ -679,12 +706,48 @@ void Core::flush_acks(u32 now) noexcept
         {
             continue;
         }
+        if (!m_sink.rx_ready(channel.spec.id))
+        {
+            continue; // 落口没腾出余量：先不确认，对端窗口随之停住
+        }
 
         if (!send_ack(channel, now))
         {
             return;
         }
     }
+}
+
+void Core::schedule_ack(Channel &channel, u32 now) noexcept
+{
+    const u32 deadline = now + m_config.ack_delay_ms;
+    if (!channel.ack_pending || time_before(deadline, channel.ack_deadline_ms))
+    {
+        channel.ack_deadline_ms = deadline;
+    }
+    channel.ack_pending = true;
+}
+
+bool Core::has_sendable_backlog() const noexcept
+{
+    if (m_frame == nullptr)
+    {
+        return false;
+    }
+
+    for (u8 i = 0; i < m_channel_count; ++i)
+    {
+        const Channel &channel = m_channels[i];
+        if (channel.count == 0)
+        {
+            continue;
+        }
+        if (channel.spec.reliability != Reliability::ReliableOrdered || channel.used_slots < channel.window_count)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Core::handle_ack(Channel &channel, u16 ack_seq, u32 ack_bits, u32 now) noexcept
@@ -828,6 +891,7 @@ u32 Core::step(u32 now) noexcept
             {
                 (void)send_control(now, ControlType::KeepAlive, ControlStatus::Ok, m_peer_epoch, 0);
             }
+            flush_reorder();
             advance_datagrams(now);
         }
     }
@@ -1113,6 +1177,43 @@ u32 Core::next_wake(u32 now) const noexcept
         if (time_before(keepalive, wake))
         {
             wake = keepalive;
+        }
+
+        for (u8 i = 0; i < m_channel_count; ++i)
+        {
+            const Channel &channel = m_channels[i];
+            if (channel.ack_pending)
+            {
+                // 已到期却没发出去（落口在挡或上一次发送失败）：按短间隔重试
+                const u32 ack_wake =
+                    time_before(now, channel.ack_deadline_ms) ? channel.ack_deadline_ms : (now + RX_RETRY_MS);
+                if (time_before(ack_wake, wake))
+                {
+                    wake = ack_wake;
+                }
+            }
+            if (channel.reorder_used != 0 && !m_sink.rx_ready(channel.spec.id))
+            {
+                const u32 reorder_wake = now + RX_RETRY_MS;
+                if (time_before(reorder_wake, wake))
+                {
+                    wake = reorder_wake;
+                }
+            }
+            for (u16 s = 0; s < channel.window_count; ++s)
+            {
+                const WindowSlot &slot = channel.slots[s];
+                if (slot.used && time_before(slot.deadline_ms, wake))
+                {
+                    wake = slot.deadline_ms;
+                }
+            }
+        }
+
+        // 发送配额用尽或底层暂时失败：下一拍继续推进，窗口满时不在此列
+        if (has_sendable_backlog() && time_before(now + TX_RETRY_MS, wake))
+        {
+            wake = now + TX_RETRY_MS;
         }
     }
     return wake;
