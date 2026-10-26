@@ -58,11 +58,6 @@ void WirelessLink::on_rx_stats(void *, u16 bytes, i8 rssi)
     Application::get_instance().config_channel().add_wireless_rx(bytes, rssi);
 }
 
-void WirelessLink::on_tx_result(void *ctx, const u8 *, bool ok)
-{
-    static_cast<WirelessLink *>(ctx)->handle_tx_result(ok);
-}
-
 void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
 {
     // 反序列化落在对象成员上：中继载荷可达 MAX_RELAYED_CONTROL_PAYLOAD，放栈上
@@ -80,33 +75,6 @@ void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
     std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
     rp.packet = packet;
     Application::get_instance().push_received_packet(rp);
-}
-
-void WirelessLink::handle_tx_result(bool ok)
-{
-    if (ok)
-    {
-        m_send_fail_streak = 0;
-        return;
-    }
-
-    const u32 now = now_ms();
-    const u8 streak = (m_send_fail_streak < 0xFF) ? static_cast<u8>(m_send_fail_streak + 1) : 0xFF;
-    m_send_fail_streak = streak;
-
-    // 连续失败达到阈值：与 NO_MEM 共用同一套退避
-    if (streak >= ESPNOW_TX_FAIL_STREAK_THRESHOLD)
-    {
-        m_send_fail_streak = 0; // 重新累计：持续失败期间由退避窗口持续刷新
-        enter_espnow_backoff(now);
-    }
-
-    // 失败日志限速：差链路下每帧一条会把日志刷满
-    if (static_cast<i32>(now - m_send_fail_log_ms) >= 0)
-    {
-        m_send_fail_log_ms = now + ESPNOW_TX_FAIL_LOG_INTERVAL_MS;
-        ESP_LOGW(TAG, "ESP-NOW send failed (streak %u)", streak);
-    }
 }
 
 WirelessLink::WirelessLink() : m_daemon(link_transport(), *this, channels(), LINK_CONFIG)
@@ -557,7 +525,6 @@ esp_err_t WirelessLink::init()
 
     transport.set_non_meaproto_frame_callback(&WirelessLink::on_frame, this);
     transport.set_rx_observer_callback(&WirelessLink::on_rx_stats, this);
-    transport.set_tx_result_callback(&WirelessLink::on_tx_result, this);
 
     constexpr unsigned channel_count = static_cast<unsigned>(sizeof(CHANNELS) / sizeof(CHANNELS[0]));
     const usize storage_size = meaproto::Core::storage_bytes(channels(), LINK_CONFIG, EspNowTransport::MTU);
@@ -709,15 +676,6 @@ esp_err_t WirelessLink::send(const u8 *dest_mac, const Packet &packet)
 
 esp_err_t WirelessLink::send_frame(const u8 *dest_mac, const u8 *data, size_t len)
 {
-    const u32 now = now_ms();
-
-    // 退避窗口内不再触碰驱动。持续满速冲击会把 ESP-NOW 的发送队列带进不可恢复
-    // 的状态（NO_MEM，或对端持续不应答），只有重启设备才能解开——宁可丢帧。
-    if (espnow_backoff_active(now))
-    {
-        return ESP_ERR_TIMEOUT;
-    }
-
     if (m_tx_mutex == nullptr)
     {
         return ESP_ERR_INVALID_STATE;
@@ -730,66 +688,12 @@ esp_err_t WirelessLink::send_frame(const u8 *dest_mac, const u8 *data, size_t le
     const esp_err_t send_ret = EspNowTransport::instance().send_to(dest_mac, std::span<const u8>{data, len});
     xSemaphoreGive(m_tx_mutex);
 
-    if (send_ret == ESP_ERR_ESPNOW_NO_MEM)
+    if (send_ret == ESP_OK)
     {
-        enter_espnow_backoff(now);
-    }
-    else if (send_ret == ESP_OK)
-    {
-        clear_espnow_backoff(now);
-        // 链路层统计：成功交给 ESP-NOW 的帧（发送结果由 tx 结果回调另行处理，
-        // 这里只反映"已发出"的字节量）
+        // 链路层统计：已交给 ESP-NOW 的字节量
         Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(len));
     }
     return send_ret;
-}
-
-bool WirelessLink::espnow_backoff_active(u32 now) const
-{
-    return static_cast<i32>(m_espnow_backoff_until_ms - now) > 0;
-}
-
-void WirelessLink::enter_espnow_backoff(u32 now)
-{
-    u8 level = 0;
-    u32 window = 0;
-    bool first_of_level = false;
-
-    portENTER_CRITICAL(&m_espnow_backoff_lock);
-    level = (m_espnow_backoff_level < ESPNOW_BACKOFF_MAX_LEVEL) ? static_cast<u8>(m_espnow_backoff_level + 1)
-                                                                : ESPNOW_BACKOFF_MAX_LEVEL;
-    window = static_cast<u32>(ESPNOW_BACKOFF_BASE_MS) << (level - 1);
-    if (window > ESPNOW_BACKOFF_MAX_MS)
-    {
-        window = ESPNOW_BACKOFF_MAX_MS;
-    }
-    first_of_level = (level != m_espnow_backoff_level);
-    m_espnow_backoff_level = level;
-    m_espnow_backoff_until_ms = now + window;
-    portEXIT_CRITICAL(&m_espnow_backoff_lock);
-
-    // 日志在临界区外：只有档位真的抬升才打一条，持续失败期间不会重复刷
-    if (first_of_level)
-    {
-        ESP_LOGW(TAG, "ESP-NOW TX backoff: best-effort frames muted for %u ms (level %u)",
-                 static_cast<unsigned>(window), level);
-    }
-}
-
-void WirelessLink::clear_espnow_backoff(u32 now)
-{
-    portENTER_CRITICAL(&m_espnow_backoff_lock);
-    const bool pending = (m_espnow_backoff_level != 0 || m_espnow_backoff_until_ms != 0);
-    // 窗口内发出成功只说明驱动队列碰巧腾出了一个空位（退避期间确认帧与 DAP 帧
-    // 照常尝试），不构成"空口已恢复"的证据。窗口真正过去之后仍能发出去，才说明
-    // 队列确实被排空，此时才降回正常档位。
-    const bool expired = !(static_cast<i32>(m_espnow_backoff_until_ms - now) > 0);
-    if (pending && expired)
-    {
-        m_espnow_backoff_level = 0;
-        m_espnow_backoff_until_ms = 0;
-    }
-    portEXIT_CRITICAL(&m_espnow_backoff_lock);
 }
 
 bool WirelessLink::ping()

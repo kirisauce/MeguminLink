@@ -109,7 +109,7 @@ class EspNowTransport
     SemaphoreHandle_t m_tx_mutex = nullptr; /**< esp_now_send 串行化 */
     u32 m_tx_frames = 0;
     u32 m_tx_failures = 0;
-    u32 m_next_fail_log_ms = 0; /**< 失败日志的限速时刻 */
+    volatile u32 m_next_fail_log_ms = 0; /**< 失败日志的限速时刻（发送路径与发送结果回调共用） */
 };
 } // namespace mlink
 

@@ -262,6 +262,15 @@ esp_err_t EspNowTransport::transmit(const u8 *peer_mac, std::span<const u8> data
     if (ret != ESP_OK)
     {
         ++m_tx_failures;
+
+        // NO_MEM 等同步失败由调用方按自己的节拍重试；日志限速，避免持续重试刷屏
+        const u32 now = static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (static_cast<i32>(now - m_next_fail_log_ms) >= 0)
+        {
+            m_next_fail_log_ms = now + TX_FAIL_LOG_INTERVAL_MS;
+            ESP_LOGW(TAG, "esp_now_send failed: %s (%u total)", esp_err_to_name(ret),
+                     static_cast<unsigned>(m_tx_failures));
+        }
         return ret;
     }
 

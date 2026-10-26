@@ -352,10 +352,8 @@ class WirelessLink : private meaproto::Sink
     /** Transport 回调（C 函数指针，实例经 ctx 传入） */
     static void on_frame(void *ctx, const u8 *src_mac, const u8 *data, usize len);
     static void on_rx_stats(void *ctx, u16 bytes, i8 rssi);
-    static void on_tx_result(void *ctx, const u8 *peer_mac, bool ok);
 
     void handle_frame(const u8 *src_mac, const u8 *data, usize len);
-    void handle_tx_result(bool ok);
 
     /** DAP 通道分派：命令入执行队列，响应交给 USB 侧 */
     void handle_dap_message(std::span<const u8> data);
@@ -392,23 +390,8 @@ class WirelessLink : private meaproto::Sink
     /** 当前线速换算成字节/秒（未知时用 Kconfig 兜底） */
     u32 uart_bytes_per_s() const;
 
-    /** 把一段已序列化的缓冲交给 ESP-NOW（退避窗口内直接丢弃） */
+    /** 把一段已序列化的缓冲交给 ESP-NOW */
     esp_err_t send_frame(const u8 *dest_mac, const u8 *data, size_t len);
-
-    /** 是否处于 ESP-NOW 发送退避窗口内（窗口内只抑制尽力而为帧） */
-    bool espnow_backoff_active(u32 now) const;
-
-    /**
-     * 抬高退避档位并按档位设定窗口（首档 20ms，逐级翻倍，200ms 封顶）。
-     * 触发源有两个：撞上 NO_MEM，以及发送完成回调连续报失败达到阈值。
-     */
-    void enter_espnow_backoff(u32 now);
-
-    /**
-     * 成功发出一帧：若退避窗口已过期则降回正常档位。窗口内的成功不算恢复
-     * ——那只是驱动队列碰巧有空位，退避期间确认帧与 DAP 帧本来就在照常尝试。
-     */
-    void clear_espnow_backoff(u32 now);
 
     /** 设置单播 peer 的 ESP-NOW 发送速率（广播地址跳过） */
     esp_err_t set_peer_rate(const u8 *peer_mac);
@@ -481,41 +464,6 @@ class WirelessLink : private meaproto::Sink
      */
     volatile u32 m_pending_rate = 0;
     portMUX_TYPE m_rate_lock = portMUX_INITIALIZER_UNLOCKED;
-
-    /** ESP-NOW 退避：首档 20ms，逐级翻倍，200ms 封顶 */
-    static constexpr u16 ESPNOW_BACKOFF_BASE_MS = 20;
-    static constexpr u16 ESPNOW_BACKOFF_MAX_MS = 200;
-    static constexpr u8 ESPNOW_BACKOFF_MAX_LEVEL = 5;
-
-    /**
-     * 发送完成回调连续报失败的阈值：达到即与 NO_MEM 走同一套退避。
-     *
-     * 连续失败说明空口或对端一侧出了问题（信道被占、对端没有应答），此时继续
-     * 满速灌帧只会让驱动队列越堆越深；退避窗口内只抑制尽力而为帧，可靠帧照发。
-     */
-    static constexpr u8 ESPNOW_TX_FAIL_STREAK_THRESHOLD = 8;
-    /** 发送失败日志的限速间隔：差链路下每帧一条会把日志刷满 */
-    static constexpr u32 ESPNOW_TX_FAIL_LOG_INTERVAL_MS = 1000;
-
-    /**
-     * ESP-NOW 发送退避。撞上 NO_MEM、或发送完成回调连续报失败达到阈值时抬高；
-     * 退避窗口过期后仍能发出帧才降回正常；窗口内只抑制串口数据帧，确认帧与
-     * DAP 帧照常尝试——队列排空后要靠它们把确认带回去。
-     *
-     * 档位与截止时刻要一起更新，且 send_raw（多任务）与 send_cb（esp_wifi 任务）
-     * 会并发调用，故由 m_espnow_backoff_lock 保护；espnow_backoff_active() 只读
-     * 单个截止时刻，保持无锁。
-     */
-    portMUX_TYPE m_espnow_backoff_lock = portMUX_INITIALIZER_UNLOCKED;
-    volatile u32 m_espnow_backoff_until_ms = 0;
-    volatile u8 m_espnow_backoff_level = 0;
-
-    /**
-     * 发送完成回调报失败的连续次数（成功清零）与最近一条失败日志的时刻。
-     * 两者都只由发送结果回调（esp_wifi 任务）读写，不需要额外同步。
-     */
-    volatile u8 m_send_fail_streak = 0;
-    volatile u32 m_send_fail_log_ms = 0;
 
     // meaproto::Sink
     void on_message(meaproto::ChannelId channel, std::span<const u8> data) override;
