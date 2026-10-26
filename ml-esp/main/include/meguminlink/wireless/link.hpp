@@ -457,7 +457,7 @@ class WirelessLink : private meaproto::Sink
     void on_connected() override;
     void on_disconnected(meaproto::DisconnectReason reason) override;
 
-    /** 通道表：本阶段为空 */
+    /** 通道表（CHANNELS），按目标分档 */
     static std::span<const meaproto::ChannelSpec> channels();
 
     meaproto::Daemon<LinkTransport> m_daemon;

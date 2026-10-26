@@ -181,22 +181,6 @@ void EspNowTransport::set_rx_observer_callback(RxObserverFn callback, void *ctx)
     m_rx_observer_ctx = ctx;
 }
 
-void EspNowTransport::set_tx_result_callback(TxResultFn callback, void *ctx) noexcept
-{
-    m_tx_result_callback = callback;
-    m_tx_result_ctx = ctx;
-}
-
-u32 EspNowTransport::tx_frames() const noexcept
-{
-    return m_tx_frames;
-}
-
-u32 EspNowTransport::tx_failures() const noexcept
-{
-    return m_tx_failures;
-}
-
 esp_err_t EspNowTransport::peer_add(const u8 *peer_mac)
 {
     if (peer_mac == nullptr)
@@ -274,7 +258,6 @@ esp_err_t EspNowTransport::transmit(const u8 *peer_mac, std::span<const u8> data
         return ret;
     }
 
-    ++m_tx_frames;
     return ESP_OK;
 }
 
@@ -355,10 +338,5 @@ void EspNowTransport::send_cb(const wifi_tx_info_t *info, esp_now_send_status_t 
             self.m_next_fail_log_ms = now + TX_FAIL_LOG_INTERVAL_MS;
             ESP_LOGW(TAG, "ESP-NOW send failed (%u total)", static_cast<unsigned>(self.m_tx_failures));
         }
-    }
-
-    if (self.m_tx_result_callback != nullptr)
-    {
-        self.m_tx_result_callback(self.m_tx_result_ctx, (info != nullptr) ? info->des_addr : nullptr, ok);
     }
 }

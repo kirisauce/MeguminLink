@@ -37,9 +37,6 @@ class EspNowTransport
     /** 收帧观测：把空口字节与 RSSI 交给射频统计 */
     using RxObserverFn = void (*)(void *ctx, u16 bytes, i8 rssi);
 
-    /** 发送结果：peer 未知时为 nullptr */
-    using TxResultFn = void (*)(void *ctx, const u8 *peer_mac, bool ok);
-
     /** 唯一实例 */
     static EspNowTransport &instance() noexcept;
 
@@ -68,7 +65,6 @@ class EspNowTransport
 
     void set_non_meaproto_frame_callback(NonMeaprotoFrameFn callback, void *ctx) noexcept;
     void set_rx_observer_callback(RxObserverFn callback, void *ctx) noexcept;
-    void set_tx_result_callback(TxResultFn callback, void *ctx) noexcept;
 
     esp_err_t peer_add(const u8 *peer_mac);
     esp_err_t peer_remove(const u8 *peer_mac);
@@ -78,9 +74,6 @@ class EspNowTransport
 
     /** 该速率档位是否在 ESP-NOW 可配置范围内 */
     static bool rate_supported(u8 rate) noexcept;
-
-    u32 tx_frames() const noexcept;
-    u32 tx_failures() const noexcept;
 
   private:
     EspNowTransport() = default;
@@ -102,12 +95,9 @@ class EspNowTransport
     void *m_non_meaproto_frame_ctx = nullptr;
     RxObserverFn m_rx_observer_callback = nullptr; /**< 每帧的字节数与 RSSI */
     void *m_rx_observer_ctx = nullptr;
-    TxResultFn m_tx_result_callback = nullptr; /**< 每帧的发送结果 */
-    void *m_tx_result_ctx = nullptr;
 
     // ---- 发送 ----
     SemaphoreHandle_t m_tx_mutex = nullptr; /**< esp_now_send 串行化 */
-    u32 m_tx_frames = 0;
     u32 m_tx_failures = 0;
     volatile u32 m_next_fail_log_ms = 0; /**< 失败日志的限速时刻（发送路径与发送结果回调共用） */
 };
