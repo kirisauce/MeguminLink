@@ -12,6 +12,9 @@
 
 namespace mlink
 {
+/** 一条入向待写帧的数据上限：UART 通道单条消息减去 1B 来源标记 */
+inline constexpr usize UART_INBOUND_FRAME_MAX = 512 - 1;
+
 /**
  * 本机串口 ↔ 对侧的桥：两端共用一份实现。
  *
@@ -50,7 +53,7 @@ class UartBridge
     /**
      * 应用线编码（参数为 CDC 枚举原值）。各参数独立校验：驱动不支持的值
      * （数据位 16、Mark/Space 校验等）告警并跳过该项，其余照常应用。
-     * 调用方：Local 模式下的主机 SET_LINE_CODING，以及无线来的 UartLineCoding 帧。
+     * 调用方：Local 模式下的主机 SET_LINE_CODING，以及无线 UART 通道的线编码消息。
      */
     void configure(u32 baud, u8 data_bits, u8 stop_bits, u8 parity);
 
@@ -60,7 +63,7 @@ class UartBridge
     {
         UartSource source;
         u16 len;
-        u8 data[MAX_UART_PAYLOAD_SIZE];
+        u8 data[UART_INBOUND_FRAME_MAX];
     };
 
     /** 本机 UART → 对侧：等 m_uart_events */

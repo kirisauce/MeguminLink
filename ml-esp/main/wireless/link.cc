@@ -53,8 +53,8 @@ void WirelessLink::on_tx_result(void *ctx, const u8 *, bool ok)
 
 void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
 {
-    // 反序列化落在对象成员上：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉
-    // 任务的栈。本函数是这条路径的唯一使用者（任务上下文单线程）。
+    // 反序列化落在对象成员上：中继载荷可达 MAX_RELAYED_CONTROL_PAYLOAD，放栈上
+    // 会吃掉任务的栈。本函数是这条路径的唯一使用者（任务上下文单线程）。
     Packet packet;
     if (packet.deserialize(data, len, m_rx_storage, sizeof(m_rx_storage)) != ESP_OK)
     {
@@ -63,26 +63,11 @@ void WirelessLink::handle_frame(const u8 *src_mac, const u8 *data, usize len)
         return;
     }
 
-    // 交付回调必须只做非阻塞的事：它跑在 esp_wifi 任务里
-    switch (packet.packet_type)
-    {
-    case PacketType::DapCommand:
-    case PacketType::DapResponse:
-    case PacketType::UartFromHost:
-    case PacketType::UartFromTarget:
-    case PacketType::UartLineCoding:
-    case PacketType::RelayedUsbControl:
-        // 业务类型已改走 meaproto 通道：出现在链路层属异常，忽略
-        return;
-    default: {
-        // 配对控制帧与 Ping/Pong：经主循环驱动状态机
-        ReceivedPacket rp = {};
-        std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
-        rp.packet = packet;
-        Application::get_instance().push_received_packet(rp);
-        return;
-    }
-    }
+    // 交付回调必须只做非阻塞的事：它跑在 esp_wifi 任务里。链路层只剩配对控制帧，
+    ReceivedPacket rp = {};
+    std::memcpy(rp.src_mac, src_mac, ESP_NOW_ETH_ALEN);
+    rp.packet = packet;
+    Application::get_instance().push_received_packet(rp);
 }
 
 void WirelessLink::handle_tx_result(bool ok)

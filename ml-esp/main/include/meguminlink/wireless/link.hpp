@@ -88,6 +88,9 @@ inline constexpr usize DAP_WIRE_HEADER = 4;
 inline constexpr u8 DAP_KIND_COMMAND = 0;
 inline constexpr u8 DAP_KIND_RESPONSE = 1;
 
+/** 单条 DAP 命令/响应的裸字节上限：通道上限减去载荷头 */
+inline constexpr usize MAX_DAP_PAYLOAD_SIZE = DAP_CHANNEL_PAYLOAD - DAP_WIRE_HEADER;
+
 /** 无线 DAP 执行队列深度：S3 跟随 USB 命令队列深度，C3 只作接收端，取一半 */
 #if CONFIG_IDF_TARGET_ESP32C3
 inline constexpr u8 DAP_EXEC_QUEUE_DEPTH = 4;
@@ -420,11 +423,11 @@ class WirelessLink : private meaproto::Sink
     SemaphoreHandle_t m_tx_mutex = nullptr;
     /** 业务包序列化缓冲与互斥（多上下文都会调各条发送 helper） */
     SemaphoreHandle_t m_pack_mutex = nullptr;
-    u8 m_pack_frame[DAP_FRAME_MAX_SIZE] = {};
-    /** 接收业务包的反序列化存储：数据段可达 MAX_DAP_PAYLOAD_SIZE，放栈上会吃掉交付任务的栈 */
-    u8 m_rx_storage[MAX_DAP_PAYLOAD_SIZE] = {};
+    u8 m_pack_frame[PACKET_MAX_SIZE] = {};
+    /** 链路层业务包的反序列化存储（配对帧与中继包） */
+    u8 m_rx_storage[PACKET_MAX_SIZE] = {};
     /** CONFIG 消息的反序列化存储（协议任务独占，不与链路层接收共用） */
-    u8 m_config_storage[512] = {};
+    u8 m_config_storage[PACKET_MAX_SIZE] = {};
 
     /** 无线 DAP：执行队列与任务独立，命令执行不拖住协议任务的 ACK 与保活 */
     QueueHandle_t m_dap_queue = nullptr;

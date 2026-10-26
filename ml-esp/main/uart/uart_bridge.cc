@@ -27,8 +27,8 @@ constexpr int RX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_RX_BUFFER_SIZE;
 constexpr int TX_BUF_SIZE = CONFIG_MEGUMINLINK_UART_TX_BUFFER_SIZE;
 constexpr int QUEUE_SIZE = CONFIG_MEGUMINLINK_UART_EVENT_QUEUE_SIZE;
 
-// 单次读取缓冲：≤ 无线帧 payload 上限（MAX_UART_PAYLOAD_SIZE）
-constexpr size_t READ_CHUNK = 200;
+// 单次读取缓冲：一条 UART 消息的数据上限
+constexpr size_t READ_CHUNK = mlink::UART_INBOUND_FRAME_MAX;
 
 // 写 UART 撞上缓冲满时的让出次数上限（每次 1 tick，约 100ms）：115200 波特率
 // 下写满 256B 缓冲 ≈ 22ms，留足余量；超过即认为对端不消费，丢弃兜底。
