@@ -15,17 +15,6 @@ static constexpr char TAG[] = "mlink::arq_link";
 
 namespace
 {
-// NVS 键名上限 15 字符
-constexpr char KEY_ARQ_GENERATION[] = "arq_gen";
-constexpr char KEY_ARQ_WINDOW[] = "arq_window";
-constexpr char KEY_ARQ_MAX_RETX[] = "arq_max_retx";
-constexpr char KEY_ARQ_BREAKER[] = "arq_breaker";
-constexpr char KEY_ARQ_RTO_MIN[] = "arq_rto_min";
-constexpr char KEY_ARQ_RTO_INIT[] = "arq_rto_init";
-constexpr char KEY_ARQ_RTO_MAX[] = "arq_rto_max";
-constexpr char KEY_ARQ_DELAYED_ACK[] = "arq_delayed_ack";
-constexpr char KEY_ARQ_BREAKER_PROBE[] = "arq_probe";
-
 /**
  * 把窗口收敛到本固件编译期允许的上限（Kconfig 的 ARQ_MAX_WINDOW）。
  *
@@ -86,121 +75,6 @@ bool mlink::arq_settings_valid(const ArqSettings &settings)
     return settings.window >= 1 && settings.window <= arq::MAX_WINDOW && settings.max_retx >= 1 &&
            settings.rto_min_ms >= 1 && settings.rto_max_ms >= settings.rto_min_ms &&
            settings.initial_rto_ms >= 1 && settings.delayed_ack_ms >= 1 && settings.breaker_probe_ms >= 1;
-}
-
-ArqSettings mlink::arq_settings_load()
-{
-    ArqSettings out = arq_default_settings();
-
-    nvs_handle_t handle = 0;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
-    {
-        return out; // 无记录：用默认值
-    }
-
-    u32 u32_value = 0;
-    u16 u16_value = 0;
-    u8 u8_value = 0;
-
-    if (nvs_get_u32(handle, KEY_ARQ_GENERATION, &u32_value) == ESP_OK)
-    {
-        out.generation = u32_value;
-    }
-    if (nvs_get_u8(handle, KEY_ARQ_WINDOW, &u8_value) == ESP_OK)
-    {
-        out.window = u8_value;
-    }
-    if (nvs_get_u8(handle, KEY_ARQ_MAX_RETX, &u8_value) == ESP_OK)
-    {
-        out.max_retx = u8_value;
-    }
-    if (nvs_get_u8(handle, KEY_ARQ_BREAKER, &u8_value) == ESP_OK)
-    {
-        out.breaker_failures = u8_value;
-    }
-    if (nvs_get_u16(handle, KEY_ARQ_RTO_MIN, &u16_value) == ESP_OK)
-    {
-        out.rto_min_ms = u16_value;
-    }
-    if (nvs_get_u16(handle, KEY_ARQ_RTO_INIT, &u16_value) == ESP_OK)
-    {
-        out.initial_rto_ms = u16_value;
-    }
-    if (nvs_get_u16(handle, KEY_ARQ_RTO_MAX, &u16_value) == ESP_OK)
-    {
-        out.rto_max_ms = u16_value;
-    }
-    if (nvs_get_u16(handle, KEY_ARQ_DELAYED_ACK, &u16_value) == ESP_OK)
-    {
-        out.delayed_ack_ms = u16_value;
-    }
-    if (nvs_get_u16(handle, KEY_ARQ_BREAKER_PROBE, &u16_value) == ESP_OK)
-    {
-        out.breaker_probe_ms = u16_value;
-    }
-
-    nvs_close(handle);
-
-    if (!arq_settings_valid(out))
-    {
-        ESP_LOGW(TAG, "stored ARQ settings invalid, falling back to defaults");
-        return arq_default_settings();
-    }
-    return out;
-}
-
-esp_err_t mlink::arq_settings_store(const ArqSettings &settings)
-{
-    NvsWriteBatch batch(NVS_NAMESPACE);
-    if (!batch.ready())
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // 整份参数走同一个 commit：NVS 保证要么全生效、要么全不生效
-    esp_err_t ret = batch.set_u32(KEY_ARQ_GENERATION, settings.generation);
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u8(KEY_ARQ_WINDOW, settings.window);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u8(KEY_ARQ_MAX_RETX, settings.max_retx);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u8(KEY_ARQ_BREAKER, settings.breaker_failures);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u16(KEY_ARQ_RTO_MIN, settings.rto_min_ms);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u16(KEY_ARQ_RTO_INIT, settings.initial_rto_ms);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u16(KEY_ARQ_RTO_MAX, settings.rto_max_ms);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u16(KEY_ARQ_DELAYED_ACK, settings.delayed_ack_ms);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.set_u16(KEY_ARQ_BREAKER_PROBE, settings.breaker_probe_ms);
-    }
-    if (ret == ESP_OK)
-    {
-        ret = batch.commit();
-    }
-
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "failed to store ARQ settings: %s", esp_err_to_name(ret));
-    }
-    return ret;
 }
 
 // ---- 构造与配置 ----

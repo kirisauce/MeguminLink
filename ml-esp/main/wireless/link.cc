@@ -4,6 +4,7 @@
 #include "meguminlink/dap_executor.hpp" // dap_executor_run（无线侧执行接线）
 #include "meguminlink/dap_frame.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/time.hpp"
 #include "meguminlink/wireless/espnow_transport.hpp"
 
 #include <cstring>
@@ -25,12 +26,6 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
-/** 单调毫秒时基：FreeRTOS tick 换算 */
-u32 now_ms()
-{
-    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
-}
-
 /** 业务帧的发送路径：注入开启时包一层丢包装饰器，否则直接用 ESP-NOW */
 LinkTransport &link_transport()
 {

@@ -243,17 +243,6 @@ config MEGUMINLINK_WIRELESS_RESPONSE_TIMEOUT_MS
         and only when that budget is exhausted is the command dropped and the
         PC-side debugger left to see a command timeout and retry on its own.
 
-config MEGUMINLINK_PING_TIMEOUT_MS
-    int "Paired peer ping timeout (ms)"
-    default 500
-    range 10 5000
-    help
-        How long the device waits for the pong of a host-initiated probe
-        before reporting the peer offline. Probes are always triggered by
-        the host (WebUI polling or mlinkctl ping), never by the device on
-        its own; a missing pong only marks the link as unreachable, the
-        pairing record is kept and the next probe is judged from scratch.
-
 config MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
     bool "Enable wireless link loss simulation (test facility)"
     default n

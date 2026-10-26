@@ -1,10 +1,10 @@
 #include "meguminlink/app.hpp"
 #include "meguminlink/nvs_flash.hpp"
+#include "meguminlink/time.hpp"
 #if CONFIG_MEGUMINLINK_USB_SUPPORT
 #include "meguminlink/usb/update_mode.hpp"
 #endif
 #include "meguminlink/usb/usb_capability.hpp"
-#include "meguminlink/wireless/arq_link.hpp"
 #include "meguminlink/wireless/frame.hpp"
 #include "meguminlink/wireless/link.hpp" // WirelessDapExecutor（DapCommand 投递）
 #include "meguminlink/wireless/link_config.hpp"

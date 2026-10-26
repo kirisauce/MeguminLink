@@ -4,6 +4,7 @@
 
 #include "esp_err.h"
 #include "meguminlink/common.hpp"
+#include "meguminlink/time.hpp"
 #include "meguminlink/wireless/arq.hpp"
 
 #include "freertos/FreeRTOS.h"
@@ -15,17 +16,6 @@
 
 namespace mlink
 {
-/**
- * 单调毫秒时基：ARQ 层与链路层共用同一个时间口径（FreeRTOS tick 换算）。
- *
- * 放在这里而不是 common.hpp：那个头被纯算法核心 arq.hpp include，必须保持零
- * ESP-IDF 依赖（宿主机单测要能直接编它）。
- */
-inline u32 now_ms()
-{
-    return static_cast<u32>(xTaskGetTickCount() * portTICK_PERIOD_MS);
-}
-
 // ---- 线格式 ----
 
 /**
@@ -99,12 +89,6 @@ ArqSettings arq_default_settings();
 
 /** 参数 → 算法配置 */
 arq::Config arq_config_from(const ArqSettings &settings);
-
-/** 从 NVS 读回参数；无记录或失败时返回默认值 */
-ArqSettings arq_settings_load();
-
-/** 参数落 NVS：所有键在同一个 commit 里写入 */
-esp_err_t arq_settings_store(const ArqSettings &settings);
 
 /**
  * 无线链路的 ARQ 层：把 arq::Sender / arq::Receiver 接到实际的收发上，并管理
