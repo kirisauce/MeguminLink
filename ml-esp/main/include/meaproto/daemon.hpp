@@ -70,8 +70,11 @@ template <Transport T> class Daemon final
     bool connecting() const;
     Stats snapshot() const;
 
-    /** 构造时注入的运行参数（运行期不可改） */
+    /** 构造时注入的运行参数副本 */
     const Config &config() const;
+
+    /** 运行期改时序类参数，见 Core::apply_config */
+    bool apply_config(const Config &config);
 
   private:
     enum class Request : u8

@@ -361,6 +361,77 @@ void retransmit_after_timeout()
     check_eq(rig.core.snapshot().datagrams_retransmitted, 1);
 }
 
+void apply_config_changes_rto()
+{
+    ChannelRig rig;
+    rig.connect();
+
+    Config config = DEFAULT_CONFIG;
+    config.rto_initial_ms = 500;
+    config.rto_max_ms = 500;
+    check(rig.core.apply_config(config));
+    check_eq(rig.core.config().rto_initial_ms, 500);
+
+    const u8 payload[3] = {4, 5, 6};
+    check(rig.core.send(CH_A, payload) == SendResult::Ok);
+    rig.core.step(rig.now);
+    const std::size_t after_first = rig.link.frames.size();
+
+    // 旧默认值（100ms）下这时早该重传了；新值要等满 500ms
+    rig.now += DEFAULT_CONFIG.rto_initial_ms;
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), after_first);
+
+    rig.now += 500 - DEFAULT_CONFIG.rto_initial_ms;
+    rig.core.step(rig.now);
+    check_eq(rig.link.frames.size(), after_first + 1);
+    check_eq(rig.core.snapshot().datagrams_retransmitted, 1);
+}
+
+void apply_config_rejects_invalid()
+{
+    ChannelRig rig;
+    rig.connect();
+
+    Config config = DEFAULT_CONFIG;
+    config.rto_initial_ms = 0; // 非法：退避基数不能是 0
+    check(!rig.core.apply_config(config));
+    check_eq(rig.core.config().rto_initial_ms, DEFAULT_CONFIG.rto_initial_ms);
+
+    config = DEFAULT_CONFIG;
+    config.rto_max_ms = config.rto_initial_ms - 1; // 非法：上限低于初始值
+    check(!rig.core.apply_config(config));
+
+    config = DEFAULT_CONFIG;
+    config.keepalive_interval_ms = 0;
+    check(!rig.core.apply_config(config));
+
+    config = DEFAULT_CONFIG;
+    config.send_quota_per_tick = 0;
+    check(!rig.core.apply_config(config));
+
+    check_eq(rig.core.config().keepalive_interval_ms, DEFAULT_CONFIG.keepalive_interval_ms);
+    check_eq(rig.core.config().send_quota_per_tick, DEFAULT_CONFIG.send_quota_per_tick);
+}
+
+void apply_config_ignores_size_fields()
+{
+    ChannelRig rig;
+    rig.connect();
+
+    Config config = DEFAULT_CONFIG;
+    config.datagram_window = 1;
+    config.max_message_size = 1;
+    config.rx_queue_depth = 1;
+    config.max_reassembly_slots = 1;
+    check(rig.core.apply_config(config));
+
+    check_eq(rig.core.config().datagram_window, DEFAULT_CONFIG.datagram_window);
+    check_eq(rig.core.config().max_message_size, DEFAULT_CONFIG.max_message_size);
+    check_eq(rig.core.config().rx_queue_depth, DEFAULT_CONFIG.rx_queue_depth);
+    check_eq(rig.core.config().max_reassembly_slots, DEFAULT_CONFIG.max_reassembly_slots);
+}
+
 void ack_bits_release_slots()
 {
     ChannelRig rig;
@@ -973,6 +1044,9 @@ const test::Case TESTS[] = {
     {"window blocks until ack", window_blocks_until_ack},
     {"retransmit after timeout", retransmit_after_timeout},
     {"ack bits release window slots", ack_bits_release_slots},
+    {"apply_config changes rto", apply_config_changes_rto},
+    {"apply_config rejects invalid", apply_config_rejects_invalid},
+    {"apply_config ignores size fields", apply_config_ignores_size_fields},
     {"send quota limits frames per tick", quota_limits_frames_per_tick},
     {"priority orders channels", priority_orders_channels},
     {"unreliable channel skips window", unreliable_channel_skips_window},

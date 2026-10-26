@@ -98,8 +98,16 @@ class Core
     /** 发一个 Ping；未连接时返回 false */
     bool ping(u32 now) noexcept;
 
-    /** 构造时注入的运行参数（运行期不可改） */
+    /** 构造时注入的运行参数副本 */
     const Config &config() const noexcept;
+
+    /**
+     * 运行期改时序类参数（RTO、保活、超时、配额、延迟确认）。
+     *
+     * 尺寸类字段（窗口、接收队列、重组槽、消息上限）在构造时已按存储切分，
+     * 这里忽略；取值非法时整体不生效并返回 false。
+     */
+    bool apply_config(const Config &config) noexcept;
 
     Stats snapshot() const noexcept;
 

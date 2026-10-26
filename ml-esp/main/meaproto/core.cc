@@ -885,6 +885,26 @@ u16 Core::config_hash() const noexcept
     return m_config_hash;
 }
 
+bool Core::apply_config(const Config &config) noexcept
+{
+    // 尺寸类字段在这里没有意义：队列、窗口与重组槽的存储已经按构造时的值切好
+    if (config.rto_initial_ms == 0 || config.rto_max_ms < config.rto_initial_ms || config.connect_timeout_ms == 0 ||
+        config.keepalive_interval_ms == 0 || config.send_quota_per_tick == 0)
+    {
+        return false;
+    }
+
+    m_config.rto_initial_ms = config.rto_initial_ms;
+    m_config.rto_max_ms = config.rto_max_ms;
+    m_config.keepalive_interval_ms = config.keepalive_interval_ms;
+    m_config.connect_timeout_ms = config.connect_timeout_ms;
+    m_config.connect_retry_ms = config.connect_retry_ms;
+    m_config.connect_max_retries = config.connect_max_retries;
+    m_config.send_quota_per_tick = config.send_quota_per_tick;
+    m_config.ack_delay_ms = config.ack_delay_ms;
+    return true;
+}
+
 const Config &Core::config() const noexcept
 {
     return m_config;

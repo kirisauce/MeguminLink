@@ -171,6 +171,24 @@ template <Transport T> const Config &Daemon<T>::config() const
     return m_core.config();
 }
 
+template <Transport T> bool Daemon<T>::apply_config(const Config &config)
+{
+    if (m_task.load(std::memory_order_relaxed) == nullptr)
+    {
+        return false;
+    }
+
+    lock_core();
+    const bool applied = m_core.apply_config(config);
+    unlock_core();
+
+    if (applied)
+    {
+        wake(); // 保活与重传节拍都跟着参数走，下一拍要按新值重算
+    }
+    return applied;
+}
+
 template <Transport T> SendResult Daemon<T>::send(ChannelId channel, std::span<const u8> data)
 {
     if (m_task.load(std::memory_order_relaxed) == nullptr)
