@@ -102,10 +102,6 @@ export const PEER_OFFLINE = 2;
  * 计数在 GetStats 的 0x70-0x7C（无线段 0x20-0x2F 已排满，单开一段）。
  * 固件未编译该功能时整组不下发，界面显示「—」。
  */
-const TAG_ARQ_GENERATION = 0x54;
-const TAG_ARQ_WINDOW = 0x56;
-const TAG_ARQ_MAX_RETX = 0x57;
-const TAG_ARQ_BREAKER = 0x58;
 const TAG_ARQ_RTO_MIN = 0x59;
 const TAG_ARQ_RTO_INIT = 0x5a;
 const TAG_ARQ_RTO_MAX = 0x5b;
@@ -124,27 +120,21 @@ const TAG_ARQ_REPLAYED = 0x78;
 const TAG_ARQ_REPLAY_MISS = 0x79;
 const TAG_ARQ_SRTT_MS = 0x7a;
 const TAG_ARQ_RTO_MS = 0x7b;
-const TAG_ARQ_BREAKER_TRIPS = 0x7c;
 
-/** SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，与响应帧的 tag 无关。 */
-// 0x01 未分配（保留号位）
-const LINK_TAG_WINDOW = 0x02;
-const LINK_TAG_MAX_RETX = 0x03;
-const LINK_TAG_BREAKER = 0x04;
-const LINK_TAG_RTO_MIN = 0x05;
+/** SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，只接受运行期可改的时序类字段。 */
+// 0x01-0x05 未分配
 const LINK_TAG_RTO_INIT = 0x06;
 const LINK_TAG_RTO_MAX = 0x07;
 const LINK_TAG_DELAYED_ACK = 0x08;
 const LINK_TAG_PROBE = 0x09;
 
 /**
- * 状态字节（0x70）的位域：bit0-3 生效窗口、bit4-6 在途消息数、bit7 熔断中。
+ * 状态字节（0x70）的位域：bit0-3 生效窗口、bit4-6 在途消息数。
  * 在途数与窗口打包成一个字节，是为了省一个 TLV；窗口上限 8、在途上限 7 都装得下。
  */
 export const ARQ_STATE_WINDOW_MASK = 0x0f;
 export const ARQ_STATE_IN_FLIGHT_SHIFT = 4;
 export const ARQ_STATE_IN_FLIGHT_MASK = 0x07;
-export const ARQ_STATE_BROKEN = 0x80;
 
 /** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
 const TAG_USB_SUPPORTED = 0x60;
@@ -230,7 +220,6 @@ export type Stats = {
 	arqReplayMiss: number | null;
 	arqSrttMs: number | null;
 	arqRtoMs: number | null;
-	arqBreakerTrips: number | null;
 };
 
 /** 可靠传输那组可空字段的键（不参与速率差分，见 rate.ts 的 CounterKey）。 */
@@ -246,15 +235,10 @@ export type ArqStateKey =
 	| 'arqReplayed'
 	| 'arqReplayMiss'
 	| 'arqSrttMs'
-	| 'arqRtoMs'
-	| 'arqBreakerTrips';
+	| 'arqRtoMs';
 
 /** SetLinkConfig 的载荷：只带要改的字段，undefined = 保持设备当前值。 */
 export type LinkConfigPatch = {
-	window?: number;
-	maxRetx?: number;
-	breaker?: number;
-	rtoMinMs?: number;
 	rtoInitMs?: number;
 	rtoMaxMs?: number;
 	delayedAckMs?: number;
@@ -375,11 +359,7 @@ export type DeviceConfig = {
 	peerMac: string | null;
 	wifiRate: number | null;
 	lossPermille: number | null;
-	/** 可靠传输参数（0x54-0x5D）；固件未编译该功能时为 null。 */
-	arqGeneration: number | null;
-	arqWindow: number | null;
-	arqMaxRetx: number | null;
-	arqBreaker: number | null;
+	/** 链路时序参数（0x59-0x5D）；固件未编译该功能时为 null。 */
 	arqRtoMinMs: number | null;
 	arqRtoInitMs: number | null;
 	arqRtoMaxMs: number | null;
@@ -562,7 +542,6 @@ export function decodeStats(frame: DataView): Stats {
 	stats.arqReplayMiss = readOptional(tags.get(TAG_ARQ_REPLAY_MISS));
 	stats.arqSrttMs = readOptional(tags.get(TAG_ARQ_SRTT_MS));
 	stats.arqRtoMs = readOptional(tags.get(TAG_ARQ_RTO_MS));
-	stats.arqBreakerTrips = readOptional(tags.get(TAG_ARQ_BREAKER_TRIPS));
 	return stats;
 }
 
@@ -576,10 +555,6 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
 		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
 		lossPermille: readOptional(tags.get(TAG_CONFIG_LOSS_PERMILLE)),
-		arqGeneration: readOptional(tags.get(TAG_ARQ_GENERATION)),
-		arqWindow: readOptional(tags.get(TAG_ARQ_WINDOW)),
-		arqMaxRetx: readOptional(tags.get(TAG_ARQ_MAX_RETX)),
-		arqBreaker: readOptional(tags.get(TAG_ARQ_BREAKER)),
 		arqRtoMinMs: readOptional(tags.get(TAG_ARQ_RTO_MIN)),
 		arqRtoInitMs: readOptional(tags.get(TAG_ARQ_RTO_INIT)),
 		arqRtoMaxMs: readOptional(tags.get(TAG_ARQ_RTO_MAX)),
@@ -728,16 +703,10 @@ export async function writeLinkConfig(
 	seq: number,
 	patch: LinkConfigPatch
 ): Promise<void> {
-	const u8 = (tag: number, value: number): Uint8Array<ArrayBuffer> =>
-		encodeTlv(tag, new Uint8Array([value & 0xff]));
 	const u16 = (tag: number, value: number): Uint8Array<ArrayBuffer> =>
 		encodeTlv(tag, new Uint8Array([(value >> 8) & 0xff, value & 0xff]));
 
 	const parts: Uint8Array[] = [];
-	if (patch.window !== undefined) parts.push(u8(LINK_TAG_WINDOW, patch.window));
-	if (patch.maxRetx !== undefined) parts.push(u8(LINK_TAG_MAX_RETX, patch.maxRetx));
-	if (patch.breaker !== undefined) parts.push(u8(LINK_TAG_BREAKER, patch.breaker));
-	if (patch.rtoMinMs !== undefined) parts.push(u16(LINK_TAG_RTO_MIN, patch.rtoMinMs));
 	if (patch.rtoInitMs !== undefined) parts.push(u16(LINK_TAG_RTO_INIT, patch.rtoInitMs));
 	if (patch.rtoMaxMs !== undefined) parts.push(u16(LINK_TAG_RTO_MAX, patch.rtoMaxMs));
 	if (patch.delayedAckMs !== undefined) parts.push(u16(LINK_TAG_DELAYED_ACK, patch.delayedAckMs));

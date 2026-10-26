@@ -166,7 +166,6 @@ STATS_FIELDS = [
     (0x72, "arq_retx"),
     (0x74, "arq_failed"),
     (0x75, "arq_dup"),
-    (0x7C, "arq_breaker_trips"),
     (0x7D, "arq_tx_dropped"),
     (0x7E, "arq_rx_dropped"),
     (0x40, "uptime_ms"),
@@ -183,13 +182,10 @@ CONFIG_FIELDS = [
     (0x51, "peer_mac"),
     (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
     (TAG_CONFIG_LOSS_PERMILLE, "loss_percent"),
-    (0x54, "arq_generation"),
-    (0x56, "arq_window"),
-    (0x57, "arq_max_retx"),
-    (0x58, "arq_breaker"),
     (0x59, "arq_rto_min_ms"),
     (0x5B, "arq_rto_max_ms"),
     (0x5C, "arq_delayed_ack_ms"),
+    (0x5D, "arq_probe_ms"),
 ]
 
 # CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
@@ -441,9 +437,16 @@ TAG_ARQ_RTO_MS = 0x7B
 TAG_ARQ_TX_DROPPED = 0x7D
 TAG_ARQ_RX_DROPPED = 0x7E
 TAG_ARQ_CMD_DROPPED = 0x7F
-TAG_ARQ_GENERATION = 0x54
-TAG_ARQ_RTO_INIT_MS = 0x5A
-TAG_ARQ_PROBE_MS = 0x5D
+TAG_ARQ_RTO_INIT = 0x5A
+TAG_ARQ_RTO_MAX = 0x5B
+TAG_ARQ_DELAYED_ACK = 0x5C
+TAG_ARQ_PROBE = 0x5D
+
+# SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，只接受运行期可改的时序类字段
+LINK_TAG_RTO_INIT = 0x06
+LINK_TAG_RTO_MAX = 0x07
+LINK_TAG_DELAYED_ACK = 0x08
+LINK_TAG_PROBE = 0x09
 
 
 def render_arq_state(values):
@@ -602,21 +605,17 @@ def cmd_arq(args):
     print(
         f"window={state & 0x0F}"
         f" in_flight={(state >> 4) & 0x07}"
-        f" broken={'yes' if state & 0x80 else 'no'}"
-        f" generation={u32_of(config, TAG_ARQ_GENERATION)}"
     )
     print(
         f"rto_ms={u32_of(stats, TAG_ARQ_RTO_MS)}"
         f" srtt_ms={u32_of(stats, TAG_ARQ_SRTT_MS)}"
-        f" min={u16_of(config, 0x59)}"
-        f" init={u16_of(config, TAG_ARQ_RTO_INIT_MS)}"
-        f" max={u16_of(config, 0x5B)}"
+        f" init={u16_of(config, TAG_ARQ_RTO_INIT)}"
+        f" max={u16_of(config, TAG_ARQ_RTO_MAX)}"
     )
     print(
         f"tx={tx} retx={retx}"
         f" retx_rate={f'{retx / tx * 100:.1f}%' if tx else '—'}"
         f" failed={u32_of(stats, 0x74)}"
-        f" breaker_trips={u32_of(stats, 0x7C)}"
     )
     print(
         f"acked={u32_of(stats, TAG_ARQ_ACKED)}"
@@ -635,55 +634,47 @@ def cmd_arq(args):
 
 
 def cmd_set_link(args):
-    """下发可靠传输参数：只覆盖指定的字段，代数由设备自己 +1。"""
-    u8_items = [
-        ("window", 0x02, args.window),
-        ("max-retx", 0x03, args.max_retx),
-        ("breaker", 0x04, args.breaker),
-    ]
-    u16_items = [
-        ("rto-min", 0x05, args.rto_min),
-        ("rto-init", 0x06, args.rto_init),
-        ("rto-max", 0x07, args.rto_max),
-        ("delayed-ack", 0x08, args.delayed_ack),
-        ("probe", 0x09, args.probe),
+    """下发链路时序参数：只覆盖指定的字段。"""
+    items = [
+        ("rto-init", LINK_TAG_RTO_INIT, args.rto_init, TAG_ARQ_RTO_INIT),
+        ("rto-max", LINK_TAG_RTO_MAX, args.rto_max, TAG_ARQ_RTO_MAX),
+        ("delayed-ack", LINK_TAG_DELAYED_ACK, args.delayed_ack, TAG_ARQ_DELAYED_ACK),
+        ("probe", LINK_TAG_PROBE, args.probe, TAG_ARQ_PROBE),
     ]
 
     payload = b""
-    for name, tag, value in u8_items:
-        if value is None:
-            continue
-        if not 0 <= value <= 0xFF:
-            die(f"--{name} 超出 u8 范围：{value}")
-        payload += encode_tlv(tag, bytes([value]))
-    for name, tag, value in u16_items:
+    expected = {}
+    for name, tag, value, read_tag in items:
         if value is None:
             continue
         if not 1 <= value <= 0xFFFF:
             die(f"--{name} 超出 u16 范围：{value}")
         payload += encode_tlv(tag, value.to_bytes(2, "big"))
+        expected[read_tag] = value
 
     if not payload:
-        die("至少要指定一个参数（--window / --rto-min / --max-retx / …）")
+        die("至少要指定一个参数（--rto-init / --rto-max / --delayed-ack / --probe）")
 
     dev = find_device(args.serial)
-    generation = u32_of(decode(fetch(dev, CMD_GET_CONFIG)), TAG_ARQ_GENERATION)
 
     try:
         dev.ctrl_transfer(0x40, VENDOR_CODE, CMD_SET_LINK_CONFIG, 0, payload, TIMEOUT_MS)
     except usb.core.USBError as err:
         die(f"设备拒绝了该载荷（参数越界或 TLV 格式非法）：{err}")
 
-    # 参数由主循环应用并落盘，代数随之 +1。OUT 请求没有响应阶段，只能盯着代数等它
-    # 变——不等的话读到的还是旧值（应用还没跑到）。
+    # 应用在设备主循环里做，OUT 请求没有响应阶段：盯住读回值等它变成下发的那份
     deadline = time.time() + 2.0
     config = decode(fetch(dev, CMD_GET_CONFIG))
-    while u32_of(config, TAG_ARQ_GENERATION) == generation and time.time() < deadline:
+
+    def settled(values):
+        return all(u32_of(values, tag) == value for tag, value in expected.items())
+
+    while not settled(config) and time.time() < deadline:
         time.sleep(0.05)
         config = decode(fetch(dev, CMD_GET_CONFIG))
 
-    if u32_of(config, TAG_ARQ_GENERATION) == generation:
-        die("设备没有应用这份参数（代数未变化），检查设备日志")
+    if not settled(config):
+        die("设备没有应用这份参数（读回值与下发值不一致），检查设备日志")
 
     print(render_config(config))
     print(
@@ -1081,15 +1072,11 @@ def build_parser():
     set_mode.add_argument("mode", choices=sorted(MODE_ARG), help="local 或 wireless")
     set_mode.set_defaults(handler=cmd_set_mode)
 
-    set_link = subparsers.add_parser("set-link", help="设置可靠传输参数（随即生效并同步给对端）")
-    set_link.add_argument("--window", type=int, metavar="N", help="发送窗口（本固件上限 8，默认 4）")
-    set_link.add_argument("--rto-min", type=int, metavar="MS", help="RTO 下限（毫秒）")
+    set_link = subparsers.add_parser("set-link", help="设置链路时序参数（随即生效并同步给对端）")
     set_link.add_argument("--rto-init", type=int, metavar="MS", help="还没有 RTT 样本时的初始 RTO（毫秒）")
     set_link.add_argument("--rto-max", type=int, metavar="MS", help="RTO 上限（毫秒，退避到此为止）")
-    set_link.add_argument("--max-retx", type=int, metavar="N", help="单条消息重传次数上限")
-    set_link.add_argument("--breaker", type=int, metavar="N", help="连续多少条重传耗尽后熔断（0 = 不熔断）")
     set_link.add_argument("--delayed-ack", type=int, metavar="MS", help="没有数据可捎带时补纯 ACK 的延迟")
-    set_link.add_argument("--probe", type=int, metavar="MS", help="熔断期间放行试探的间隔")
+    set_link.add_argument("--probe", type=int, metavar="MS", help="空闲时保活帧的间隔")
     set_link.set_defaults(handler=cmd_set_link)
 
     subparsers.add_parser("arq", help="可靠传输聚焦视图：状态、RTO 估计与全部计数").set_defaults(
