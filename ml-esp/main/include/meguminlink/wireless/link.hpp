@@ -7,6 +7,7 @@
 #include "esp_wifi.h" // IWYU pragma: export
 #include "meaproto/config.hpp"
 #include "meaproto/daemon.hpp"
+#include "meaproto/lossy_transport.hpp"
 #include "meguminlink/common.hpp" // IWYU pragma: keep
 #include "meguminlink/dap_executor.hpp"
 #include "meguminlink/dap_frame.hpp"
@@ -144,6 +145,13 @@ inline constexpr meaproto::Config LINK_CONFIG = [] {
     config.max_reassembly_slots = 2;
     return config;
 }();
+#endif
+
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+/** 业务帧的发送路径：注入装饰器包住 ESP-NOW */
+using LinkTransport = meaproto::LossyTransport<EspNowTransport>;
+#else
+using LinkTransport = EspNowTransport;
 #endif
 
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
@@ -405,19 +413,6 @@ class WirelessLink : private meaproto::Sink
     /** 设置单播 peer 的 ESP-NOW 发送速率（广播地址跳过） */
     esp_err_t set_peer_rate(const u8 *peer_mac);
 
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    /** xorshift32 取下一个随机数（状态在发送锁内推进） */
-    u32 next_random();
-
-    /**
-     * 本次发送是否按注入丢包率丢弃。
-     *
-     * 判定、计数与 PRNG 推进都在调用方持有发送锁期间完成，因此不需要额外的
-     * 临界区（发送会被 UART 桥任务、USB 任务与主循环调用）。
-     */
-    bool loss_should_drop();
-#endif
-
     bool m_initialized = false;
     /** 发送互斥：ESP-NOW 的发送缓冲与驱动调用串行化 */
     SemaphoreHandle_t m_tx_mutex = nullptr;
@@ -522,17 +517,6 @@ class WirelessLink : private meaproto::Sink
     volatile u8 m_send_fail_streak = 0;
     volatile u32 m_send_fail_log_ms = 0;
 
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    /**
-     * 注入丢包率（千分比）。只由主循环写（set_loss_permille），读取方是
-     * arq_send_raw 的判定与配置通道 GetConfig（EP0 上下文）——单字节读写，
-     * 与 m_rate 同一口径。
-     */
-    volatile u8 m_loss_permille = DEFAULT_LOSS_PERMILLE;
-    /** PRNG 状态：init() 与改档位时用 esp_random 播种，只在发送锁内推进 */
-    u32 m_loss_rng = 1;
-#endif
-
     // meaproto::Sink
     void on_message(meaproto::ChannelId channel, std::span<const u8> data) override;
     void on_connected() override;
@@ -544,7 +528,7 @@ class WirelessLink : private meaproto::Sink
     /** 可靠传输参数的本层副本：供配置通道读写与回显 */
     ArqSettings m_settings{};
 
-    meaproto::Daemon<EspNowTransport> m_daemon;
+    meaproto::Daemon<LinkTransport> m_daemon;
 };
 } // namespace mlink
 

@@ -25,6 +25,18 @@ static constexpr char TAG[] = "mlink::wireless_link";
 
 namespace
 {
+/** 业务帧的发送路径：注入开启时包一层丢包装饰器，否则直接用 ESP-NOW */
+LinkTransport &link_transport()
+{
+#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
+    static meaproto::LossyTransport<EspNowTransport> transport(
+        EspNowTransport::instance(),
+        [](void *, bool dropped) { Application::get_instance().config_channel().add_loss_frame(dropped); }, nullptr);
+    return transport;
+#else
+    return EspNowTransport::instance();
+#endif
+}
 } // namespace
 
 bool mlink::wifi_rate_supported(u8 rate)
@@ -97,7 +109,7 @@ void WirelessLink::handle_tx_result(bool ok)
     }
 }
 
-WirelessLink::WirelessLink() : m_daemon(EspNowTransport::instance(), *this, channels(), LINK_CONFIG)
+WirelessLink::WirelessLink() : m_daemon(link_transport(), *this, channels(), LINK_CONFIG)
 {
 }
 
@@ -538,12 +550,6 @@ esp_err_t WirelessLink::init()
         return ESP_ERR_NO_MEM;
     }
 
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    // 注入丢帧的随机序列：两端各自用 esp_random 播种，不共享序列——固定种子会
-    // 让两台设备在相同帧号上同时丢帧，制造出现实里不存在的人为相关
-    m_loss_rng = esp_random() | 1u;
-#endif
-
     esp_err_t ret;
     EspNowTransport &transport = EspNowTransport::instance();
     ret = transport.init();
@@ -627,7 +633,7 @@ esp_err_t WirelessLink::set_wifi_rate(u8 rate)
 #if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
 u8 WirelessLink::loss_permille() const
 {
-    return m_loss_permille;
+    return link_transport().permille();
 }
 
 esp_err_t WirelessLink::set_loss_permille(u8 permille)
@@ -638,39 +644,12 @@ esp_err_t WirelessLink::set_loss_permille(u8 permille)
         return ESP_ERR_INVALID_ARG;
     }
 
-    m_loss_permille = permille;
     // 换档即重播种：同一档位反复实验不会重放同一串丢帧
-    m_loss_rng = esp_random() | 1u; // xorshift 的 0 是不动点
+    link_transport().set_permille(permille, esp_random() | 1u);
 
     // 无 USB 侧（接收端）没有宿主可以读回配置，它有没有收到中继只能靠这条日志
     ESP_LOGI(TAG, "Link loss injection: %u permille (%u.%u%%)", permille, permille / 10, permille % 10);
     return ESP_OK;
-}
-
-u32 WirelessLink::next_random()
-{
-    u32 x = m_loss_rng;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    m_loss_rng = x;
-    return x;
-}
-
-bool WirelessLink::loss_should_drop()
-{
-    // 只做概率判定，被丢的帧由调用方记账
-    auto &config = Application::get_instance().config_channel();
-    const u8 permille = m_loss_permille;
-    if (permille == 0)
-    {
-        config.add_loss_frame(false);
-        return false;
-    }
-
-    const bool drop = (next_random() % 1000u) < permille;
-    config.add_loss_frame(drop);
-    return drop;
 }
 #endif
 
@@ -747,17 +726,6 @@ esp_err_t WirelessLink::send_frame(const u8 *dest_mac, const u8 *data, size_t le
     {
         return ESP_ERR_TIMEOUT;
     }
-
-#if CONFIG_MEGUMINLINK_WIRELESS_LOSS_SIM_ENABLE
-    // 注入丢帧：被丢的帧照旧计入 wl_tx_bytes，真实丢包时底层发送也返回成功、
-    // 这个计数照样加，两种丢帧在统计上不可区分。
-    if (loss_should_drop())
-    {
-        xSemaphoreGive(m_tx_mutex);
-        Application::get_instance().config_channel().add_wireless_tx(static_cast<u16>(len));
-        return ESP_OK;
-    }
-#endif
 
     const esp_err_t send_ret = EspNowTransport::instance().send_to(dest_mac, std::span<const u8>{data, len});
     xSemaphoreGive(m_tx_mutex);
