@@ -102,24 +102,24 @@ export const PEER_OFFLINE = 2;
  * 计数在 GetStats 的 0x70-0x7C（无线段 0x20-0x2F 已排满，单开一段）。
  * 固件未编译该功能时整组不下发，界面显示「—」。
  */
-const TAG_ARQ_RTO_MIN = 0x59;
-const TAG_ARQ_RTO_INIT = 0x5a;
-const TAG_ARQ_RTO_MAX = 0x5b;
-const TAG_ARQ_DELAYED_ACK = 0x5c;
-const TAG_ARQ_PROBE = 0x5d;
+const TAG_MEAPROTO_RTO_MIN = 0x59;
+const TAG_MEAPROTO_RTO_INIT = 0x5a;
+const TAG_MEAPROTO_RTO_MAX = 0x5b;
+const TAG_MEAPROTO_DELAYED_ACK = 0x5c;
+const TAG_MEAPROTO_PROBE = 0x5d;
 
-const TAG_ARQ_STATE = 0x70;
-const TAG_ARQ_TX = 0x71;
-const TAG_ARQ_RETX = 0x72;
-const TAG_ARQ_ACKED = 0x73;
-const TAG_ARQ_FAILED = 0x74;
-const TAG_ARQ_DUP = 0x75;
-const TAG_ARQ_OOO = 0x76;
-const TAG_ARQ_SKIPPED = 0x77;
-const TAG_ARQ_REPLAYED = 0x78;
-const TAG_ARQ_REPLAY_MISS = 0x79;
-const TAG_ARQ_SRTT_MS = 0x7a;
-const TAG_ARQ_RTO_MS = 0x7b;
+const TAG_MEAPROTO_STATE = 0x70;
+const TAG_MEAPROTO_TX = 0x71;
+const TAG_MEAPROTO_RETX = 0x72;
+const TAG_MEAPROTO_ACKED = 0x73;
+const TAG_MEAPROTO_FAILED = 0x74;
+const TAG_MEAPROTO_DUP = 0x75;
+const TAG_MEAPROTO_OOO = 0x76;
+const TAG_MEAPROTO_SKIPPED = 0x77;
+const TAG_MEAPROTO_REPLAYED = 0x78;
+const TAG_MEAPROTO_REPLAY_MISS = 0x79;
+const TAG_MEAPROTO_SRTT_MS = 0x7a;
+const TAG_MEAPROTO_RTO_MS = 0x7b;
 
 /** SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，只接受运行期可改的时序类字段。 */
 // 0x01-0x05 未分配
@@ -132,9 +132,9 @@ const LINK_TAG_PROBE = 0x09;
  * 状态字节（0x70）的位域：bit0-3 生效窗口、bit4-6 在途消息数。
  * 在途数与窗口打包成一个字节，是为了省一个 TLV；窗口上限 8、在途上限 7 都装得下。
  */
-export const ARQ_STATE_WINDOW_MASK = 0x0f;
-export const ARQ_STATE_IN_FLIGHT_SHIFT = 4;
-export const ARQ_STATE_IN_FLIGHT_MASK = 0x07;
+export const MEAPROTO_STATE_WINDOW_MASK = 0x0f;
+export const MEAPROTO_STATE_IN_FLIGHT_SHIFT = 4;
+export const MEAPROTO_STATE_IN_FLIGHT_MASK = 0x07;
 
 /** GetUsbConfig / SetUsbConfig 的 tag（0x60-0x6F USB 能力）。 */
 const TAG_USB_SUPPORTED = 0x60;
@@ -204,38 +204,38 @@ export type Stats = {
 	lossFrames: number | null;
 	lossDropped: number | null;
 	/**
-	 * 可靠传输的运行状态与计数（同一次快照）。arqState 是打包字节，用上面那组位掩码
-	 * 拆；arqRetx / arqTx 之比即重传率，是"链路现在有多差"最直观的读数。
+	 * 可靠传输的运行状态与计数（同一次快照）。meaprotoState 是打包字节，用上面那组位掩码
+	 * 拆；meaprotoRetx / meaprotoTx 之比即重传率，是"链路现在有多差"最直观的读数。
 	 * 固件未编译该功能时为 null。
 	 */
-	arqState: number | null;
-	arqTx: number | null;
-	arqRetx: number | null;
-	arqAcked: number | null;
-	arqFailed: number | null;
-	arqDup: number | null;
-	arqOoo: number | null;
-	arqSkipped: number | null;
-	arqReplayed: number | null;
-	arqReplayMiss: number | null;
-	arqSrttMs: number | null;
-	arqRtoMs: number | null;
+	meaprotoState: number | null;
+	meaprotoTx: number | null;
+	meaprotoRetx: number | null;
+	meaprotoAcked: number | null;
+	meaprotoFailed: number | null;
+	meaprotoDup: number | null;
+	meaprotoOoo: number | null;
+	meaprotoSkipped: number | null;
+	meaprotoReplayed: number | null;
+	meaprotoReplayMiss: number | null;
+	meaprotoSrttMs: number | null;
+	meaprotoRtoMs: number | null;
 };
 
 /** 可靠传输那组可空字段的键（不参与速率差分，见 rate.ts 的 CounterKey）。 */
-export type ArqStateKey =
-	| 'arqState'
-	| 'arqTx'
-	| 'arqRetx'
-	| 'arqAcked'
-	| 'arqFailed'
-	| 'arqDup'
-	| 'arqOoo'
-	| 'arqSkipped'
-	| 'arqReplayed'
-	| 'arqReplayMiss'
-	| 'arqSrttMs'
-	| 'arqRtoMs';
+export type MeaprotoStateKey =
+	| 'meaprotoState'
+	| 'meaprotoTx'
+	| 'meaprotoRetx'
+	| 'meaprotoAcked'
+	| 'meaprotoFailed'
+	| 'meaprotoDup'
+	| 'meaprotoOoo'
+	| 'meaprotoSkipped'
+	| 'meaprotoReplayed'
+	| 'meaprotoReplayMiss'
+	| 'meaprotoSrttMs'
+	| 'meaprotoRtoMs';
 
 /** SetLinkConfig 的载荷：只带要改的字段，undefined = 保持设备当前值。 */
 export type LinkConfigPatch = {
@@ -246,9 +246,9 @@ export type LinkConfigPatch = {
 };
 
 /** 重传率（百分比）；一次都没发出去过时返回 null（显示「—」而不是 0%）。 */
-export function arqRetxRate(stats: Stats): number | null {
-	if (stats.arqTx === null || stats.arqTx === 0) return null;
-	return ((stats.arqRetx ?? 0) / stats.arqTx) * 100;
+export function meaprotoRetxRate(stats: Stats): number | null {
+	if (stats.meaprotoTx === null || stats.meaprotoTx === 0) return null;
+	return ((stats.meaprotoRetx ?? 0) / stats.meaprotoTx) * 100;
 }
 
 export type StatField = {
@@ -360,10 +360,10 @@ export type DeviceConfig = {
 	wifiRate: number | null;
 	lossPermille: number | null;
 	/** 链路时序参数（0x59-0x5D）；固件未编译该功能时为 null。 */
-	arqRtoMinMs: number | null;
-	arqRtoInitMs: number | null;
-	arqRtoMaxMs: number | null;
-	arqDelayedAckMs: number | null;
+	meaprotoRtoMinMs: number | null;
+	meaprotoRtoInitMs: number | null;
+	meaprotoRtoMaxMs: number | null;
+	meaprotoDelayedAckMs: number | null;
 };
 
 /**
@@ -530,18 +530,18 @@ export function decodeStats(frame: DataView): Stats {
 	stats.pingRttUs = readOptional(tags.get(TAG_PING_RTT));
 	stats.lossFrames = readOptional(tags.get(TAG_LOSS_FRAMES));
 	stats.lossDropped = readOptional(tags.get(TAG_LOSS_DROPPED));
-	stats.arqState = readOptional(tags.get(TAG_ARQ_STATE));
-	stats.arqTx = readOptional(tags.get(TAG_ARQ_TX));
-	stats.arqRetx = readOptional(tags.get(TAG_ARQ_RETX));
-	stats.arqAcked = readOptional(tags.get(TAG_ARQ_ACKED));
-	stats.arqFailed = readOptional(tags.get(TAG_ARQ_FAILED));
-	stats.arqDup = readOptional(tags.get(TAG_ARQ_DUP));
-	stats.arqOoo = readOptional(tags.get(TAG_ARQ_OOO));
-	stats.arqSkipped = readOptional(tags.get(TAG_ARQ_SKIPPED));
-	stats.arqReplayed = readOptional(tags.get(TAG_ARQ_REPLAYED));
-	stats.arqReplayMiss = readOptional(tags.get(TAG_ARQ_REPLAY_MISS));
-	stats.arqSrttMs = readOptional(tags.get(TAG_ARQ_SRTT_MS));
-	stats.arqRtoMs = readOptional(tags.get(TAG_ARQ_RTO_MS));
+	stats.meaprotoState = readOptional(tags.get(TAG_MEAPROTO_STATE));
+	stats.meaprotoTx = readOptional(tags.get(TAG_MEAPROTO_TX));
+	stats.meaprotoRetx = readOptional(tags.get(TAG_MEAPROTO_RETX));
+	stats.meaprotoAcked = readOptional(tags.get(TAG_MEAPROTO_ACKED));
+	stats.meaprotoFailed = readOptional(tags.get(TAG_MEAPROTO_FAILED));
+	stats.meaprotoDup = readOptional(tags.get(TAG_MEAPROTO_DUP));
+	stats.meaprotoOoo = readOptional(tags.get(TAG_MEAPROTO_OOO));
+	stats.meaprotoSkipped = readOptional(tags.get(TAG_MEAPROTO_SKIPPED));
+	stats.meaprotoReplayed = readOptional(tags.get(TAG_MEAPROTO_REPLAYED));
+	stats.meaprotoReplayMiss = readOptional(tags.get(TAG_MEAPROTO_REPLAY_MISS));
+	stats.meaprotoSrttMs = readOptional(tags.get(TAG_MEAPROTO_SRTT_MS));
+	stats.meaprotoRtoMs = readOptional(tags.get(TAG_MEAPROTO_RTO_MS));
 	return stats;
 }
 
@@ -555,10 +555,10 @@ export function decodeConfig(frame: DataView): DeviceConfig {
 		peerMac: readMac(tags.get(TAG_CONFIG_PEER_MAC)),
 		wifiRate: readOptional(tags.get(TAG_CONFIG_WIFI_RATE)),
 		lossPermille: readOptional(tags.get(TAG_CONFIG_LOSS_PERMILLE)),
-		arqRtoMinMs: readOptional(tags.get(TAG_ARQ_RTO_MIN)),
-		arqRtoInitMs: readOptional(tags.get(TAG_ARQ_RTO_INIT)),
-		arqRtoMaxMs: readOptional(tags.get(TAG_ARQ_RTO_MAX)),
-		arqDelayedAckMs: readOptional(tags.get(TAG_ARQ_DELAYED_ACK)),
+		meaprotoRtoMinMs: readOptional(tags.get(TAG_MEAPROTO_RTO_MIN)),
+		meaprotoRtoInitMs: readOptional(tags.get(TAG_MEAPROTO_RTO_INIT)),
+		meaprotoRtoMaxMs: readOptional(tags.get(TAG_MEAPROTO_RTO_MAX)),
+		meaprotoDelayedAckMs: readOptional(tags.get(TAG_MEAPROTO_DELAYED_ACK)),
 	};
 }
 

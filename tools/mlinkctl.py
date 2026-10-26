@@ -162,12 +162,12 @@ STATS_FIELDS = [
     (0x33, "uart_wl_tx_bytes"),
     (0x26, "loss_frames"),
     (0x27, "loss_dropped"),
-    (0x71, "arq_tx"),
-    (0x72, "arq_retx"),
-    (0x74, "arq_failed"),
-    (0x75, "arq_dup"),
-    (0x7D, "arq_tx_dropped"),
-    (0x7E, "arq_rx_dropped"),
+    (0x71, "meaproto_tx"),
+    (0x72, "meaproto_retx"),
+    (0x74, "meaproto_failed"),
+    (0x75, "meaproto_dup"),
+    (0x7D, "meaproto_tx_dropped"),
+    (0x7E, "meaproto_rx_dropped"),
     (0x40, "uptime_ms"),
 ]
 
@@ -182,10 +182,10 @@ CONFIG_FIELDS = [
     (0x51, "peer_mac"),
     (TAG_CONFIG_WIFI_RATE, "wifi_rate"),
     (TAG_CONFIG_LOSS_PERMILLE, "loss_percent"),
-    (0x59, "arq_rto_min_ms"),
-    (0x5B, "arq_rto_max_ms"),
-    (0x5C, "arq_delayed_ack_ms"),
-    (0x5D, "arq_probe_ms"),
+    (0x59, "meaproto_rto_min_ms"),
+    (0x5B, "meaproto_rto_max_ms"),
+    (0x5C, "meaproto_delayed_ack_ms"),
+    (0x5D, "meaproto_probe_ms"),
 ]
 
 # CDC ACM 串口状态（GetStats 的 0x34-0x38，与固件 config_channel.cc 一致）：
@@ -388,7 +388,7 @@ def render_stats(values):
         parts.append(f"{name}={value}")
     parts.extend(render_uart_state(values))
     parts.extend(render_peer_state(values))
-    parts.extend(render_arq_state(values))
+    parts.extend(render_meaproto_state(values))
     return " ".join(parts)
 
 
@@ -428,19 +428,19 @@ def render_peer_state(values):
 
 
 # 可靠传输（GetStats 的 0x70-0x7F、GetConfig 的 0x54-0x5D，与固件 config_channel.cc 一致）
-TAG_ARQ_STATE = 0x70
-TAG_ARQ_ACKED = 0x73
-TAG_ARQ_REPLAYED = 0x78
-TAG_ARQ_REPLAY_MISS = 0x79
-TAG_ARQ_SRTT_MS = 0x7A
-TAG_ARQ_RTO_MS = 0x7B
-TAG_ARQ_TX_DROPPED = 0x7D
-TAG_ARQ_RX_DROPPED = 0x7E
-TAG_ARQ_CMD_DROPPED = 0x7F
-TAG_ARQ_RTO_INIT = 0x5A
-TAG_ARQ_RTO_MAX = 0x5B
-TAG_ARQ_DELAYED_ACK = 0x5C
-TAG_ARQ_PROBE = 0x5D
+TAG_MEAPROTO_STATE = 0x70
+TAG_MEAPROTO_ACKED = 0x73
+TAG_MEAPROTO_REPLAYED = 0x78
+TAG_MEAPROTO_REPLAY_MISS = 0x79
+TAG_MEAPROTO_SRTT_MS = 0x7A
+TAG_MEAPROTO_RTO_MS = 0x7B
+TAG_MEAPROTO_TX_DROPPED = 0x7D
+TAG_MEAPROTO_RX_DROPPED = 0x7E
+TAG_MEAPROTO_CMD_DROPPED = 0x7F
+TAG_MEAPROTO_RTO_INIT = 0x5A
+TAG_MEAPROTO_RTO_MAX = 0x5B
+TAG_MEAPROTO_DELAYED_ACK = 0x5C
+TAG_MEAPROTO_PROBE = 0x5D
 
 # SetLinkConfig 的 OUT 载荷自成一套 TLV 空间，只接受运行期可改的时序类字段
 LINK_TAG_RTO_INIT = 0x06
@@ -449,32 +449,31 @@ LINK_TAG_DELAYED_ACK = 0x08
 LINK_TAG_PROBE = 0x09
 
 
-def render_arq_state(values):
-    """可靠传输状态：窗口/熔断位在 0x70 里打包，重传率由 tx 与 retx 现算（老固件整组跳过）。"""
-    if TAG_ARQ_STATE not in values:
+def render_meaproto_state(values):
+    """可靠传输状态：窗口与在途帧数在 0x70 里打包，重传率由 tx 与 retx 现算（老固件整组跳过）。"""
+    if TAG_MEAPROTO_STATE not in values:
         return []
 
-    state = u8_of(values, TAG_ARQ_STATE)
+    state = u8_of(values, TAG_MEAPROTO_STATE)
     tx = u32_of(values, 0x71)
     retx = u32_of(values, 0x72)
     rate = f"{retx / tx * 100:.1f}%" if tx else "—"
     parts = [
-        f"arq_window={state & 0x0F}",
-        f"arq_in_flight={(state >> 4) & 0x07}",
-        f"arq_broken={'yes' if state & 0x80 else 'no'}",
-        f"arq_srtt_ms={u32_of(values, TAG_ARQ_SRTT_MS)}",
-        f"arq_rto_ms={u32_of(values, TAG_ARQ_RTO_MS)}",
-        f"arq_retx_rate={rate}",
-        f"arq_replayed={u32_of(values, TAG_ARQ_REPLAYED)}",
-        f"arq_replay_miss={u32_of(values, TAG_ARQ_REPLAY_MISS)}",
+        f"meaproto_window={state & 0x0F}",
+        f"meaproto_in_flight={(state >> 4) & 0x07}",
+        f"meaproto_srtt_ms={u32_of(values, TAG_MEAPROTO_SRTT_MS)}",
+        f"meaproto_rto_ms={u32_of(values, TAG_MEAPROTO_RTO_MS)}",
+        f"meaproto_retx_rate={rate}",
+        f"meaproto_replayed={u32_of(values, TAG_MEAPROTO_REPLAYED)}",
+        f"meaproto_replay_miss={u32_of(values, TAG_MEAPROTO_REPLAY_MISS)}",
     ]
     # 丢弃类计数：老固件不上报整组跳过；正常链路上这三个数应恒为 0
-    if TAG_ARQ_TX_DROPPED in values:
+    if TAG_MEAPROTO_TX_DROPPED in values:
         parts.extend(
             (
-                f"arq_tx_dropped={u32_of(values, TAG_ARQ_TX_DROPPED)}",
-                f"arq_rx_dropped={u32_of(values, TAG_ARQ_RX_DROPPED)}",
-                f"arq_cmd_dropped={u32_of(values, TAG_ARQ_CMD_DROPPED)}",
+                f"meaproto_tx_dropped={u32_of(values, TAG_MEAPROTO_TX_DROPPED)}",
+                f"meaproto_rx_dropped={u32_of(values, TAG_MEAPROTO_RX_DROPPED)}",
+                f"meaproto_cmd_dropped={u32_of(values, TAG_MEAPROTO_CMD_DROPPED)}",
             )
         )
     return parts
@@ -505,7 +504,7 @@ def render_config(values):
             # 设备端按千分比存放，界面上统一按百分比呈现（0.1% 步进）
             code = int.from_bytes(raw, "big") if raw else None
             value = "?" if code is None else f"{code / 10:.1f}%"
-        elif name.startswith("arq_"):
+        elif name.startswith("meaproto_"):
             # 可靠传输参数都是整数
             code = int.from_bytes(raw, "big") if raw else None
             value = "?" if code is None else code
@@ -590,16 +589,16 @@ def cmd_read_usb(args):
     print(render_usb(decode(fetch(find_device(args.serial), CMD_GET_USB_CONFIG))))
 
 
-def cmd_arq(args):
+def cmd_meaproto(args):
     """可靠传输的聚焦视图：状态、RTO 估计与全部计数各一行，便于盯链路质量。"""
     dev = find_device(args.serial)
     stats = decode(fetch(dev, CMD_GET_STATS))
     config = decode(fetch(dev, CMD_GET_CONFIG))
 
-    if TAG_ARQ_STATE not in stats:
+    if TAG_MEAPROTO_STATE not in stats:
         die("固件不支持可靠传输（GetStats 里没有 0x70），或该功能未编译")
 
-    state = u8_of(stats, TAG_ARQ_STATE)
+    state = u8_of(stats, TAG_MEAPROTO_STATE)
     tx = u32_of(stats, 0x71)
     retx = u32_of(stats, 0x72)
     print(
@@ -607,10 +606,10 @@ def cmd_arq(args):
         f" in_flight={(state >> 4) & 0x07}"
     )
     print(
-        f"rto_ms={u32_of(stats, TAG_ARQ_RTO_MS)}"
-        f" srtt_ms={u32_of(stats, TAG_ARQ_SRTT_MS)}"
-        f" init={u16_of(config, TAG_ARQ_RTO_INIT)}"
-        f" max={u16_of(config, TAG_ARQ_RTO_MAX)}"
+        f"rto_ms={u32_of(stats, TAG_MEAPROTO_RTO_MS)}"
+        f" srtt_ms={u32_of(stats, TAG_MEAPROTO_SRTT_MS)}"
+        f" init={u16_of(config, TAG_MEAPROTO_RTO_INIT)}"
+        f" max={u16_of(config, TAG_MEAPROTO_RTO_MAX)}"
     )
     print(
         f"tx={tx} retx={retx}"
@@ -618,28 +617,28 @@ def cmd_arq(args):
         f" failed={u32_of(stats, 0x74)}"
     )
     print(
-        f"acked={u32_of(stats, TAG_ARQ_ACKED)}"
+        f"acked={u32_of(stats, TAG_MEAPROTO_ACKED)}"
         f" dup={u32_of(stats, 0x75)}"
         f" ooo={u32_of(stats, 0x76)}"
         f" skipped={u32_of(stats, 0x77)}"
-        f" replayed={u32_of(stats, TAG_ARQ_REPLAYED)}"
-        f" replay_miss={u32_of(stats, TAG_ARQ_REPLAY_MISS)}"
+        f" replayed={u32_of(stats, TAG_MEAPROTO_REPLAYED)}"
+        f" replay_miss={u32_of(stats, TAG_MEAPROTO_REPLAY_MISS)}"
     )
-    if TAG_ARQ_TX_DROPPED in stats:
+    if TAG_MEAPROTO_TX_DROPPED in stats:
         print(
-            f"tx_dropped={u32_of(stats, TAG_ARQ_TX_DROPPED)}"
-            f" rx_dropped={u32_of(stats, TAG_ARQ_RX_DROPPED)}"
-            f" cmd_dropped={u32_of(stats, TAG_ARQ_CMD_DROPPED)}"
+            f"tx_dropped={u32_of(stats, TAG_MEAPROTO_TX_DROPPED)}"
+            f" rx_dropped={u32_of(stats, TAG_MEAPROTO_RX_DROPPED)}"
+            f" cmd_dropped={u32_of(stats, TAG_MEAPROTO_CMD_DROPPED)}"
         )
 
 
 def cmd_set_link(args):
     """下发链路时序参数：只覆盖指定的字段。"""
     items = [
-        ("rto-init", LINK_TAG_RTO_INIT, args.rto_init, TAG_ARQ_RTO_INIT),
-        ("rto-max", LINK_TAG_RTO_MAX, args.rto_max, TAG_ARQ_RTO_MAX),
-        ("delayed-ack", LINK_TAG_DELAYED_ACK, args.delayed_ack, TAG_ARQ_DELAYED_ACK),
-        ("probe", LINK_TAG_PROBE, args.probe, TAG_ARQ_PROBE),
+        ("rto-init", LINK_TAG_RTO_INIT, args.rto_init, TAG_MEAPROTO_RTO_INIT),
+        ("rto-max", LINK_TAG_RTO_MAX, args.rto_max, TAG_MEAPROTO_RTO_MAX),
+        ("delayed-ack", LINK_TAG_DELAYED_ACK, args.delayed_ack, TAG_MEAPROTO_DELAYED_ACK),
+        ("probe", LINK_TAG_PROBE, args.probe, TAG_MEAPROTO_PROBE),
     ]
 
     payload = b""
@@ -1079,8 +1078,8 @@ def build_parser():
     set_link.add_argument("--probe", type=int, metavar="MS", help="空闲时保活帧的间隔")
     set_link.set_defaults(handler=cmd_set_link)
 
-    subparsers.add_parser("arq", help="可靠传输聚焦视图：状态、RTO 估计与全部计数").set_defaults(
-        handler=cmd_arq
+    subparsers.add_parser("meaproto", help="可靠传输聚焦视图：状态、RTO 估计与全部计数").set_defaults(
+        handler=cmd_meaproto
     )
 
     set_rate = subparsers.add_parser("set-rate", help="设置 ESP-NOW 发送速率档位（两端同时应用）")
@@ -1100,7 +1099,7 @@ def build_parser():
     set_uart.add_argument(
         "state",
         choices=("on", "off"),
-        help="on = 可靠传输（丢帧重传，占一个 ARQ 窗口）；off = 尽力而为（超速即丢）",
+        help="on = 可靠传输（丢帧重传，占一个可靠传输窗口）；off = 尽力而为（超速即丢）",
     )
     set_uart.set_defaults(handler=cmd_set_uart_reliable)
 

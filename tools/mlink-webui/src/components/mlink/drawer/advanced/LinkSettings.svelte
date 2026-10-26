@@ -1,9 +1,9 @@
 <script lang="ts">
 	import {
-		ARQ_STATE_IN_FLIGHT_MASK,
-		ARQ_STATE_IN_FLIGHT_SHIFT,
-		ARQ_STATE_WINDOW_MASK,
-		arqRetxRate
+		MEAPROTO_STATE_IN_FLIGHT_MASK,
+		MEAPROTO_STATE_IN_FLIGHT_SHIFT,
+		MEAPROTO_STATE_WINDOW_MASK,
+		meaprotoRetxRate
 	} from '../../../../lib/protocol';
 	import type { LinkConfigPatch } from '../../../../lib/protocol';
 	import type { MlinkSession } from '../../../../lib/session.svelte';
@@ -12,7 +12,7 @@
 
 	const busy = $derived(session.commandPending || session.device === null);
 	/** 固件上报不出这组参数：既不认识 0x1B 命令，也读不到配置项。 */
-	const unsupported = $derived(session.config !== null && session.config.arqRtoInitMs === null);
+	const unsupported = $derived(session.config !== null && session.config.meaprotoRtoInitMs === null);
 
 	/** 表单绑定值（设备值每次刷新都重置）。参数是数值，undefined = 无值。 */
 	let rtoInit = $state<number | undefined>(undefined);
@@ -20,8 +20,8 @@
 
 	function syncFromDevice(): void {
 		const config = session.config;
-		rtoInit = config?.arqRtoInitMs ?? undefined;
-		rtoMax = config?.arqRtoMaxMs ?? undefined;
+		rtoInit = config?.meaprotoRtoInitMs ?? undefined;
+		rtoMax = config?.meaprotoRtoMaxMs ?? undefined;
 	}
 
 	$effect(syncFromDevice);
@@ -50,24 +50,24 @@
 
 	const dirty = $derived(
 		session.config !== null &&
-			(rtoInit !== session.config.arqRtoInitMs || rtoMax !== session.config.arqRtoMaxMs)
+			(rtoInit !== session.config.meaprotoRtoInitMs || rtoMax !== session.config.meaprotoRtoMaxMs)
 	);
 
 	/** 运行读数：状态字节拆出窗口与在途，重传率由 tx 与 retx 现算。 */
 	const readout = $derived.by(() => {
 		const stats = session.stats;
-		if (stats?.arqState == null) return null;
+		if (stats?.meaprotoState == null) return null;
 
-		const window_ = stats.arqState & ARQ_STATE_WINDOW_MASK;
-		const inFlight = (stats.arqState >> ARQ_STATE_IN_FLIGHT_SHIFT) & ARQ_STATE_IN_FLIGHT_MASK;
-		const rate = arqRetxRate(stats);
+		const window_ = stats.meaprotoState & MEAPROTO_STATE_WINDOW_MASK;
+		const inFlight = (stats.meaprotoState >> MEAPROTO_STATE_IN_FLIGHT_SHIFT) & MEAPROTO_STATE_IN_FLIGHT_MASK;
+		const rate = meaprotoRetxRate(stats);
 
 		return [
 			`窗口 ${window_}`,
 			`在途 ${inFlight}`,
-			`重传 ${stats.arqRetx ?? 0}/${stats.arqTx ?? 0}（${rate === null ? '—' : `${rate.toFixed(1)}%`}）`,
-			`丢弃 ${stats.arqFailed ?? 0}`,
-			`去重 ${stats.arqDup ?? 0}`
+			`重传 ${stats.meaprotoRetx ?? 0}/${stats.meaprotoTx ?? 0}（${rate === null ? '—' : `${rate.toFixed(1)}%`}）`,
+			`丢弃 ${stats.meaprotoFailed ?? 0}`,
+			`去重 ${stats.meaprotoDup ?? 0}`
 		].join(' · ');
 	});
 </script>
@@ -75,12 +75,12 @@
 <div class="link-settings">
 	<div class="grid">
 		<div class="field">
-			<label class="label" for="arq-rto-init">初始 RTO (ms)</label>
-			<input id="arq-rto-init" type="number" min="1" max="65535" bind:value={rtoInit} disabled={busy || unsupported} />
+			<label class="label" for="meaproto-rto-init">初始 RTO (ms)</label>
+			<input id="meaproto-rto-init" type="number" min="1" max="65535" bind:value={rtoInit} disabled={busy || unsupported} />
 		</div>
 		<div class="field">
-			<label class="label" for="arq-rto-max">RTO 上限 (ms)</label>
-			<input id="arq-rto-max" type="number" min="1" max="65535" bind:value={rtoMax} disabled={busy || unsupported} />
+			<label class="label" for="meaproto-rto-max">RTO 上限 (ms)</label>
+			<input id="meaproto-rto-max" type="number" min="1" max="65535" bind:value={rtoMax} disabled={busy || unsupported} />
 		</div>
 	</div>
 
