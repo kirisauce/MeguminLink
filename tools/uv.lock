@@ -260,10 +260,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "pyocd" },
+    { name = "pyserial" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyocd", specifier = ">=0.45.1" }]
+requires-dist = [
+    { name = "pyocd", specifier = ">=0.45.1" },
+    { name = "pyserial", specifier = ">=3.5" },
+]
 
 [[package]]
 name = "natsort"
@@ -371,6 +375,15 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/ee/d9/0f49c2c50bd301a1f6c5514e4bb4d9ca3dba7034136e28eba920481c88aa/pyocd-0.45.1.tar.gz", hash = "sha256:cef9ae095cde87cbd4005eff0a4bc0d3016dd22c7a5c61f425b69024cae1e0c1" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/d6/f3/6ae54998aacca6db8b1046d6567781f0ad4679cadf5f588812ca532ab1ba/pyocd-0.45.1-py3-none-any.whl", hash = "sha256:bf3f35d62620f8a0838cd1b2d8c6555308073165093684663c4c1921dae73b30" },
+]
+
+[[package]]
+name = "pyserial"
+version = "3.5"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0" },
 ]
 
 [[package]]
