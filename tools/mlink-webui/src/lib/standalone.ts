@@ -5,4 +5,5 @@
 export const STANDALONE_FILENAME = 'mlink-webui-standalone.html';
 
 /** 相对于站点根的单文件版本地址。 */
-export const STANDALONE_HREF = `/${STANDALONE_FILENAME}`;
+const base = import.meta.env.BASE_URL;
+export const STANDALONE_HREF = `${base.endsWith('/') ? base : `${base}/`}${STANDALONE_FILENAME}`;
