@@ -7,15 +7,15 @@ MeguminLink 设备监控上位机。浏览器通过 WebUSB 直接读设备的 EP
 ## 运行
 
 ```bash
-bun install
-bun run dev        # 开发
+pnpm install
+pnpm dev           # 开发
 ```
 
 日常使用静态产物：
 
 ```bash
-bun run build      # 产物在 dist/
-bun run preview
+pnpm build         # 产物在 dist/
+pnpm preview
 ```
 
 打开命令输出的地址即可。
